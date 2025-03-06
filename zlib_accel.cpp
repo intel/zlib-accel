@@ -476,7 +476,7 @@ int ZEXPORT inflateReset(z_streamp strm) {
 
 int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                       uLong sourceLen, int level) {
-  Log(LogLevel::LOG_INFO, "compress2 Line %d, sourceLen %d, destLen %d\n",
+  Log(LogLevel::LOG_INFO, "compress2 Line %d, sourceLen %lu, destLen %lu\n",
       __LINE__, sourceLen, *destLen);
 
   int ret = 1;
@@ -522,8 +522,8 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     ret = Z_OK;
 
     Log(LogLevel::LOG_INFO,
-        "compress2 Line %d, accelerator return code %d, sourceLen %d, "
-        "destLen %d\n",
+        "compress2 Line %d, accelerator return code %d, sourceLen %lu, "
+        "destLen %lu\n",
         __LINE__, ret, sourceLen, *destLen);
   } else if (config::use_zlib_compress) {
     // compress2 in zlib calls deflate. It was observed that deflate is
@@ -533,8 +533,8 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     ret = orig_compress2(dest, destLen, source, sourceLen, level);
     in_call = false;
     Log(LogLevel::LOG_INFO,
-        "compress2 Line %d, zlib return code %d, sourceLen %d, "
-        "destLen %d\n",
+        "compress2 Line %d, zlib return code %d, sourceLen %lu, "
+        "destLen %lu\n",
         __LINE__, ret, sourceLen, *destLen);
   } else {
     ret = Z_DATA_ERROR;
@@ -549,7 +549,7 @@ int ZEXPORT compress(Bytef* dest, uLongf* destLen, const Bytef* source,
 
 int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                         uLong* sourceLen) {
-  Log(LogLevel::LOG_INFO, "uncompress2 Line %d, sourceLen %d, destLen %d\n",
+  Log(LogLevel::LOG_INFO, "uncompress2 Line %d, sourceLen %lu, destLen %lu\n",
       __LINE__, *sourceLen, *destLen);
 
   int ret = 1;
@@ -599,8 +599,8 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     ret = Z_OK;
 
     Log(LogLevel::LOG_INFO,
-        "uncompress2 Line %d, accelerator return code %d, sourceLen %d, "
-        "destLen %d\n",
+        "uncompress2 Line %d, accelerator return code %d, sourceLen %lu, "
+        "destLen %lu\n",
         __LINE__, ret, *sourceLen, *destLen);
   } else if (config::use_zlib_uncompress) {
     // refer to comment in compress2
@@ -608,8 +608,8 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     ret = orig_uncompress2(dest, destLen, source, sourceLen);
     in_call = false;
     Log(LogLevel::LOG_INFO,
-        "uncompress2 Line %d, zlib return code %d, sourceLen %d, "
-        "destLen %d\n",
+        "uncompress2 Line %d, zlib return code %d, sourceLen %lu, "
+        "destLen %lu\n",
         __LINE__, ret, *sourceLen, *destLen);
   } else {
     ret = Z_DATA_ERROR;
@@ -724,12 +724,12 @@ struct GzipFile {
   // - serve data from data_buf when requested
 
   char* data_buf = nullptr;
-  int data_buf_size;
+  int data_buf_size = 0;
   int data_buf_pos = 0;
   int data_buf_content = 0;
 
   char* io_buf = nullptr;
-  int io_buf_size;
+  int io_buf_size = 0;
   int io_buf_pos = 0;
   int io_buf_content = 0;
 
@@ -853,7 +853,7 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
 gzFile ZEXPORT gzdopen(int fd, const char* mode) {
   gzFile file = orig_gzdopen(fd, mode);
 
-  Log(LogLevel::LOG_INFO, "gzdopen Line %d, file %p, fd %d, mode %s\n",
+  Log(LogLevel::LOG_INFO, "gzdopen Line %d, file %d, fd %p, mode %s\n",
       __LINE__, fd, file, mode);
 
   FileMode file_mode = FileMode::NONE;
@@ -1246,15 +1246,24 @@ int ZEXPORT gzclose(gzFile file) {
     // Capture file size and name before gzclose
     int file_size = lseek(gz->fd, 0, SEEK_CUR);
     char file_path[MAXPATHLEN];
-    int readlink_ret =
+    ssize_t  readlink_ret =
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
-                 MAXPATHLEN);
+                 MAXPATHLEN - 1);
     // TODO check for errors
+    if(readlink_ret == -1){
+      ret = orig_gzclose(file);
+      gzip_files.Unset(file);
+      Log(LogLevel::LOG_ERROR,
+      "gzclose Line %d, readlink_ret return error \n",__LINE__);
+      return ret;
+    }
     file_path[readlink_ret] = '\0';
     // Close the file
     int close_ret = orig_gzclose(file);
     // Remove any file content added by gzclose
-    int truncate_ret = truncate(file_path, file_size);
+    if(file_size != -1){
+       int truncate_ret = truncate(file_path, file_size);
+    }
     // TODO check for errors
 
     if (ret == 0) {
