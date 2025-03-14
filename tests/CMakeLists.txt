@@ -19,12 +19,18 @@ add_link_options("-Wl,--unresolved-symbols=ignore-all")
 add_executable(zlib_accel_test zlib_accel_test.cpp ../utils.cpp)
 
 add_custom_target(run
-    COMMAND ./zlib-accel-test
-    DEPENDS zlib-accel-test
+    COMMAND ./zlib_accel_test
+    DEPENDS zlib_accel_test
 )
 
-add_custom_target(coverage
-    COMMAND lcov --directory . --capture --output-file zlib_accel_test.info
-    COMMAND lcov --directory ../../build --capture --output-file zlib_accel.info
-    COMMAND genhtml -o html zlib_accel_test.info zlib_accel.info
-)
+if(COVERAGE)
+    add_custom_target(coverage
+        COMMAND lcov --directory . --capture --output-file zlib_accel_test.info
+        COMMAND lcov --directory ../../build --capture --output-file zlib_accel.info
+        COMMAND genhtml -o html zlib_accel_test.info zlib_accel.info
+    )
+else()
+    add_custom_target(coverage
+        COMMAND echo "Cannot generate coverage report. Build with COVERAGE=ON."
+    )
+endif()
