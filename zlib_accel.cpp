@@ -1256,23 +1256,23 @@ int ZEXPORT gzclose(gzFile file) {
     // Capture file size and name before gzclose
     int file_size = lseek(gz->fd, 0, SEEK_CUR);
     char file_path[MAXPATHLEN];
-    ssize_t  readlink_ret =
+    ssize_t readlink_ret =
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
                  MAXPATHLEN - 1);
     // TODO check for errors
-    if(readlink_ret == -1){
+    if (readlink_ret == -1) {
       ret = orig_gzclose(file);
       gzip_files.Unset(file);
-      Log(LogLevel::LOG_ERROR,
-      "gzclose Line %d, readlink_ret return error \n",__LINE__);
+      Log(LogLevel::LOG_ERROR, "gzclose Line %d, readlink_ret return error \n",
+          __LINE__);
       return ret;
     }
     file_path[readlink_ret] = '\0';
     // Close the file
     int close_ret = orig_gzclose(file);
     // Remove any file content added by gzclose
-    if(file_size != -1){
-       int truncate_ret = truncate(file_path, file_size);
+    if (file_size != -1) {
+      int truncate_ret = truncate(file_path, file_size);
     }
     // TODO check for errors
 

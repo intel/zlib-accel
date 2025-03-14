@@ -30,6 +30,11 @@ jobs:
     
     - name: Checkout code
       uses: actions/checkout@v4
+        
+    - name: Check formatting
+      run: |
+        pwd
+        find . -iname '*.h' -o -iname '*.cpp' | xargs clang-format -style=Google -i --dry-run -Werror
 
     - name: Build zlib-accel
       run: |
@@ -48,3 +53,4 @@ jobs:
         cmake ..
         make
         ./zlib_accel_test
+    
