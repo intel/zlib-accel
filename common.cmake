@@ -5,7 +5,6 @@ option(USE_IAA "Use IAA (requires QPL)" OFF)
 option(USE_QAT "Use QAT (requires QATzip)" OFF)
 option(DEBUG_LOG "for logging" ON)
 option(COVERAGE "for coverage" OFF)
-option(QAT_ZLIB "Support Zlib format in QATzip. Requires modified QATzip." OFF)
 
 if(USE_IAA)
   add_compile_definitions(USE_IAA)
@@ -17,10 +16,6 @@ endif()
 
 if(DEBUG_LOG)
   add_compile_definitions(DEBUG_LOG)
-endif()
-
-if(QAT_ZLIB)
-  add_compile_definitions(QAT_ZLIB)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL Debug)

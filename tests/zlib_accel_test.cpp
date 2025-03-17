@@ -604,12 +604,8 @@ TEST_P(ZlibTest, CompressDecompress) {
 #ifdef USE_QAT
     if (test_param.execution_path_compress == QAT &&
         input_length > QAT_HW_BUFF_SZ &&
-#ifdef QAT_ZLIB
         GetCompressedFormat(window_bits_uncompress) !=
             CompressedFormat::DEFLATE_RAW) {
-#else
-        GetCompressedFormat(window_bits_uncompress) == CompressedFormat::GZIP) {
-#endif
       // For data compressed by qzCompress, data is
       // made of multiple streams of hardware buffer size.
       ASSERT_TRUE(uncompressed_length <= QAT_HW_BUFF_SZ);

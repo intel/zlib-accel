@@ -17,14 +17,12 @@ QzSession_T *QATJob::GetQATSession(int window_bits, bool gzip_ext) {
         Init(&qzSession_deflate_raw, format);
       }
       return qzSession_deflate_raw;
-#ifdef QAT_ZLIB
     case CompressedFormat::ZLIB:
       if (qzSession_zlib == nullptr) {
         Init(&qzSession_zlib,
              format);  // we do not have zlib format in public enum of qatzip
       }
       return qzSession_zlib;
-#endif
     case CompressedFormat::GZIP:
       if (gzip_ext) {
         if (qzSession_gzip_ext == nullptr) {
@@ -50,12 +48,10 @@ void QATJob::CloseQATSession(int window_bits, bool gzip_ext) {
       Close(qzSession_deflate_raw);
       qzSession_deflate_raw = nullptr;
       break;
-#ifdef QAT_ZLIB
     case CompressedFormat::ZLIB:
       Close(qzSession_zlib);
       qzSession_zlib = nullptr;
       break;
-#endif
     case CompressedFormat::GZIP:
       if (gzip_ext) {
         Close(qzSession_gzip_ext);
@@ -122,12 +118,10 @@ void QATJob::Init(QzSession_T **qzSession, CompressedFormat format,
     case CompressedFormat::DEFLATE_RAW:
       deflateExt.deflate_params.data_fmt = QZ_DEFLATE_RAW;
       break;
-#ifdef QAT_ZLIB
     case CompressedFormat::ZLIB:
       deflateExt.deflate_params.data_fmt = QZ_DEFLATE_RAW;
       deflateExt.zlib_format = 1;
       break;
-#endif
     case CompressedFormat::GZIP:
       if (gzip_ext) {
         deflateExt.deflate_params.data_fmt = QZ_DEFLATE_GZIP_EXT;
@@ -268,9 +262,7 @@ int UncompressQAT(uint8_t *input, uint32_t *input_length, uint8_t *output,
 
 bool SupportedOptionsQAT(int window_bits, uint32_t input_length) {
   if ((window_bits >= -15 && window_bits <= -8) ||
-#ifdef QAT_ZLIB
       (window_bits >= 8 && window_bits <= 15) ||
-#endif
       (window_bits >= 24 && window_bits <= 31)) {
     if (input_length < QZ_COMP_THRESHOLD_DEFAULT) {
       Log(LogLevel::LOG_INFO,
