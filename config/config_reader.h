@@ -17,7 +17,8 @@ class ConfigReader {
 
  public:
   bool ParseFile(std::string fileName);
-  bool GetValue(std::string tag, int& value, int maxValue = 100, int minValue = 0);
+  bool GetValue(std::string tag, int& value, int maxValue = 100,
+                int minValue = 0);
   bool GetValue(std::string tag, std::string& value);
 
   std::string DumpValues();

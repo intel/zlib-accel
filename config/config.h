@@ -20,5 +20,6 @@ extern int qat_compression_level;
 extern std::string log_file;
 extern int log_level;
 
-bool LoadConfigFile(std::string& file_content, const char* filePath = "./default_config");
+bool LoadConfigFile(std::string& file_content,
+                    const char* filePath = "./default_config");
 }  // namespace config

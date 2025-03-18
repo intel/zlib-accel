@@ -5,29 +5,29 @@
 
 #include <algorithm>
 #include <fstream>
-#include <sstream>
 #include <regex>
+#include <sstream>
+
 #include "../logging.h"
 
 using namespace std;
 
-
-bool ConfigReader::GetValue(std::string tag, int& value, int maxValue, int minValue) {
+bool ConfigReader::GetValue(std::string tag, int& value, int maxValue,
+                            int minValue) {
   bool retVal = false;
   map<string, string>::iterator it;
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
-    char *p;
+    char* p;
     value = (int)strtol((it->second).c_str(), &p, 10);
-    if((*p == 0) && (minValue <= value  && value <= maxValue)) {
+    if ((*p == 0) && (minValue <= value && value <= maxValue)) {
       retVal = true;
-    }
-    else {
-        Log(LogLevel::LOG_INFO,
-        "ConfigReader::GetValue  Line %d invalid input value for tag %s\n", __LINE__,
-        tag.c_str());
-        value = 0;
-        retVal = false;
+    } else {
+      Log(LogLevel::LOG_INFO,
+          "ConfigReader::GetValue  Line %d invalid input value for tag %s\n",
+          __LINE__, tag.c_str());
+      value = 0;
+      retVal = false;
     }
   }
   return retVal;
@@ -39,14 +39,13 @@ bool ConfigReader::GetValue(std::string tag, std::string& value) {
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
     value = it->second;
-    if((tag == "log_file") && !isValidFileNameOrPath(value))
-    {
-        Log(LogLevel::LOG_INFO,
-        "ConfigReader::GetValue  Line %d invalid log_file value  %s\n", __LINE__,
-        value.c_str());
-        value = "";
-        retVal = false;
-    } else{
+    if ((tag == "log_file") && !isValidFileNameOrPath(value)) {
+      Log(LogLevel::LOG_INFO,
+          "ConfigReader::GetValue  Line %d invalid log_file value  %s\n",
+          __LINE__, value.c_str());
+      value = "";
+      retVal = false;
+    } else {
       retVal = true;
     }
   }
@@ -152,15 +151,15 @@ std::string ConfigReader::DumpValues() {
 }
 
 bool ConfigReader::isValidFileNameOrPath(const std::string& input) {
-    // Check for null character
-    if (input.find('\0') != std::string::npos) {
-        return false;
-    }
-    // Check for length constraints
-    if (input.length() > 4096) {
-        return false;
-    }
-    // Regular expression to match valid file names and paths
-    std::regex validPattern("^[a-zA-Z0-9._/-]+$");
-    return std::regex_match(input, validPattern);
+  // Check for null character
+  if (input.find('\0') != std::string::npos) {
+    return false;
+  }
+  // Check for length constraints
+  if (input.length() > 4096) {
+    return false;
+  }
+  // Regular expression to match valid file names and paths
+  std::regex validPattern("^[a-zA-Z0-9._/-]+$");
+  return std::regex_match(input, validPattern);
 }
