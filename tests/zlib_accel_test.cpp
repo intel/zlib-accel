@@ -13,11 +13,13 @@
 #include <limits>
 #include <tuple>
 #include <vector>
+#include <fstream>
 
 #include "../iaa.h"
 #include "../logging.h"
 #include "../qat.h"
 #include "../utils.h"
+#include "../config/config.h"
 
 enum BlockCompressibilityType {
   compressible_block,
@@ -1123,6 +1125,49 @@ INSTANTIATE_TEST_SUITE_P(
                      testing::Values(1024, 16384, 262144, 2097152),
                      testing::Values(compressible_block, incompressible_block),
                      testing::Values(false)));
+
+class ConfigLoaderTest : public ::testing::Test {
+};
+
+void createAndWriteTempConfigFile(const char *filePath) {
+    std::ofstream tempFile(filePath);
+    tempFile << "use_qat_compress=5000\n";
+    tempFile << "use_qat_uncompress=aaaa\n";
+    tempFile << "use_iaa_compress=!0\n";
+    tempFile << "use_iaa_compress=!0\n";
+    tempFile << "use_zlib_compress=!0222\n";
+    tempFile << "use_zlib_uncompress=AB23\n";
+    tempFile << "log_level=10\n";
+    tempFile.close();
+}
+
+TEST_F(ConfigLoaderTest, LoadInvalidConfig)
+{
+  std::string file_content;
+  createAndWriteTempConfigFile("/tmp/invalid_config");
+  EXPECT_TRUE(config::LoadConfigFile( file_content, "/tmp/invalid_config"));
+  EXPECT_EQ(config::use_qat_compress, 0);
+  EXPECT_EQ(config::use_qat_uncompress, 0);
+  EXPECT_EQ(config::use_iaa_compress, 0);
+  EXPECT_EQ(config::use_iaa_uncompress, 0);
+  EXPECT_EQ(config::use_zlib_compress, 0);
+  EXPECT_EQ(config::use_zlib_uncompress, 0);
+  EXPECT_EQ(config::log_level, 0);
+  std::remove("/tmp/invalid_config");
+}
+
+TEST_F(ConfigLoaderTest, LoadValidConfig)
+{
+  std::string file_content;
+  EXPECT_TRUE(config::LoadConfigFile( file_content, "../../config/default_config"));
+  EXPECT_EQ(config::use_qat_compress, 1);
+  EXPECT_EQ(config::use_qat_uncompress, 1);
+  EXPECT_EQ(config::use_iaa_compress, 0);
+  EXPECT_EQ(config::use_iaa_uncompress, 0);
+  EXPECT_EQ(config::use_zlib_compress, 1);
+  EXPECT_EQ(config::use_zlib_uncompress, 1);
+  EXPECT_EQ(config::log_level, 2);
+}
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
