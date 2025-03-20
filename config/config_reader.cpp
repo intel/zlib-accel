@@ -10,31 +10,33 @@
 
 #include "../logging.h"
 
+#define PATH_MAX 4096
+
 using namespace std;
 
-bool ConfigReader::GetValue(std::string tag, int& value, int maxValue,
-                            int minValue) {
-  bool retVal = false;
+bool ConfigReader::GetValue(std::string tag, int& value, int max_value,
+                            int min_value) {
+  bool ret_val = false;
   map<string, string>::iterator it;
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
     char* p;
     value = (int)strtol((it->second).c_str(), &p, 10);
-    if ((*p == 0) && (minValue <= value && value <= maxValue)) {
-      retVal = true;
+    if ((*p == 0) && (min_value <= value && value <= max_value)) {
+      ret_val = true;
     } else {
       Log(LogLevel::LOG_INFO,
           "ConfigReader::GetValue  Line %d invalid input value for tag %s\n",
           __LINE__, tag.c_str());
       value = 0;
-      retVal = false;
+      ret_val = false;
     }
   }
-  return retVal;
+  return ret_val;
 }
 
 bool ConfigReader::GetValue(std::string tag, std::string& value) {
-  bool retVal = false;
+  bool ret_val = false;
   map<string, string>::iterator it;
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
@@ -44,12 +46,12 @@ bool ConfigReader::GetValue(std::string tag, std::string& value) {
           "ConfigReader::GetValue  Line %d invalid log_file value  %s\n",
           __LINE__, value.c_str());
       value = "";
-      retVal = false;
+      ret_val = false;
     } else {
-      retVal = true;
+      ret_val = true;
     }
   }
-  return retVal;
+  return ret_val;
 }
 
 bool ConfigReader::ParseFile(string file_name) {
@@ -156,7 +158,7 @@ bool ConfigReader::isValidFileNameOrPath(const std::string& input) {
     return false;
   }
   // Check for length constraints
-  if (input.length() > 4096) {
+  if (input.length() > PATH_MAX) {
     return false;
   }
   // Regular expression to match valid file names and paths

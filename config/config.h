@@ -21,5 +21,5 @@ extern std::string log_file;
 extern int log_level;
 
 bool LoadConfigFile(std::string& file_content,
-                    const char* filePath = "./default_config");
+                    const char* filePath = "/etc/zlib-accel.conf");
 }  // namespace config
