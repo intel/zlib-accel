@@ -18,7 +18,6 @@ If the shim is not able to offload a job to an accelerator, it will fall back to
 The shim has only been tested on Linux.
 
 Other work in progress:
-- QAT support requires QATzip features that have not been released yet. Until they are released, zlib-accel can be used with IAA.
 - CI is in development. Some validation checks are still performed internally (in particular, HW offload tests).
 
 
@@ -57,7 +56,7 @@ Requirements for QAT
 - QAT hardware (integrated in 4th Gen Intel Scalable Processor and later)
 - QAT drivers, available in-tree in Linux kernel
 - [QATlib](https://github.com/intel/qatlib) library
-- [QATzip](https://github.com/intel/qatzip) library
+- [QATzip](https://github.com/intel/qatzip) library (v1.3.0 and above)
 
 Requirements for IAA
 - IAA hardware (integrated in 4th Gen Intel Scalable Processor and later)
@@ -105,7 +104,7 @@ make coverage
 
 ## Configuration
 
-The shim is configured through a file at /etc/zlib/config/default_config
+The shim is configured through a file at /etc/zlib-accel.conf
 The following options are supported.
 
 use_qat_compress
