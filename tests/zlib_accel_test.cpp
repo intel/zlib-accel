@@ -21,6 +21,8 @@
 #include "../qat.h"
 #include "../utils.h"
 
+using namespace config;
+
 enum BlockCompressibilityType {
   compressible_block,
   incompressible_block,
@@ -121,7 +123,7 @@ int ZlibCompress(const char* input, size_t input_length, std::string* output,
   stream.next_out = reinterpret_cast<Bytef*>(&(*output)[0]);
 
   st = deflate(&stream, flush);
-  *execution_path = zlib_accel_get_deflate_execution_path(&stream);
+  *execution_path = GetDeflateExecutionPath(&stream);
   if (st != Z_STREAM_END) {
     return st;
   }
@@ -162,7 +164,7 @@ int ZlibUncompress(const char* input, size_t input_length, size_t output_length,
         static_cast<unsigned int>(output_length - stream.total_out);
 
     st = inflate(&stream, flush);
-    *execution_path = zlib_accel_get_inflate_execution_path(&stream);
+    *execution_path = GetInflateExecutionPath(&stream);
     if (st == Z_STREAM_END && input_chunk < (input_chunks - 1)) {
       return st;
     } else if (st == Z_OK && input_chunk == (input_chunks - 1)) {
@@ -309,42 +311,48 @@ void SetCompressPath(ExecutionPath path, bool zlib_fallback,
                      bool iaa_prepend_empty_block = false) {
   switch (path) {
     case ZLIB:
-      zlib_accel_set_config(USE_IAA_COMPRESS, 0);
-      zlib_accel_set_config(USE_QAT_COMPRESS, 0);
-      zlib_accel_set_config(USE_ZLIB_COMPRESS, 1);
+      SetConfig(USE_IAA_COMPRESS, 0);
+      SetConfig(USE_QAT_COMPRESS, 0);
+      SetConfig(USE_ZLIB_COMPRESS, 1);
       break;
     case QAT:
-      zlib_accel_set_config(USE_IAA_COMPRESS, 0);
-      zlib_accel_set_config(USE_QAT_COMPRESS, 1);
-      zlib_accel_set_config(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
+      SetConfig(USE_IAA_COMPRESS, 0);
+      SetConfig(USE_QAT_COMPRESS, 1);
+      SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
       break;
     case IAA:
-      zlib_accel_set_config(USE_IAA_COMPRESS, 1);
-      zlib_accel_set_config(USE_QAT_COMPRESS, 0);
-      zlib_accel_set_config(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
+      SetConfig(USE_IAA_COMPRESS, 1);
+      SetConfig(USE_QAT_COMPRESS, 0);
+      SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
+      break;
+    default:
+      break;
   }
-  zlib_accel_set_config(IAA_PREPEND_EMPTY_BLOCK, iaa_prepend_empty_block);
+  SetConfig(IAA_PREPEND_EMPTY_BLOCK, iaa_prepend_empty_block);
 }
 
 void SetUncompressPath(ExecutionPath path, bool zlib_fallback,
                        bool iaa_prepend_empty_block = false) {
   switch (path) {
     case ZLIB:
-      zlib_accel_set_config(USE_IAA_UNCOMPRESS, 0);
-      zlib_accel_set_config(USE_QAT_UNCOMPRESS, 0);
-      zlib_accel_set_config(USE_ZLIB_UNCOMPRESS, 1);
+      SetConfig(USE_IAA_UNCOMPRESS, 0);
+      SetConfig(USE_QAT_UNCOMPRESS, 0);
+      SetConfig(USE_ZLIB_UNCOMPRESS, 1);
       break;
     case QAT:
-      zlib_accel_set_config(USE_IAA_UNCOMPRESS, 0);
-      zlib_accel_set_config(USE_QAT_UNCOMPRESS, 1);
-      zlib_accel_set_config(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
+      SetConfig(USE_IAA_UNCOMPRESS, 0);
+      SetConfig(USE_QAT_UNCOMPRESS, 1);
+      SetConfig(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
       break;
     case IAA:
-      zlib_accel_set_config(USE_IAA_UNCOMPRESS, 1);
-      zlib_accel_set_config(USE_QAT_UNCOMPRESS, 0);
-      zlib_accel_set_config(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
+      SetConfig(USE_IAA_UNCOMPRESS, 1);
+      SetConfig(USE_QAT_UNCOMPRESS, 0);
+      SetConfig(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
+      break;
+    default:
+      break;
   }
-  zlib_accel_set_config(IAA_PREPEND_EMPTY_BLOCK, iaa_prepend_empty_block);
+  SetConfig(IAA_PREPEND_EMPTY_BLOCK, iaa_prepend_empty_block);
 }
 
 struct TestParam {
@@ -385,6 +393,10 @@ struct TestParam {
 
 bool ZlibCompressExpectFallback(TestParam test_param, size_t input_length,
                                 size_t output_upper_bound) {
+  (void)test_param;
+  (void)input_length;
+  (void)output_upper_bound;
+
   bool fallback_expected = false;
 #ifdef USE_QAT
   // if QAT selected, but options not supported
@@ -416,6 +428,13 @@ bool ZlibUncompressExpectFallback(TestParam test_param, size_t input_length,
                                   size_t compressed_length,
                                   int window_bits_uncompress,
                                   bool compress_fallback = false) {
+  (void)test_param;
+  (void)input_length;
+  (void)compressed;
+  (void)compressed_length;
+  (void)window_bits_uncompress;
+  (void)compress_fallback;
+
   bool fallback_expected = false;
 #ifdef USE_QAT
   // if QAT selected, but options not supported or multi-call decompression, and
@@ -1124,43 +1143,42 @@ INSTANTIATE_TEST_SUITE_P(
 
 class ConfigLoaderTest : public ::testing::Test {};
 
-void createAndWriteTempConfigFile(const char* filePath) {
-  std::ofstream tempFile(filePath);
-  tempFile << "use_qat_compress=5000\n";
-  tempFile << "use_qat_uncompress=aaaa\n";
-  tempFile << "use_iaa_compress=!0\n";
-  tempFile << "use_iaa_compress=!0\n";
-  tempFile << "use_zlib_compress=!0222\n";
-  tempFile << "use_zlib_uncompress=AB23\n";
-  tempFile << "log_level=10\n";
-  tempFile.close();
+void CreateAndWriteTempConfigFile(const char* file_path) {
+  std::ofstream temp_file(file_path);
+  temp_file << "use_qat_compress=5000\n";
+  temp_file << "use_qat_uncompress=aaaa\n";
+  temp_file << "use_iaa_compress=!0\n";
+  temp_file << "use_iaa_compress=!0\n";
+  temp_file << "use_zlib_compress=!0222\n";
+  temp_file << "use_zlib_uncompress=AB23\n";
+  temp_file << "log_level=10\n";
+  temp_file.close();
 }
 
 TEST_F(ConfigLoaderTest, LoadInvalidConfig) {
   std::string file_content;
-  createAndWriteTempConfigFile("/tmp/invalid_config");
-  EXPECT_TRUE(config::LoadConfigFile(file_content, "/tmp/invalid_config"));
-  EXPECT_EQ(config::use_qat_compress, 0);
-  EXPECT_EQ(config::use_qat_uncompress, 0);
-  EXPECT_EQ(config::use_iaa_compress, 0);
-  EXPECT_EQ(config::use_iaa_uncompress, 0);
-  EXPECT_EQ(config::use_zlib_compress, 0);
-  EXPECT_EQ(config::use_zlib_uncompress, 0);
-  EXPECT_EQ(config::log_level, 0);
+  CreateAndWriteTempConfigFile("/tmp/invalid_config");
+  EXPECT_TRUE(LoadConfigFile(file_content, "/tmp/invalid_config"));
+  EXPECT_EQ(GetConfig(USE_QAT_COMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_QAT_UNCOMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_IAA_COMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_IAA_UNCOMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 0);
+  EXPECT_EQ(GetConfig(LOG_LEVEL), 0);
   std::remove("/tmp/invalid_config");
 }
 
 TEST_F(ConfigLoaderTest, LoadValidConfig) {
   std::string file_content;
-  EXPECT_TRUE(
-      config::LoadConfigFile(file_content, "../../config/default_config"));
-  EXPECT_EQ(config::use_qat_compress, 1);
-  EXPECT_EQ(config::use_qat_uncompress, 1);
-  EXPECT_EQ(config::use_iaa_compress, 0);
-  EXPECT_EQ(config::use_iaa_uncompress, 0);
-  EXPECT_EQ(config::use_zlib_compress, 1);
-  EXPECT_EQ(config::use_zlib_uncompress, 1);
-  EXPECT_EQ(config::log_level, 2);
+  EXPECT_TRUE(LoadConfigFile(file_content, "../../config/default_config"));
+  EXPECT_EQ(GetConfig(USE_QAT_COMPRESS), 1);
+  EXPECT_EQ(GetConfig(USE_QAT_UNCOMPRESS), 1);
+  EXPECT_EQ(GetConfig(USE_IAA_COMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_IAA_UNCOMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 1);
+  EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 1);
+  EXPECT_EQ(GetConfig(LOG_LEVEL), 2);
 }
 
 int main(int argc, char* argv[]) {

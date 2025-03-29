@@ -128,7 +128,7 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
 
     // Move standard header to beginning of output
     uint32_t header_length = GetHeaderLength(format);
-    for (int i = 0; i < header_length; i++) {
+    for (uint32_t i = 0; i < header_length; i++) {
       output[i] = output[i + output_shift];
       pos++;
     }

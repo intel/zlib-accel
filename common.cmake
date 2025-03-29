@@ -18,6 +18,22 @@ if(DEBUG_LOG)
   add_compile_definitions(DEBUG_LOG)
 endif()
 
+set(COMPILER_FLAGS "-Wall -Wextra -Werror \
+-flto -fvisibility=hidden \
+-Wformat -Wformat-security -Werror=format-security \
+-D_FORTIFY_SOURCE=2 \
+-fstack-protector-strong")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  message(STATUS "GCC detected.")
+  set(COMPILER_FLAGS "${COMPILER_FLAGS} -Wl,-z,noexecstack,-z,relro,-z,now -mindirect-branch-register")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  message(STATUS "Clang detected.")
+  set(COMPILER_FLAGS "${COMPILER_FLAGS} -fsanitize=cfi -mretpoline")
+endif()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMPILER_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMPILER_FLAGS}")
+
 if(CMAKE_BUILD_TYPE STREQUAL Debug)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0")

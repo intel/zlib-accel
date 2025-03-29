@@ -90,7 +90,7 @@ void QATJob::Init(QzSession_T **qzSession, CompressedFormat format,
         *qzSession, status);
   }
 
-  QzSessionParamsDeflateExt_T deflateExt = {{}};
+  QzSessionParamsDeflateExt_T deflateExt = {{}, 0, 0};
   deflateExt.deflate_params.common_params.comp_algorithm = QZ_DEFLATE;
   deflateExt.deflate_params.common_params.comp_lvl =
       config::qat_compression_level;

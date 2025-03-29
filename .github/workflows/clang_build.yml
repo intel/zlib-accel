@@ -1,10 +1,10 @@
-name: zlib-accel Build and Test
+name: zlib-accel clang build
 on:
 - push
 - pull_request
 jobs:
-  build_and_test_zlib_accel:
-    name: Build and test zlib-accel
+  build_zlib_accel:
+    name: Build zlib-accel
     runs-on: ubuntu-latest
     steps:
     - name: Print system info
@@ -24,39 +24,29 @@ jobs:
       run: |
         export DEBIAN_FRONTEND=noninteractive
         sudo apt-get install -y build-essential
+        sudo apt-get install -y clang
         sudo apt-get install -y cmake
         sudo apt-get install -y libgtest-dev
         sudo apt-get install -y zlib1g-dev
     
     - name: Checkout code
       uses: actions/checkout@v4
-        
-    - name: Check formatting
+    
+    - name: Build zlib-accel
       run: |
-        pwd
-        find . -iname '*.h' -o -iname '*.cpp' | xargs clang-format -style=Google -i --dry-run -Werror
-
-    - name: Build zlib-accel (gcc)
-      run: |
+        sudo apt-get install -y build-essential
         pwd
         mkdir build
         cd build
-        cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
+        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ..
         make
         
-    - name: Build tests (gcc)
+    - name: Build tests
       run: |
         pwd
         cd tests
         mkdir build
         cd build
-        cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
+        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ..
         make
-    
-    - name: Run unit tests
-      run: |
-        pwd
-        cd tests/build
-        make run
-
     

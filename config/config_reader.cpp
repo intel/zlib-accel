@@ -41,7 +41,7 @@ bool ConfigReader::GetValue(std::string tag, std::string& value) {
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
     value = it->second;
-    if ((tag == "log_file") && !isValidFileNameOrPath(value)) {
+    if ((tag == "log_file") && !IsValidFileNameOrPath(value)) {
       Log(LogLevel::LOG_INFO,
           "ConfigReader::GetValue  Line %d invalid log_file value  %s\n",
           __LINE__, value.c_str());
@@ -56,13 +56,11 @@ bool ConfigReader::GetValue(std::string tag, std::string& value) {
 
 bool ConfigReader::ParseFile(string file_name) {
   ifstream input_file;
-  // printf("\n log file name in parseFile() %s \n",fileName.c_str());
   input_file.open(file_name.c_str());
   string delimeter = "=";
   int initPos = 0;
 
   if (input_file.fail()) {
-    // cout << "Unable to find defaultConfig ******file" << endl;
     return false;
   }
 
@@ -78,7 +76,7 @@ bool ConfigReader::ParseFile(string file_name) {
 
     if (config_data.empty()) continue;
 
-    unsigned int length = config_data.find(delimeter);
+    size_t length = config_data.find(delimeter);
 
     string tag, value;
 
@@ -152,7 +150,7 @@ std::string ConfigReader::DumpValues() {
   return values.str();
 }
 
-bool ConfigReader::isValidFileNameOrPath(const std::string& input) {
+bool ConfigReader::IsValidFileNameOrPath(const std::string& input) {
   // Check for null character
   if (input.find('\0') != std::string::npos) {
     return false;

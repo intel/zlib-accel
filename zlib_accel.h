@@ -2,25 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#pragma GCC visibility push(default)
 
 #include <zlib.h>
 
-enum ConfigTag {
-  USE_IAA_COMPRESS,
-  USE_IAA_UNCOMPRESS,
-  USE_QAT_COMPRESS,
-  USE_QAT_UNCOMPRESS,
-  USE_ZLIB_COMPRESS,
-  USE_ZLIB_UNCOMPRESS,
-  IAA_PREPEND_EMPTY_BLOCK,
-  LOG_LEVEL
-};
-
+// Visible for testing
 enum ExecutionPath { UNDEFINED, ZLIB, QAT, IAA };
+ExecutionPath GetDeflateExecutionPath(z_streamp strm);
+ExecutionPath GetInflateExecutionPath(z_streamp strm);
 
-// Non-zlib APIs (for testing or non-transparent applications)
-ZEXTERN void ZEXPORT zlib_accel_set_config(ConfigTag tag, int value);
-ZEXTERN ExecutionPath ZEXPORT
-zlib_accel_get_deflate_execution_path(z_streamp strm);
-ZEXTERN ExecutionPath ZEXPORT
-zlib_accel_get_inflate_execution_path(z_streamp strm);
+#pragma GCC visibility pop

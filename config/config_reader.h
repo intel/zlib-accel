@@ -25,7 +25,7 @@ class ConfigReader {
 
  private:
   // Helper function to trim the tag and value.
-  bool isValidFileNameOrPath(const std::string& input);
+  bool IsValidFileNameOrPath(const std::string& input);
   std::string Trim(const std::string& str,
                    const std::string& whitespace = " \t");
   std::string Reduce(const std::string& str, const std::string& fill = " ",

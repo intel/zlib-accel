@@ -54,4 +54,75 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
 
   return true;
 }
+
+void SetConfig(ConfigOption option, int value) {
+  switch (option) {
+    case USE_QAT_COMPRESS:
+      use_qat_compress = value;
+      break;
+    case USE_QAT_UNCOMPRESS:
+      use_qat_uncompress = value;
+      break;
+    case USE_IAA_COMPRESS:
+      use_iaa_compress = value;
+      break;
+    case USE_IAA_UNCOMPRESS:
+      use_iaa_uncompress = value;
+      break;
+    case USE_ZLIB_COMPRESS:
+      use_zlib_compress = value;
+      break;
+    case USE_ZLIB_UNCOMPRESS:
+      use_zlib_uncompress = value;
+      break;
+    case IAA_COMPRESS_PERCENTAGE:
+      iaa_compress_percentage = value;
+      break;
+    case IAA_DECOMPRESS_PERCENTAGE:
+      iaa_decompress_percentage = value;
+      break;
+    case IAA_PREPEND_EMPTY_BLOCK:
+      iaa_prepend_empty_block = value;
+      break;
+    case QAT_PERIODICAL_POLLING:
+      qat_periodical_polling = value;
+      break;
+    case QAT_COMPRESSION_LEVEL:
+      qat_compression_level = value;
+      break;
+    case LOG_LEVEL:
+      log_level = value;
+      break;
+  }
+}
+
+int GetConfig(ConfigOption option) {
+  switch (option) {
+    case USE_QAT_COMPRESS:
+      return use_qat_compress;
+    case USE_QAT_UNCOMPRESS:
+      return use_qat_uncompress;
+    case USE_IAA_COMPRESS:
+      return use_iaa_compress;
+    case USE_IAA_UNCOMPRESS:
+      return use_iaa_uncompress;
+    case USE_ZLIB_COMPRESS:
+      return use_zlib_compress;
+    case USE_ZLIB_UNCOMPRESS:
+      return use_zlib_uncompress;
+    case IAA_COMPRESS_PERCENTAGE:
+      return iaa_compress_percentage;
+    case IAA_DECOMPRESS_PERCENTAGE:
+      return iaa_decompress_percentage;
+    case IAA_PREPEND_EMPTY_BLOCK:
+      return iaa_prepend_empty_block;
+    case QAT_PERIODICAL_POLLING:
+      return qat_periodical_polling;
+    case QAT_COMPRESSION_LEVEL:
+      return qat_compression_level;
+    case LOG_LEVEL:
+      return log_level;
+  }
+  return 0;
+}
 }  // namespace config

@@ -60,7 +60,7 @@ static inline void Log(LogLevel level, const char* format, ...) {
 
 #ifdef DEBUG_LOG
 static inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data,
-                                           int len, int window_bits) {
+                                           uint32_t len, int window_bits) {
   if (static_cast<int>(level) < config::log_level) {
     return;
   }
