@@ -27,7 +27,8 @@ int log_level = 2;
 
 bool LoadConfigFile(std::string& file_content, const char* filePath) {
   const bool exists = std::filesystem::exists(filePath);
-  if (!exists) {
+  const bool symlink = std::filesystem::is_symlink(filePath);
+  if (!exists || symlink) {
     return false;
   }
   ConfigReader configReader;

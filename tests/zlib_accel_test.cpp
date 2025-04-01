@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -1179,6 +1180,20 @@ TEST_F(ConfigLoaderTest, LoadValidConfig) {
   EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 1);
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 1);
   EXPECT_EQ(GetConfig(LOG_LEVEL), 2);
+}
+
+TEST_F(ConfigLoaderTest, SymbolicLinkTest) {
+  std::string file_content;
+  std::filesystem::path target_path = "/tmp/target_file_path";
+  std::filesystem::path symlink_path = "symlink_to_target";
+  // create a real/target file
+  std::ofstream target_file(target_path);
+  target_file.close();
+  // create a symlink for the target file
+  std::filesystem::create_symlink(target_path, symlink_path);
+  EXPECT_FALSE(LoadConfigFile(file_content, symlink_path.c_str()));
+  std::filesystem::remove(symlink_path);
+  std::filesystem::remove(target_path);
 }
 
 int main(int argc, char* argv[]) {
