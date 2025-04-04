@@ -660,11 +660,9 @@ struct GzipFile {
   }
 
   void Reset() {
-    fd = 0;
     path = UNDEFINED;
     use_zlib_for_decompression = false;
     reached_eof = false;
-    mode = FileMode::NONE;
 
     data_buf_pos = 0;
     data_buf_content = 0;
@@ -732,39 +730,18 @@ struct GzipFile {
 class GzipFiles {
  public:
   void Set(gzFile file, int fd, FileMode file_mode) {
-    if (use_thread_local) {
-      gzip_file.Reset();
-      gzip_file.fd = fd;
-      gzip_file.mode = file_mode;
-    } else {
-      GzipFile* f = new GzipFile(fd, file_mode);
-      map.Set(file, f);
-    }
+    GzipFile* f = new GzipFile(fd, file_mode);
+    map.Set(file, f);
   }
 
-  void Unset(gzFile file) {
-    if (use_thread_local) {
-      gzip_file.Reset();
-    } else {
-      map.Unset(file);
-    }
-  }
+  void Unset(gzFile file) { map.Unset(file); }
 
-  GzipFile* Get(gzFile file) {
-    if (use_thread_local) {
-      return &gzip_file;
-    } else {
-      return map.Get(file);
-    }
-  }
+  GzipFile* Get(gzFile file) { return map.Get(file); }
 
  private:
   ShardedMap<gzFile, GzipFile*> map;
-  static thread_local GzipFile gzip_file;
-  bool use_thread_local = true;
 };
 GzipFiles gzip_files;
-thread_local GzipFile GzipFiles::gzip_file;
 
 // Inspired by gz_open in gzlib.c
 int GetOpenFlags(const char* mode, FileMode* file_mode) {
