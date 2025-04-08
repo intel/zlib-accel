@@ -57,7 +57,7 @@ bool ConfigReader::GetValue(std::string tag, std::string& value) {
 bool ConfigReader::ParseFile(string file_name) {
   ifstream input_file;
   input_file.open(file_name.c_str());
-  string delimeter = "=";
+  string delimiter = "=";
   int initPos = 0;
 
   if (input_file.fail()) {
@@ -76,7 +76,7 @@ bool ConfigReader::ParseFile(string file_name) {
 
     if (config_data.empty()) continue;
 
-    size_t length = config_data.find(delimeter);
+    size_t length = config_data.find(delimiter);
 
     string tag, value;
 

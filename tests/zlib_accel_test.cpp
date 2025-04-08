@@ -984,7 +984,7 @@ INSTANTIATE_TEST_SUITE_P(
         testing::Values(Z_SYNC_FLUSH), testing::Values(1),
         // Testing 32k instead of 16k blocks, to make IAA success/failure
         // predictable. With 16k divided into two 8k streams, sometimes IAA is
-        // able to decompress if no references happend to be farther than 4kB.
+        // able to decompress if no references happened to be farther than 4kB.
         testing::Values(1024, 32768, 262144),
         testing::Values(compressible_block, incompressible_block),
         testing::Values(false)));
