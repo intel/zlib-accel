@@ -122,7 +122,6 @@ static int init_zlib_accel(void) {
     CreateLogFile(config::log_file.c_str());
   }
 
-  Log(LogLevel::LOG_INFO, config_file_content.c_str());
 #endif
   return 0;
 }
