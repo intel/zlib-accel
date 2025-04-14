@@ -1090,6 +1090,8 @@ TEST_F(ConfigLoaderTest, LoadInvalidConfig) {
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 0);
   EXPECT_EQ(GetConfig(LOG_LEVEL), 0);
   std::remove("/tmp/invalid_config");
+  // Restore config from official config file
+  LoadConfigFile(file_content);
 }
 
 TEST_F(ConfigLoaderTest, LoadValidConfig) {
@@ -1102,6 +1104,7 @@ TEST_F(ConfigLoaderTest, LoadValidConfig) {
   EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 1);
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 1);
   EXPECT_EQ(GetConfig(LOG_LEVEL), 2);
+  LoadConfigFile(file_content);
 }
 
 TEST_F(ConfigLoaderTest, SymbolicLinkTest) {

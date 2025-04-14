@@ -65,16 +65,12 @@ static inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data,
     return;
   }
 
-  FILE* stream = stdout;
-  if (log_file_stream != nullptr) {
-    stream = log_file_stream;
-  }
-
   CompressedFormat format = GetCompressedFormat(window_bits);
   uint32_t header_length = GetHeaderLength(format);
   if (len >= (header_length + 1)) {
-    fprintf(stream, "bfinal=%d, btype=%d\n", data[header_length] & 0b00000001,
-            (data[header_length] & 0b00000110) >> 1);
+    Log(level, "Deflate block header bfinal=%d, btype=%d\n",
+        data[header_length] & 0b00000001,
+        (data[header_length] & 0b00000110) >> 1);
   }
 }
 #else

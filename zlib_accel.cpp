@@ -121,7 +121,6 @@ static int init_zlib_accel(void) {
   if (!config::log_file.empty()) {
     CreateLogFile(config::log_file.c_str());
   }
-
 #endif
   return 0;
 }
