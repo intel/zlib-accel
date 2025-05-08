@@ -27,6 +27,7 @@
 #endif
 #include "statistics.h"
 
+using namespace config;
 // Disable cfi-icall as it makes calls to orig* functions fail
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((no_sanitize("cfi-icall"))), \
@@ -233,13 +234,13 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     uint32_t output_len = strm->avail_out;
 
 #ifdef USE_IAA
-    iaa_available = config::use_iaa_compress &&
+    iaa_available = configs[USE_IAA_COMPRESS] &&
                     SupportedOptionsIAA(deflate_settings->window_bits,
                                         input_len, output_len);
 #endif
 #ifdef USE_QAT
     qat_available =
-        config::use_qat_compress &&
+        configs[USE_QAT_COMPRESS] &&
         SupportedOptionsQAT(deflate_settings->window_bits, input_len);
 #endif
 
@@ -247,7 +248,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     // one or the other
     ExecutionPath path_selected = ZLIB;
     if (iaa_available && qat_available) {
-      if (std::rand() % 100 < config::iaa_compress_percentage) {
+      if (std::rand() % 100 < configs[IAA_COMPRESS_PERCENTAGE]) {
         path_selected = IAA;
       } else {
         path_selected = QAT;
@@ -302,7 +303,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     }
   }
 
-  if (in_call || config::use_zlib_compress) {
+  if (in_call || configs[USE_ZLIB_COMPRESS]) {
     ret = orig_deflate(strm, flush);
     INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
     if (!in_call) {
@@ -376,7 +377,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     uint32_t output_len = strm->avail_out;
 
 #ifdef USE_IAA
-    iaa_available = config::use_iaa_uncompress &&
+    iaa_available = configs[USE_IAA_UNCOMPRESS] &&
                     SupportedOptionsIAA(inflate_settings->window_bits,
                                         input_len, output_len) &&
                     IsIAADecompressible(strm->next_in, input_len,
@@ -385,7 +386,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 #endif
 #ifdef USE_QAT
     qat_available =
-        config::use_qat_uncompress &&
+        configs[USE_QAT_UNCOMPRESS] &&
         SupportedOptionsQAT(inflate_settings->window_bits, input_len);
 #endif
 
@@ -393,7 +394,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     // one or the other
     ExecutionPath path_selected = ZLIB;
     if (iaa_available && qat_available) {
-      if (std::rand() % 100 < config::iaa_uncompress_percentage) {
+      if (std::rand() % 100 < configs[IAA_UNCOMPRESS_PERCENTAGE]) {
         path_selected = IAA;
       } else {
         path_selected = QAT;
@@ -459,7 +460,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     }
   }
 
-  if (in_call || config::use_zlib_uncompress) {
+  if (in_call || configs[USE_ZLIB_UNCOMPRESS]) {
     ret = orig_inflate(strm, flush);
     INCREMENT_STAT(INFLATE_ZLIB_COUNT);
     if (!in_call) {
@@ -508,12 +509,12 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
   bool iaa_available = false;
   bool qat_available = false;
 #ifdef USE_IAA
-  iaa_available = config::use_iaa_compress &&
+  iaa_available = configs[USE_IAA_COMPRESS] &&
                   SupportedOptionsIAA(15, input_len, output_len);
 #endif
 #ifdef USE_QAT
   qat_available =
-      config::use_qat_compress && SupportedOptionsQAT(15, input_len);
+      configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -547,7 +548,7 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
         "compress2 Line %d, accelerator return code %d, sourceLen %lu, "
         "destLen %lu\n",
         __LINE__, ret, sourceLen, *destLen);
-  } else if (config::use_zlib_compress) {
+  } else if (configs[USE_ZLIB_COMPRESS]) {
     // compress2 in zlib calls deflate. It was observed that deflate is
     // sometimes intercepted by the shim. in_call prevents deflate from using
     // accelerators.
@@ -584,13 +585,13 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
   bool qat_available = false;
 #ifdef USE_IAA
   iaa_available =
-      config::use_iaa_uncompress &&
+      configs[USE_IAA_UNCOMPRESS] &&
       SupportedOptionsIAA(15, input_len, output_len) &&
       IsIAADecompressible(const_cast<uint8_t*>(source), input_len, 15);
 #endif
 #ifdef USE_QAT
   qat_available =
-      config::use_qat_uncompress && SupportedOptionsQAT(15, input_len);
+      configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -625,7 +626,7 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
         "uncompress2 Line %d, accelerator return code %d, sourceLen %lu, "
         "destLen %lu\n",
         __LINE__, ret, *sourceLen, *destLen);
-  } else if (config::use_zlib_uncompress) {
+  } else if (configs[USE_ZLIB_UNCOMPRESS]) {
     // refer to comment in compress2
     in_call = true;
     ret = orig_uncompress2(dest, destLen, source, sourceLen);
@@ -858,12 +859,12 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
   bool qat_available = false;
 
 #ifdef USE_IAA
-  iaa_available = config::use_iaa_compress &&
+  iaa_available = configs[USE_IAA_COMPRESS] &&
                   SupportedOptionsIAA(31, *input_length, *output_length);
 #endif
 #ifdef USE_QAT
   qat_available =
-      config::use_qat_compress && SupportedOptionsQAT(31, *input_length);
+      configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -908,13 +909,13 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
   bool qat_available = false;
 
 #ifdef USE_IAA
-  iaa_available = config::use_iaa_uncompress &&
+  iaa_available = configs[USE_IAA_UNCOMPRESS] &&
                   SupportedOptionsIAA(31, *input_length, *output_length) &&
                   IsIAADecompressible(input, *input_length, 31);
 #endif
 #ifdef USE_QAT
   qat_available =
-      config::use_qat_uncompress && SupportedOptionsQAT(31, *input_length);
+      configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -946,7 +947,7 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
 
 static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len) {
   int ret = 0;
-  if (config::use_zlib_compress) {
+  if (configs[USE_ZLIB_COMPRESS]) {
     ret = orig_gzwrite(file, buf, len);
   } else {
     ret = 0;
@@ -956,7 +957,7 @@ static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len) {
 
 static int GzreadZlibUncompress(gzFile file, voidp buf, unsigned len) {
   int ret = 0;
-  if (config::use_zlib_uncompress) {
+  if (configs[USE_ZLIB_UNCOMPRESS]) {
     ret = orig_gzread(file, buf, len);
   } else {
     ret = -1;
@@ -1027,7 +1028,7 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
 
   unsigned int written_bytes = 0;
   bool accelerator_selected =
-      config::use_iaa_compress || config::use_qat_compress;
+      configs[USE_IAA_COMPRESS] || configs[USE_QAT_COMPRESS];
   if (gz->path != ZLIB && accelerator_selected) {
     gz->AllocateBuffers();
     gz->data_buf_size = 256 << 10;
@@ -1087,7 +1088,7 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   int ret = 1;
   uint32_t read_bytes = 0;
   bool accelerator_selected =
-      config::use_iaa_uncompress || config::use_qat_uncompress;
+      configs[USE_IAA_UNCOMPRESS] || configs[USE_QAT_UNCOMPRESS];
   if (gz->path != ZLIB && accelerator_selected) {
     gz->AllocateBuffers();
     gz->data_buf_size = 512 << 10;

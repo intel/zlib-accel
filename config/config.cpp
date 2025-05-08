@@ -12,20 +12,20 @@
 using namespace std;
 
 namespace config {
-int use_qat_compress = 1;
-int use_qat_uncompress = 1;
-int use_iaa_compress = 0;
-int use_iaa_uncompress = 0;
-int use_zlib_compress = 1;
-int use_zlib_uncompress = 1;
-int iaa_compress_percentage = 50;
-int iaa_uncompress_percentage = 50;
-int iaa_prepend_empty_block = 0;
-int qat_periodical_polling = 0;
-int qat_compression_level = 1;
+
 std::string log_file = "";
-int log_level = 2;
-int log_stats_samples = 1000;
+
+const std::string config_names[CONFIG_MAX]{
+    "use_qat_compress",        "use_qat_uncompress",
+    "use_iaa_compress",        "use_iaa_uncompress",
+    "use_zlib_compress",       "USE_ZLIB_UNCOMPRESS",
+    "use_zlib_uncompress",     "iaa_compress_percentage",
+    "iaa_prepend_empty_block", "qat_periodical_polling",
+    "qat_compression_level",   "log_level",
+    "log_stats_samples"};
+
+uint16_t configs[CONFIG_MAX] = {1, 1, 0, 0, 1, 1, 50, 50, 0, 0, 1, 2, 1000};
+
 
 bool LoadConfigFile(std::string& file_content, const char* filePath) {
   const bool exists = std::filesystem::exists(filePath);
@@ -35,103 +35,41 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
   }
   ConfigReader configReader;
   configReader.ParseFile(filePath);
-
-  configReader.GetValue("use_qat_compress", use_qat_compress, 1, 0);
-  configReader.GetValue("use_qat_uncompress", use_qat_uncompress, 1, 0);
-  configReader.GetValue("use_iaa_compress", use_iaa_compress, 1, 0);
-  configReader.GetValue("use_iaa_uncompress", use_iaa_uncompress, 1, 0);
-  configReader.GetValue("use_zlib_compress", use_zlib_compress, 1, 0);
-  configReader.GetValue("use_zlib_uncompress", use_zlib_uncompress, 1, 0);
-  configReader.GetValue("iaa_compress_percentage", iaa_compress_percentage, 100,
-                        0);
-  configReader.GetValue("iaa_uncompress_percentage", iaa_uncompress_percentage,
-                        100, 0);
-  configReader.GetValue("iaa_prepend_empty_block", iaa_prepend_empty_block, 1,
-                        0);
-  configReader.GetValue("qat_periodical_polling", qat_periodical_polling, 1, 0);
-  configReader.GetValue("qat_compression_level", qat_compression_level, 9, 1);
+  int value = 0;
+  configReader.GetValue(config_names[USE_QAT_COMPRESS], value, 1, 0);
+  configs[USE_QAT_COMPRESS] = value;
+  configReader.GetValue(config_names[USE_QAT_UNCOMPRESS], value, 1, 0);
+  configs[USE_QAT_UNCOMPRESS] = value;
+  configReader.GetValue(config_names[USE_IAA_COMPRESS], value, 1, 0);
+  configs[USE_IAA_COMPRESS] = value;
+  configReader.GetValue(config_names[USE_IAA_UNCOMPRESS], value, 1, 0);
+  configs[USE_IAA_UNCOMPRESS] = value;
+  configReader.GetValue(config_names[USE_ZLIB_COMPRESS], value, 1, 0);
+  configs[USE_ZLIB_COMPRESS] = value;
+  configReader.GetValue(config_names[USE_ZLIB_UNCOMPRESS], value, 1, 0);
+  configs[USE_ZLIB_UNCOMPRESS] = value;
+  configReader.GetValue(config_names[IAA_COMPRESS_PERCENTAGE], value, 100, 0);
+  configs[IAA_COMPRESS_PERCENTAGE] = value;
+  configReader.GetValue(config_names[IAA_UNCOMPRESS_PERCENTAGE], value, 100, 0);
+  configs[IAA_UNCOMPRESS_PERCENTAGE] = value;
+  configReader.GetValue(config_names[IAA_PREPEND_EMPTY_BLOCK], value, 1, 0);
+  configs[IAA_PREPEND_EMPTY_BLOCK] = value;
+  configReader.GetValue(config_names[QAT_PERIODICAL_POLLING], value, 1, 0);
+  configs[QAT_PERIODICAL_POLLING] = value;
+  configReader.GetValue(config_names[QAT_COMPRESSION_LEVEL], value, 9, 1);
+  configs[QAT_COMPRESSION_LEVEL] = value;
+  configReader.GetValue(config_names[LOG_LEVEL], value, 2, 0);
+  configs[LOG_LEVEL] = value;
+  configReader.GetValue(config_names[LOG_STATS_SAMPLES], value, 1000, 0);
+  configs[LOG_STATS_SAMPLES] = value;
   configReader.GetValue("log_file", log_file);
-  configReader.GetValue("log_level", log_level, 2, 0);
-  configReader.GetValue("log_stats_samples", log_stats_samples, INT_MAX, 0);
-
   file_content.append(configReader.DumpValues());
 
   return true;
 }
 
-void SetConfig(ConfigOption option, int value) {
-  switch (option) {
-    case USE_QAT_COMPRESS:
-      use_qat_compress = value;
-      break;
-    case USE_QAT_UNCOMPRESS:
-      use_qat_uncompress = value;
-      break;
-    case USE_IAA_COMPRESS:
-      use_iaa_compress = value;
-      break;
-    case USE_IAA_UNCOMPRESS:
-      use_iaa_uncompress = value;
-      break;
-    case USE_ZLIB_COMPRESS:
-      use_zlib_compress = value;
-      break;
-    case USE_ZLIB_UNCOMPRESS:
-      use_zlib_uncompress = value;
-      break;
-    case IAA_COMPRESS_PERCENTAGE:
-      iaa_compress_percentage = value;
-      break;
-    case IAA_UNCOMPRESS_PERCENTAGE:
-      iaa_uncompress_percentage = value;
-      break;
-    case IAA_PREPEND_EMPTY_BLOCK:
-      iaa_prepend_empty_block = value;
-      break;
-    case QAT_PERIODICAL_POLLING:
-      qat_periodical_polling = value;
-      break;
-    case QAT_COMPRESSION_LEVEL:
-      qat_compression_level = value;
-      break;
-    case LOG_LEVEL:
-      log_level = value;
-      break;
-    case LOG_STATS_SAMPLES:
-      log_stats_samples = value;
-      break;
-  }
-}
+void SetConfig(ConfigOption option, int value) { configs[option] = value; }
 
-int GetConfig(ConfigOption option) {
-  switch (option) {
-    case USE_QAT_COMPRESS:
-      return use_qat_compress;
-    case USE_QAT_UNCOMPRESS:
-      return use_qat_uncompress;
-    case USE_IAA_COMPRESS:
-      return use_iaa_compress;
-    case USE_IAA_UNCOMPRESS:
-      return use_iaa_uncompress;
-    case USE_ZLIB_COMPRESS:
-      return use_zlib_compress;
-    case USE_ZLIB_UNCOMPRESS:
-      return use_zlib_uncompress;
-    case IAA_COMPRESS_PERCENTAGE:
-      return iaa_compress_percentage;
-    case IAA_UNCOMPRESS_PERCENTAGE:
-      return iaa_uncompress_percentage;
-    case IAA_PREPEND_EMPTY_BLOCK:
-      return iaa_prepend_empty_block;
-    case QAT_PERIODICAL_POLLING:
-      return qat_periodical_polling;
-    case QAT_COMPRESSION_LEVEL:
-      return qat_compression_level;
-    case LOG_LEVEL:
-      return log_level;
-    case LOG_STATS_SAMPLES:
-      return log_stats_samples;
-  }
-  return 0;
-}
+int GetConfig(ConfigOption option) { return configs[option]; }
+
 }  // namespace config

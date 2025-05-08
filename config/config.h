@@ -5,6 +5,8 @@
 
 #define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
+#include <stdint.h>
+
 #include <string>
 
 namespace config {
@@ -21,23 +23,13 @@ enum ConfigOption {
   QAT_PERIODICAL_POLLING,
   QAT_COMPRESSION_LEVEL,
   LOG_LEVEL,
-  LOG_STATS_SAMPLES
+  LOG_STATS_SAMPLES,
+  CONFIG_MAX
 };
 
-extern int use_qat_compress;
-extern int use_qat_uncompress;
-extern int use_iaa_compress;
-extern int use_iaa_uncompress;
-extern int use_zlib_compress;
-extern int use_zlib_uncompress;
-extern int iaa_compress_percentage;
-extern int iaa_uncompress_percentage;
-extern int iaa_prepend_empty_block;
-extern int qat_periodical_polling;
-extern int qat_compression_level;
 extern std::string log_file;
-extern int log_level;
-extern int log_stats_samples;
+
+extern uint16_t configs[CONFIG_MAX];
 
 VISIBLE_FOR_TESTING bool LoadConfigFile(
     std::string& file_content, const char* filePath = "/etc/zlib-accel.conf");

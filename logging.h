@@ -13,7 +13,7 @@
 
 #include "config/config.h"
 #include "utils.h"
-
+using namespace config;
 enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
@@ -32,7 +32,7 @@ inline static void CloseLogFile() {
 
 #ifdef DEBUG_LOG
 static inline void Log(LogLevel level, const char* format, ...) {
-  if (static_cast<int>(level) < config::log_level) {
+  if (static_cast<int>(level) < configs[LOG_LEVEL]) {
     return;
   }
 
@@ -77,7 +77,7 @@ static inline void LogStats(const char* stats_str) {
 #ifdef DEBUG_LOG
 static inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data,
                                            uint32_t len, int window_bits) {
-  if (static_cast<int>(level) < config::log_level) {
+  if (static_cast<int>(level) < configs[LOG_LEVEL]) {
     return;
   }
 
