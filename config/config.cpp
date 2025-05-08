@@ -26,7 +26,6 @@ const std::string config_names[CONFIG_MAX]{
 
 uint16_t configs[CONFIG_MAX] = {1, 1, 0, 0, 1, 1, 50, 50, 0, 0, 1, 2, 1000};
 
-
 bool LoadConfigFile(std::string& file_content, const char* filePath) {
   const bool exists = std::filesystem::exists(filePath);
   const bool symlink = std::filesystem::is_symlink(filePath);
