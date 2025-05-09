@@ -6,6 +6,7 @@
 #include "config/config.h"
 #include "logging.h"
 #include "utils.h"
+using namespace config;
 #ifdef USE_QAT
 #include <iostream>
 
@@ -93,14 +94,14 @@ void QATJob::Init(QzSession_T **qzSession, CompressedFormat format,
   QzSessionParamsDeflateExt_T deflateExt = {{}, 0, 0};
   deflateExt.deflate_params.common_params.comp_algorithm = QZ_DEFLATE;
   deflateExt.deflate_params.common_params.comp_lvl =
-      config::qat_compression_level;
+      configs[QAT_COMPRESSION_LEVEL];
   deflateExt.deflate_params.common_params.direction = QZ_DIR_BOTH;
   deflateExt.deflate_params.common_params.hw_buff_sz = QAT_HW_BUFF_SZ;
   deflateExt.deflate_params.common_params.input_sz_thrshold =
       QZ_COMP_THRESHOLD_DEFAULT;
   deflateExt.deflate_params.common_params.is_sensitive_mode = 0;
   deflateExt.deflate_params.common_params.max_forks = 0;
-  if (config::qat_periodical_polling == 1) {
+  if (configs[QAT_PERIODICAL_POLLING] == 1) {
     deflateExt.deflate_params.common_params.polling_mode =
         QZ_PERIODICAL_POLLING;
   } else {

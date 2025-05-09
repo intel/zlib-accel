@@ -6,6 +6,7 @@
 #include "config/config.h"
 #include "logging.h"
 #include "utils.h"
+using namespace config;
 #ifdef USE_IAA
 #include <iostream>
 
@@ -102,7 +103,7 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   bool prepend_empty_block = false;
   CompressedFormat format = GetCompressedFormat(window_bits);
   if (format != CompressedFormat::ZLIB &&
-      config::iaa_prepend_empty_block == 1 &&
+      configs[IAA_PREPEND_EMPTY_BLOCK] == 1 &&
       job->available_out >= PREPENDED_BLOCK_LENGTH) {
     job->next_out_ptr += PREPENDED_BLOCK_LENGTH;
     job->available_out -= PREPENDED_BLOCK_LENGTH;
@@ -275,9 +276,9 @@ bool IsIAADecompressible(uint8_t* input, uint32_t input_length,
   } else {
     // if no empty block markers selected, we cannot tell for sure it's
     // IAA-decompression, but we assume it is.
-    if (config::iaa_prepend_empty_block == 0) {
+    if (configs[IAA_PREPEND_EMPTY_BLOCK] == 0) {
       return true;
-    } else if (config::iaa_prepend_empty_block == 1 &&
+    } else if (configs[IAA_PREPEND_EMPTY_BLOCK] == 1 &&
                PrependedEmptyBlockPresent(input, input_length, format)) {
       return true;
     } else {

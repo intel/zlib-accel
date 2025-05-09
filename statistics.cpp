@@ -9,6 +9,7 @@
 
 #include "config/config.h"
 #include "logging.h"
+using namespace config;
 
 // clang-format off
 const std::string stat_names[STATS_COUNT] {
@@ -61,7 +62,7 @@ uint64_t GetStat(Statistic stat) {
 #ifdef ENABLE_STATISTICS
 void PrintStats() {
   if ((stats[DEFLATE_COUNT] + stats[INFLATE_COUNT]) %
-          config::log_stats_samples !=
+          configs[LOG_STATS_SAMPLES] !=
       0) {
     return;
   }
