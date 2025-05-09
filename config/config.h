@@ -29,7 +29,7 @@ enum ConfigOption {
 
 extern std::string log_file;
 
-extern uint16_t configs[CONFIG_MAX];
+extern uint32_t configs[CONFIG_MAX];
 
 VISIBLE_FOR_TESTING bool LoadConfigFile(
     std::string& file_content, const char* filePath = "/etc/zlib-accel.conf");
