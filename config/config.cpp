@@ -14,17 +14,39 @@ using namespace std;
 namespace config {
 
 std::string log_file = "";
-
+// clang-format off
 const std::string config_names[CONFIG_MAX]{
-    "use_qat_compress",        "use_qat_uncompress",
-    "use_iaa_compress",        "use_iaa_uncompress",
-    "use_zlib_compress",       "USE_ZLIB_UNCOMPRESS",
-    "use_zlib_uncompress",     "iaa_compress_percentage",
-    "iaa_prepend_empty_block", "qat_periodical_polling",
-    "qat_compression_level",   "log_level",
-    "log_stats_samples"};
-
-uint16_t configs[CONFIG_MAX] = {1, 1, 0, 0, 1, 1, 50, 50, 0, 0, 1, 2, 1000};
+    "use_qat_compress",
+    "use_qat_uncompress",
+    "use_iaa_compress",
+    "use_iaa_uncompress",
+    "use_zlib_compress",
+    "use_zlib_uncompress",
+    "iaa_compress_percentage",
+    "iaa_uncompress_percentage",
+    "iaa_prepend_empty_block",
+    "qat_periodical_polling",
+    "qat_compression_level",
+    "log_level",
+    "log_stats_samples"
+    };
+// clang-format on
+// default config values initialization
+uint32_t configs[CONFIG_MAX] = {
+    1,   /*use_qat_compress*/
+    1,   /*use_qat_uncompress*/
+    0,   /*use_iaa_compress*/
+    0,   /*use_iaa_uncompress*/
+    1,   /*use_zlib_compress*/
+    1,   /*use_zlib_uncompress*/
+    50,  /*iaa_compress_percentage*/
+    50,  /*iaa_uncompress_percentage*/
+    0,   /*iaa_prepend_empty_block*/
+    0,   /*qat_periodical_polling*/
+    1,   /*qat_compression_level*/
+    2,   /*log_level*/
+    1000 /*log_stats_samples*/
+};
 
 bool LoadConfigFile(std::string& file_content, const char* filePath) {
   const bool exists = std::filesystem::exists(filePath);
