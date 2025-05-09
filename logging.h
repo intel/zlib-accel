@@ -32,7 +32,7 @@ inline static void CloseLogFile() {
 
 #ifdef DEBUG_LOG
 static inline void Log(LogLevel level, const char* format, ...) {
-  if (static_cast<int>(level) < configs[LOG_LEVEL]) {
+  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
     return;
   }
 
@@ -77,7 +77,7 @@ static inline void LogStats(const char* stats_str) {
 #ifdef DEBUG_LOG
 static inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data,
                                            uint32_t len, int window_bits) {
-  if (static_cast<int>(level) < configs[LOG_LEVEL]) {
+  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
     return;
   }
 
