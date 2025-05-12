@@ -34,6 +34,6 @@ extern uint32_t configs[CONFIG_MAX];
 VISIBLE_FOR_TESTING bool LoadConfigFile(
     std::string& file_content, const char* filePath = "/etc/zlib-accel.conf");
 
-VISIBLE_FOR_TESTING void SetConfig(ConfigOption option, int value);
-VISIBLE_FOR_TESTING int GetConfig(ConfigOption option);
+VISIBLE_FOR_TESTING void SetConfig(ConfigOption option, uint32_t value);
+VISIBLE_FOR_TESTING uint32_t GetConfig(ConfigOption option);
 }  // namespace config

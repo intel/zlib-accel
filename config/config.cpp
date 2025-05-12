@@ -89,8 +89,8 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
   return true;
 }
 
-void SetConfig(ConfigOption option, int value) { configs[option] = value; }
+void SetConfig(ConfigOption option, uint32_t value) { configs[option] = value; }
 
-int GetConfig(ConfigOption option) { return configs[option]; }
+uint32_t GetConfig(ConfigOption option) { return configs[option]; }
 
 }  // namespace config
