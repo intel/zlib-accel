@@ -14,14 +14,14 @@
 
 using namespace std;
 
-bool ConfigReader::GetValue(std::string tag, int& value, int max_value,
-                            int min_value) {
+bool ConfigReader::GetValue(std::string tag, uint32_t& value,
+                            uint32_t max_value, uint32_t min_value) {
   bool ret_val = false;
   map<string, string>::iterator it;
   it = config_settings_map.find(tag);
   if (it != config_settings_map.end()) {
     char* p;
-    value = (int)strtol((it->second).c_str(), &p, 10);
+    value = (uint32_t)strtol((it->second).c_str(), &p, 10);
     if ((*p == 0) && (min_value <= value && value <= max_value)) {
       ret_val = true;
     } else {

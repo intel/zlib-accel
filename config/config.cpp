@@ -14,23 +14,7 @@ using namespace std;
 namespace config {
 
 std::string log_file = "";
-// clang-format off
-const std::string config_names[CONFIG_MAX]{
-    "use_qat_compress",
-    "use_qat_uncompress",
-    "use_iaa_compress",
-    "use_iaa_uncompress",
-    "use_zlib_compress",
-    "use_zlib_uncompress",
-    "iaa_compress_percentage",
-    "iaa_uncompress_percentage",
-    "iaa_prepend_empty_block",
-    "qat_periodical_polling",
-    "qat_compression_level",
-    "log_level",
-    "log_stats_samples"
-    };
-// clang-format on
+
 // default config values initialization
 uint32_t configs[CONFIG_MAX] = {
     1,   /*use_qat_compress*/
@@ -49,6 +33,28 @@ uint32_t configs[CONFIG_MAX] = {
 };
 
 bool LoadConfigFile(std::string& file_content, const char* filePath) {
+  // Initialize config_names within the function to avoid initialization order
+  // problems. LoadConfigFile is called from the zlib-accel shared library
+  // constructor. If config_names is a global array of strings, it may not be
+  // initialized yet when the constructor is executed.
+  // clang-format off
+  static const std::string config_names[CONFIG_MAX] {
+    "use_qat_compress",
+    "use_qat_uncompress",
+    "use_iaa_compress",
+    "use_iaa_uncompress",
+    "use_zlib_compress",
+    "use_zlib_uncompress",
+    "iaa_compress_percentage",
+    "iaa_uncompress_percentage",
+    "iaa_prepend_empty_block",
+    "qat_periodical_polling",
+    "qat_compression_level",
+    "log_level",
+    "log_stats_samples"
+  };
+  // clang-format on
+
   const bool exists = std::filesystem::exists(filePath);
   const bool symlink = std::filesystem::is_symlink(filePath);
   if (!exists || symlink) {
@@ -56,7 +62,7 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
   }
   ConfigReader configReader;
   configReader.ParseFile(filePath);
-  int value = 0;
+  uint32_t value = 0;
   configReader.GetValue(config_names[USE_QAT_COMPRESS], value, 1, 0);
   configs[USE_QAT_COMPRESS] = value;
   configReader.GetValue(config_names[USE_QAT_UNCOMPRESS], value, 1, 0);
@@ -81,7 +87,7 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
   configs[QAT_COMPRESSION_LEVEL] = value;
   configReader.GetValue(config_names[LOG_LEVEL], value, 2, 0);
   configs[LOG_LEVEL] = value;
-  configReader.GetValue(config_names[LOG_STATS_SAMPLES], value, 1000, 0);
+  configReader.GetValue(config_names[LOG_STATS_SAMPLES], value, UINT32_MAX, 0);
   configs[LOG_STATS_SAMPLES] = value;
   configReader.GetValue("log_file", log_file);
   file_content.append(configReader.DumpValues());
