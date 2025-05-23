@@ -20,7 +20,7 @@ enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
 inline FILE* log_file_stream = nullptr;
 
 inline static void CreateLogFile(const char* file_name) {
-  log_file_stream = fopen(file_name, "w");
+  log_file_stream = fopen(file_name, "a");
 }
 
 inline static void CloseLogFile() {
