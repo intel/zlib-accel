@@ -191,6 +191,11 @@ qat_compression_level
 - Values: 1,9. Default: 1
 - QAT compression level
 
+qat_compression_allow_chunking
+- Values: 0,1. Default: 1
+- If the input data is larger than the QAT HW buffer (512kB), by default it is split into chunks of HW buffer size during compression. This causes the compressed data to be a concatenation of multiple streams (one per chunk). This is not the same behavior as for zlib, which creates a single stream. If decompression expects a single stream, this may cause issues.
+- If set to 0, this option disables chunking for QAT compression. If the input data is larger than the QAT HW buffer, QAT will not be used. This improves zlib compatibility.
+
 log_level
 - Values: 0,1,2. Default 2
 - This option applies only if the shim is built with DEBUG_LOG=ON.
@@ -232,6 +237,7 @@ unset LD_PRELOAD
 deflate/inflate and related functions
 - deflateInit, deflateInit2, deflate, deflateEnd, deflateReset
 - inflateInit, inflateInit2, inflate, inflateEnd, inflateReset
+
 For deflate, offload is supported for Z_FINISH flush option. Support for additional options will be added in later releases. 
 
 utility functions

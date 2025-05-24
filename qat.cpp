@@ -272,6 +272,14 @@ bool SupportedOptionsQAT(int window_bits, uint32_t input_length) {
           __LINE__, input_length);
       return false;
     }
+    if (!configs[QAT_COMPRESSION_ALLOW_CHUNKING] &&
+        input_length > QAT_HW_BUFF_SZ) {
+      Log(LogLevel::LOG_INFO,
+          "SupportedOptionsQAT() Line %d input length %d is greater than "
+          "QAT HW buffer and chunking is not allowed\n",
+          __LINE__, input_length);
+      return false;
+    }
     return true;
   }
   return false;

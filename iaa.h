@@ -40,7 +40,8 @@ class IAAJob {
 
 int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
                 uint32_t* output_length, qpl_path_t execution_path,
-                int window_bits, bool gzip_ext = false);
+                int window_bits, uint32_t max_compressed_size = 0,
+                bool gzip_ext = false);
 
 int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
                   uint32_t* output_length, qpl_path_t execution_path,

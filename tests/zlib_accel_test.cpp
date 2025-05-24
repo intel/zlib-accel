@@ -243,6 +243,7 @@ void SetCompressPath(ExecutionPath path, bool zlib_fallback,
       SetConfig(USE_IAA_COMPRESS, 0);
       SetConfig(USE_QAT_COMPRESS, 1);
       SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
+      SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, 1);
       break;
     case IAA:
       SetConfig(USE_IAA_COMPRESS, 1);
