@@ -263,8 +263,12 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     if (path_selected == IAA) {
 #ifdef USE_IAA
       in_call = true;
+      // Casting to uint32_t is safe, as IAA is not used for any blocks larger
+      // than 2MB
+      uint32_t max_compressed_size = (uint32_t)deflateBound(strm, input_len);
       ret = CompressIAA(strm->next_in, &input_len, strm->next_out, &output_len,
-                        qpl_path_hardware, deflate_settings->window_bits);
+                        qpl_path_hardware, deflate_settings->window_bits,
+                        max_compressed_size);
       deflate_settings->path = IAA;
       in_call = false;
       INCREMENT_STAT(DEFLATE_IAA_COUNT);
