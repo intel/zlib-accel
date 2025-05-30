@@ -28,6 +28,7 @@ uint32_t configs[CONFIG_MAX] = {
     0,   /*iaa_prepend_empty_block*/
     0,   /*qat_periodical_polling*/
     1,   /*qat_compression_level*/
+    0,   /*qat_compression_allow_chunking*/
     2,   /*log_level*/
     1000 /*log_stats_samples*/
 };
@@ -50,6 +51,7 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
     "iaa_prepend_empty_block",
     "qat_periodical_polling",
     "qat_compression_level",
+	"qat_compression_allow_chunking",
     "log_level",
     "log_stats_samples"
   };
@@ -85,6 +87,9 @@ bool LoadConfigFile(std::string& file_content, const char* filePath) {
   configs[QAT_PERIODICAL_POLLING] = value;
   configReader.GetValue(config_names[QAT_COMPRESSION_LEVEL], value, 9, 1);
   configs[QAT_COMPRESSION_LEVEL] = value;
+  configReader.GetValue(config_names[QAT_COMPRESSION_ALLOW_CHUNKING], value, 1,
+                        0);
+  configs[QAT_COMPRESSION_ALLOW_CHUNKING] = value;
   configReader.GetValue(config_names[LOG_LEVEL], value, 2, 0);
   configs[LOG_LEVEL] = value;
   configReader.GetValue(config_names[LOG_STATS_SAMPLES], value, UINT32_MAX, 0);

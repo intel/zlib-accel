@@ -232,7 +232,8 @@ int ZlibUncompressGzipFileInChunks(size_t output_length, char** uncompressed,
 }
 
 void SetCompressPath(ExecutionPath path, bool zlib_fallback,
-                     bool iaa_prepend_empty_block = false) {
+                     bool iaa_prepend_empty_block,
+                     bool qat_compression_allow_chunking) {
   switch (path) {
     case ZLIB:
       SetConfig(USE_IAA_COMPRESS, 0);
@@ -253,10 +254,11 @@ void SetCompressPath(ExecutionPath path, bool zlib_fallback,
       break;
   }
   SetConfig(IAA_PREPEND_EMPTY_BLOCK, iaa_prepend_empty_block);
+  SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, qat_compression_allow_chunking);
 }
 
 void SetUncompressPath(ExecutionPath path, bool zlib_fallback,
-                       bool iaa_prepend_empty_block = false) {
+                       bool iaa_prepend_empty_block) {
   switch (path) {
     case ZLIB:
       SetConfig(USE_IAA_UNCOMPRESS, 0);
@@ -287,7 +289,7 @@ struct TestParam {
             int _flush_compress, int _window_bits_uncompress,
             int _flush_uncompress, int _input_chunks_uncompress,
             size_t _block_size, BlockCompressibilityType _block_type,
-            bool _iaa_prepend_empty_block)
+            bool _iaa_prepend_empty_block, bool _qat_compression_allow_chunking)
       : execution_path_compress(_execution_path_compress),
         zlib_fallback_compress(_zlib_fallback_compress),
         execution_path_uncompress(_execution_path_uncompress),
@@ -299,7 +301,8 @@ struct TestParam {
         input_chunks_uncompress(_input_chunks_uncompress),
         block_size(_block_size),
         block_type(_block_type),
-        iaa_prepend_empty_block(_iaa_prepend_empty_block) {}
+        iaa_prepend_empty_block(_iaa_prepend_empty_block),
+        qat_compression_allow_chunking(_qat_compression_allow_chunking) {}
 
   ExecutionPath execution_path_compress;
   bool zlib_fallback_compress;
@@ -313,6 +316,7 @@ struct TestParam {
   size_t block_size;
   BlockCompressibilityType block_type;
   bool iaa_prepend_empty_block;
+  bool qat_compression_allow_chunking;
 };
 
 bool ZlibCompressExpectFallback(TestParam test_param, size_t input_length,
@@ -351,7 +355,7 @@ bool ZlibUncompressExpectFallback(TestParam test_param, size_t input_length,
                                   std::string& compressed,
                                   size_t compressed_length,
                                   int window_bits_uncompress,
-                                  bool compress_fallback = false,
+                                  bool compress_fallback,
                                   bool* accelerator_tried = nullptr) {
   (void)test_param;
   (void)input_length;
@@ -363,16 +367,16 @@ bool ZlibUncompressExpectFallback(TestParam test_param, size_t input_length,
   bool fallback_expected = false;
   bool accelerator_tried_val = false;
 #ifdef USE_QAT
-  // if QAT selected, but options not supported or multi-call decompression, and
-  // no zlib fallback
   if (test_param.execution_path_uncompress == QAT) {
     if (!SupportedOptionsQAT(
             window_bits_uncompress,
             compressed_length / test_param.input_chunks_uncompress)) {
       fallback_expected = true;
     } else if (input_length > QAT_HW_BUFF_SZ &&
-               test_param.execution_path_compress != QAT) {
-      // If it was not compressed by QAT, it is not chunked
+               (test_param.execution_path_compress != QAT ||
+                !test_param.qat_compression_allow_chunking)) {
+      // If it was not compressed by QAT or QAT chunking is not allowed, it is
+      // not chunked
       fallback_expected = true;
       accelerator_tried_val = true;
     } else if (input_length > QAT_HW_BUFF_SZ &&
@@ -381,8 +385,10 @@ bool ZlibUncompressExpectFallback(TestParam test_param, size_t input_length,
                      CompressedFormat::ZLIB &&
                  test_param.block_type == incompressible_block) ||
                 GetCompressedFormat(window_bits_uncompress) ==
-                    CompressedFormat::DEFLATE_RAW)) {
+                    CompressedFormat::DEFLATE_RAW ||
+                !test_param.qat_compression_allow_chunking)) {
       // If data was compressed with QAT, it was chunked during compression
+      // (if chunking is allowed)
       // - gzip format: QAT decompression always possible (stream boundaries
       // detected before decompression)
       // - zlib format: QAT decompression possible if compressed
@@ -400,8 +406,6 @@ bool ZlibUncompressExpectFallback(TestParam test_param, size_t input_length,
   }
 #endif
 #ifdef USE_IAA
-  // if IAA selected, but options not supported or block not decompressible, and
-  // no zlib fallback
   if (test_param.execution_path_uncompress == IAA) {
     if (!SupportedOptionsIAA(
             window_bits_uncompress,
@@ -469,21 +473,40 @@ void VerifyStatIncrementedUpTo(Statistic stat, int up_to) {
   }
 }
 
+void RunDummyQatJob() {
+  size_t input_length = 4096;
+  char* input = GenerateBlock(input_length, compressible_block);
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath execution_path = UNDEFINED;
+  ZlibCompress(input, input_length, &compressed, 15, 4, &output_upper_bound,
+               &execution_path);
+  char* uncompressed = nullptr;
+  size_t uncompressed_length;
+  size_t input_consumed;
+  ZlibUncompress(compressed.c_str(), compressed.length(), input_length,
+                 &uncompressed, &uncompressed_length, &input_consumed, 15, 1, 1,
+                 &execution_path);
+  delete[] uncompressed;
+  DestroyBlock(input);
+}
+
 class ZlibTest
     : public testing::TestWithParam<
           std::tuple<ExecutionPath, bool, ExecutionPath, bool, int, int, int,
-                     int, int, size_t, BlockCompressibilityType, bool>> {};
+                     int, int, size_t, BlockCompressibilityType, bool, bool>> {
+};
 
 TEST_P(ZlibTest, CompressDecompress) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   // QAT does not support stateful decompression (decompression must be done in
   // one call)
@@ -509,7 +532,8 @@ TEST_P(ZlibTest, CompressDecompress) {
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,
-                  test_param.iaa_prepend_empty_block);
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -605,10 +629,12 @@ TEST_P(ZlibTest, CompressDecompress) {
 #ifdef USE_QAT
     if (test_param.execution_path_compress == QAT &&
         input_length > QAT_HW_BUFF_SZ &&
+        test_param.qat_compression_allow_chunking &&
         GetCompressedFormat(window_bits_uncompress) !=
             CompressedFormat::DEFLATE_RAW) {
       // For data compressed by qzCompress, data is
-      // made of multiple streams of hardware buffer size.
+      // made of multiple streams of hardware buffer size
+      // (if chunking is allowed)
       ASSERT_TRUE(uncompressed_length <= QAT_HW_BUFF_SZ);
       ASSERT_TRUE(memcmp(uncompressed, input, uncompressed_length) == 0);
     } else {
@@ -621,43 +647,49 @@ TEST_P(ZlibTest, CompressDecompress) {
 #endif
   }
 
+  // TODO remove this section and RunDummyQatJob when QAT state reset issue is
+  // resolved.
+  if (GetCompressedFormat(window_bits_uncompress) == CompressedFormat::ZLIB) {
+    RunDummyQatJob();
+  }
+
   delete[] uncompressed;
   DestroyBlock(input);
 }
 
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibTest,
-    testing::Combine(testing::Values(ZLIB
+    testing::Combine(
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true),
-                     testing::Values(ZLIB
+                        ),
+        testing::Values(false, true),
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true), testing::Values(-15, 15, 31),
-                     // testing::Values(Z_NO_FLUSH, Z_PARTIAL_FLUSH,
-                     // Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_FINISH, Z_BLOCK, Z_TREES),
-                     testing::Values(Z_FINISH), testing::Values(0),
-                     testing::Values(Z_PARTIAL_FLUSH, Z_SYNC_FLUSH),
-                     testing::Values(1, 2),
-                     testing::Values(1024, 4096, 16384, 262144, 2097152),
-                     testing::Values(compressible_block, incompressible_block,
-                                     zero_block),
-                     testing::Values(false, true)));
+                        ),
+        testing::Values(false, true), testing::Values(-15, 15, 31),
+        // testing::Values(Z_NO_FLUSH, Z_PARTIAL_FLUSH,
+        // Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_FINISH, Z_BLOCK, Z_TREES),
+        testing::Values(Z_FINISH), testing::Values(0),
+        testing::Values(Z_PARTIAL_FLUSH, Z_SYNC_FLUSH), testing::Values(1, 2),
+        testing::Values(1024, 4096, 16384, 262144, 2097152),
+        testing::Values(compressible_block, incompressible_block, zero_block),
+        testing::Values(false, true),   /* iaa_prepend_empty_block */
+        testing::Values(false, true))); /* qat_compression_allow_chunking */
 
 class ZlibUtilityTest : public ZlibTest {};
 
@@ -665,15 +697,17 @@ TEST_P(ZlibUtilityTest, CompressDecompressUtility) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   SetCompressPath(test_param.execution_path_compress,
-                  test_param.zlib_fallback_compress);
+                  test_param.zlib_fallback_compress,
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -696,7 +730,8 @@ TEST_P(ZlibUtilityTest, CompressDecompressUtility) {
   }
 
   SetUncompressPath(test_param.execution_path_uncompress,
-                    test_param.zlib_fallback_uncompress);
+                    test_param.zlib_fallback_uncompress,
+                    test_param.iaa_prepend_empty_block);
 
   char* uncompressed;
   size_t uncompressed_length;
@@ -724,34 +759,35 @@ TEST_P(ZlibUtilityTest, CompressDecompressUtility) {
 
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibUtilityTest,
-    testing::Combine(testing::Values(ZLIB
+    testing::Combine(
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true),
-                     testing::Values(ZLIB
+                        ),
+        testing::Values(false, true),
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true), testing::Values(15),
-                     testing::Values(Z_FINISH), testing::Values(0),
-                     testing::Values(Z_SYNC_FLUSH), testing::Values(1),
-                     testing::Values(1024, 4096, 16384, 262144),
-                     testing::Values(compressible_block, incompressible_block,
-                                     zero_block),
-                     testing::Values(false)));
+                        ),
+        testing::Values(false, true), testing::Values(15),
+        testing::Values(Z_FINISH), testing::Values(0),
+        testing::Values(Z_SYNC_FLUSH), testing::Values(1),
+        testing::Values(1024, 4096, 16384, 262144),
+        testing::Values(compressible_block, incompressible_block, zero_block),
+        testing::Values(false),  /* iaa_prepend_empty_block */
+        testing::Values(true))); /* qat_compression_allow_chunking */
 
 class ZlibUtility2Test : public ZlibTest {};
 
@@ -759,15 +795,17 @@ TEST_P(ZlibUtility2Test, CompressDecompressUtility2) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   SetCompressPath(test_param.execution_path_compress,
-                  test_param.zlib_fallback_compress);
+                  test_param.zlib_fallback_compress,
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -790,7 +828,8 @@ TEST_P(ZlibUtility2Test, CompressDecompressUtility2) {
   }
 
   SetUncompressPath(test_param.execution_path_uncompress,
-                    test_param.zlib_fallback_uncompress);
+                    test_param.zlib_fallback_uncompress,
+                    test_param.iaa_prepend_empty_block);
 
   char* uncompressed;
   size_t uncompressed_length;
@@ -818,34 +857,35 @@ TEST_P(ZlibUtility2Test, CompressDecompressUtility2) {
 
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibUtility2Test,
-    testing::Combine(testing::Values(ZLIB
+    testing::Combine(
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true),
-                     testing::Values(ZLIB
+                        ),
+        testing::Values(false, true),
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true), testing::Values(15),
-                     testing::Values(Z_FINISH), testing::Values(0),
-                     testing::Values(Z_SYNC_FLUSH), testing::Values(1),
-                     testing::Values(1024, 4096, 16384, 262144),
-                     testing::Values(compressible_block, incompressible_block,
-                                     zero_block),
-                     testing::Values(false)));
+                        ),
+        testing::Values(false, true), testing::Values(15),
+        testing::Values(Z_FINISH), testing::Values(0),
+        testing::Values(Z_SYNC_FLUSH), testing::Values(1),
+        testing::Values(1024, 4096, 16384, 262144),
+        testing::Values(compressible_block, incompressible_block, zero_block),
+        testing::Values(false),  /* iaa_prepend_empty_block */
+        testing::Values(true))); /* qat_compression_allow_chunking */
 
 class ZlibPartialAndMultiStreamTest : public ZlibTest {};
 
@@ -853,15 +893,17 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   SetCompressPath(test_param.execution_path_compress,
-                  test_param.zlib_fallback_compress);
+                  test_param.zlib_fallback_compress,
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -886,7 +928,8 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
   }
 
   SetUncompressPath(test_param.execution_path_uncompress,
-                    test_param.zlib_fallback_uncompress);
+                    test_param.zlib_fallback_uncompress,
+                    test_param.iaa_prepend_empty_block);
 
   // Decompress half of the first stream
   char* uncompressed;
@@ -918,15 +961,17 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   SetCompressPath(test_param.execution_path_compress,
-                  test_param.zlib_fallback_compress);
+                  test_param.zlib_fallback_compress,
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -973,7 +1018,8 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   std::string compressed = compressed1 + compressed2;
 
   SetUncompressPath(test_param.execution_path_uncompress,
-                    test_param.zlib_fallback_uncompress);
+                    test_param.zlib_fallback_uncompress,
+                    test_param.iaa_prepend_empty_block);
 
   // Decompress all the first stream and half of the second
   char* uncompressed;
@@ -1044,7 +1090,8 @@ INSTANTIATE_TEST_SUITE_P(
         // able to decompress if no references happened to be farther than 4kB.
         testing::Values(1024, 32768, 262144),
         testing::Values(compressible_block, incompressible_block),
-        testing::Values(false)));
+        testing::Values(false),  /* iaa_prepend_empty_block */
+        testing::Values(true))); /* qat_compression_allow_chunking */
 
 class ZlibGzipFileTest : public ZlibTest {};
 
@@ -1052,15 +1099,17 @@ TEST_P(ZlibGzipFileTest, CompressDecompressGzipFile) {
   Log(LogLevel::LOG_INFO,
       testing::PrintToString(GetParam()).append("\n").c_str());
 
-  TestParam test_param(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                       std::get<2>(GetParam()), std::get<3>(GetParam()),
-                       std::get<4>(GetParam()), std::get<5>(GetParam()),
-                       std::get<6>(GetParam()), std::get<7>(GetParam()),
-                       std::get<8>(GetParam()), std::get<9>(GetParam()),
-                       std::get<10>(GetParam()), std::get<11>(GetParam()));
+  TestParam test_param(
+      std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
+      std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
+      std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
+      std::get<9>(GetParam()), std::get<10>(GetParam()),
+      std::get<11>(GetParam()), std::get<12>(GetParam()));
 
   SetCompressPath(test_param.execution_path_compress,
-                  test_param.zlib_fallback_compress);
+                  test_param.zlib_fallback_compress,
+                  test_param.iaa_prepend_empty_block,
+                  test_param.qat_compression_allow_chunking);
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -1071,7 +1120,8 @@ TEST_P(ZlibGzipFileTest, CompressDecompressGzipFile) {
   ASSERT_EQ(ret, Z_OK);
 
   SetUncompressPath(test_param.execution_path_uncompress,
-                    test_param.zlib_fallback_uncompress);
+                    test_param.zlib_fallback_uncompress,
+                    test_param.iaa_prepend_empty_block);
 
   char* uncompressed;
   size_t uncompressed_length;
@@ -1093,33 +1143,35 @@ TEST_P(ZlibGzipFileTest, CompressDecompressGzipFile) {
 
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibGzipFileTest,
-    testing::Combine(testing::Values(ZLIB
+    testing::Combine(
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true),
-                     testing::Values(ZLIB
+                        ),
+        testing::Values(false, true),
+        testing::Values(ZLIB
 #ifdef USE_QAT
-                                     ,
-                                     QAT
+                        ,
+                        QAT
 #endif
 #ifdef USE_IAA
-                                     ,
-                                     IAA
+                        ,
+                        IAA
 #endif
-                                     ),
-                     testing::Values(false, true), testing::Values(31),
-                     testing::Values(Z_FINISH), testing::Values(0),
-                     testing::Values(Z_SYNC_FLUSH), testing::Values(1, 10),
-                     testing::Values(1024, 16384, 262144, 2097152),
-                     testing::Values(compressible_block, incompressible_block),
-                     testing::Values(false)));
+                        ),
+        testing::Values(false, true), testing::Values(31),
+        testing::Values(Z_FINISH), testing::Values(0),
+        testing::Values(Z_SYNC_FLUSH), testing::Values(1, 10),
+        testing::Values(1024, 16384, 262144, 2097152),
+        testing::Values(compressible_block, incompressible_block),
+        testing::Values(false),  /* iaa_prepend_empty_block */
+        testing::Values(true))); /* qat_compression_allow_chunking */
 
 class ConfigLoaderTest : public ::testing::Test {};
 
