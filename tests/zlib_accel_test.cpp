@@ -13,12 +13,12 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <tuple>
 #include <vector>
 
 #include "../config/config.h"
 #include "../iaa.h"
-#include "../logging.h"
 #include "../qat.h"
 #include "../statistics.h"
 #include "../utils.h"
@@ -317,6 +317,58 @@ struct TestParam {
   BlockCompressibilityType block_type;
   bool iaa_prepend_empty_block;
   bool qat_compression_allow_chunking;
+
+  std::string ExecutionPathToString(ExecutionPath path) {
+    switch (path) {
+      case UNDEFINED:
+        return "undefined";
+      case ZLIB:
+        return "zlib";
+      case QAT:
+        return "QAT";
+      case IAA:
+        return "IAA";
+    }
+    return "";
+  }
+
+  std::string BlockCompressibilityTypeToString(
+      BlockCompressibilityType block_type) {
+    switch (block_type) {
+      case compressible_block:
+        return "compressible block";
+      case incompressible_block:
+        return "incompressible block";
+      case zero_block:
+        return "zero block";
+    }
+    return "";
+  }
+
+  std::string ToString() {
+    std::stringstream param_str;
+    param_str << "execution_path_compress: "
+              << ExecutionPathToString(execution_path_compress) << std::endl;
+    param_str << "zlib_fallback_compress: " << zlib_fallback_compress
+              << std::endl;
+    param_str << "execution_path_uncompress: "
+              << ExecutionPathToString(execution_path_uncompress) << std::endl;
+    param_str << "zlib_fallback_uncompress: " << zlib_fallback_uncompress
+              << std::endl;
+    param_str << "window_bits_compress: " << window_bits_compress << std::endl;
+    param_str << "flush_compress: " << flush_compress << std::endl;
+    param_str << "window_bits_uncompress: " << window_bits_uncompress
+              << std::endl;
+    param_str << "flush_uncompress: " << flush_uncompress << std::endl;
+    param_str << "input_chunks_uncompress: " << input_chunks_uncompress
+              << std::endl;
+    param_str << "block_size: " << block_size << std::endl;
+    param_str << "block_type: " << BlockCompressibilityTypeToString(block_type)
+              << std::endl;
+    param_str << "iaa_prepend_empty_block: " << iaa_prepend_empty_block
+              << std::endl;
+    return param_str.str();
+  }
 };
 
 bool ZlibCompressExpectFallback(TestParam test_param, size_t input_length,
@@ -498,15 +550,13 @@ class ZlibTest
 };
 
 TEST_P(ZlibTest, CompressDecompress) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   // QAT does not support stateful decompression (decompression must be done in
   // one call)
@@ -699,15 +749,13 @@ INSTANTIATE_TEST_SUITE_P(
 class ZlibUtilityTest : public ZlibTest {};
 
 TEST_P(ZlibUtilityTest, CompressDecompressUtility) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,
@@ -797,15 +845,13 @@ INSTANTIATE_TEST_SUITE_P(
 class ZlibUtility2Test : public ZlibTest {};
 
 TEST_P(ZlibUtility2Test, CompressDecompressUtility2) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,
@@ -895,15 +941,13 @@ INSTANTIATE_TEST_SUITE_P(
 class ZlibPartialAndMultiStreamTest : public ZlibTest {};
 
 TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,
@@ -963,15 +1007,13 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
 }
 
 TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,
@@ -1101,15 +1143,13 @@ INSTANTIATE_TEST_SUITE_P(
 class ZlibGzipFileTest : public ZlibTest {};
 
 TEST_P(ZlibGzipFileTest, CompressDecompressGzipFile) {
-  Log(LogLevel::LOG_INFO,
-      testing::PrintToString(GetParam()).append("\n").c_str());
-
   TestParam test_param(
       std::get<0>(GetParam()), std::get<1>(GetParam()), std::get<2>(GetParam()),
       std::get<3>(GetParam()), std::get<4>(GetParam()), std::get<5>(GetParam()),
       std::get<6>(GetParam()), std::get<7>(GetParam()), std::get<8>(GetParam()),
       std::get<9>(GetParam()), std::get<10>(GetParam()),
       std::get<11>(GetParam()), std::get<12>(GetParam()));
+  Log(test_param.ToString());
 
   SetCompressPath(test_param.execution_path_compress,
                   test_param.zlib_fallback_compress,

@@ -6,7 +6,6 @@
 #include <climits>
 #include <filesystem>
 
-#include "../logging.h"
 #include "config_reader.h"
 
 using namespace std;

@@ -3,6 +3,12 @@
 
 #include "test_utils.h"
 
+#include <iostream>
+
+#ifdef DEBUG_LOG
+void Log(std::string message) { std::cout << message << std::endl; }
+#endif
+
 int ZlibCompress(const char* input, size_t input_length, std::string* output,
                  int window_bits, int flush, size_t* output_upper_bound,
                  ExecutionPath* execution_path) {
