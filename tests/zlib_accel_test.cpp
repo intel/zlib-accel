@@ -1231,6 +1231,7 @@ void CreateAndWriteTempConfigFile(const char* file_path) {
   temp_file << "use_zlib_compress=!0222\n";
   temp_file << "use_zlib_uncompress=AB23\n";
   temp_file << "log_level=10\n";
+  temp_file << "log_stats_samples=4294967296\n";
   temp_file.close();
 }
 
@@ -1243,6 +1244,7 @@ TEST_F(ConfigLoaderTest, LoadInvalidConfig) {
   uint32_t DEFAULT_ZLIB_COMPRESS = GetConfig(USE_ZLIB_COMPRESS);
   uint32_t DEFAULT_ZLIB_UNCOMPRESS = GetConfig(USE_ZLIB_UNCOMPRESS);
   uint32_t DEFAULT_LOG_LEVEL = GetConfig(LOG_LEVEL);
+  uint32_t DEFAULT_LOG_STATS_SAMPLES = GetConfig(LOG_STATS_SAMPLES);
 
   CreateAndWriteTempConfigFile("/tmp/invalid_config");
   EXPECT_TRUE(LoadConfigFile(file_content, "/tmp/invalid_config"));
@@ -1253,6 +1255,7 @@ TEST_F(ConfigLoaderTest, LoadInvalidConfig) {
   EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), DEFAULT_ZLIB_COMPRESS);
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), DEFAULT_ZLIB_UNCOMPRESS);
   EXPECT_EQ(GetConfig(LOG_LEVEL), DEFAULT_LOG_LEVEL);
+  EXPECT_EQ(GetConfig(LOG_STATS_SAMPLES), DEFAULT_LOG_STATS_SAMPLES);
   std::remove("/tmp/invalid_config");
   // Restore config from official config file
   LoadConfigFile(file_content);
