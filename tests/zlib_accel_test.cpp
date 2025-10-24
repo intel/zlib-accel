@@ -598,28 +598,28 @@ TEST_P(ZlibTest, CompressDecompress) {
   int ret = ZlibCompress(
       input, input_length, &compressed, test_param.window_bits_compress,
       test_param.flush_compress, &output_upper_bound, &execution_path);
-  VerifyStatIncremented(DEFLATE_COUNT);
+  VerifyStatIncremented(Statistic::DEFLATE_COUNT);
 
   bool compress_fallback_expected =
       ZlibCompressExpectFallback(test_param, input_length, output_upper_bound);
   if (compress_fallback_expected && !test_param.zlib_fallback_compress) {
     ASSERT_EQ(ret, Z_DATA_ERROR);
-    VerifyStatIncremented(DEFLATE_ERROR_COUNT);
+    VerifyStatIncremented(Statistic::DEFLATE_ERROR_COUNT);
     DestroyBlock(input);
     return;
   } else {
     ASSERT_EQ(ret, Z_STREAM_END);
     if (compress_fallback_expected) {
       ASSERT_EQ(execution_path, ZLIB);
-      VerifyStatIncremented(DEFLATE_ZLIB_COUNT);
+      VerifyStatIncremented(Statistic::DEFLATE_ZLIB_COUNT);
     } else {
       ASSERT_EQ(execution_path, test_param.execution_path_compress);
       if (test_param.execution_path_compress == QAT) {
-        VerifyStatIncremented(DEFLATE_QAT_COUNT);
+        VerifyStatIncremented(Statistic::DEFLATE_QAT_COUNT);
       } else if (test_param.execution_path_compress == IAA) {
-        VerifyStatIncremented(DEFLATE_IAA_COUNT);
+        VerifyStatIncremented(Statistic::DEFLATE_IAA_COUNT);
       } else if (test_param.execution_path_compress == ZLIB) {
-        VerifyStatIncremented(DEFLATE_ZLIB_COUNT);
+        VerifyStatIncremented(Statistic::DEFLATE_ZLIB_COUNT);
       }
     }
   }
@@ -640,7 +640,8 @@ TEST_P(ZlibTest, CompressDecompress) {
                        &uncompressed, &uncompressed_length, &input_consumed,
                        window_bits_uncompress, test_param.flush_uncompress,
                        test_param.input_chunks_uncompress, &execution_path);
-  VerifyStatIncrementedUpTo(INFLATE_COUNT, test_param.input_chunks_uncompress);
+  VerifyStatIncrementedUpTo(Statistic::INFLATE_COUNT,
+                            test_param.input_chunks_uncompress);
 
   bool error_expected = false;
   bool accelerator_tried = false;
@@ -649,12 +650,12 @@ TEST_P(ZlibTest, CompressDecompress) {
       window_bits_uncompress, compress_fallback_expected, &accelerator_tried);
   if (uncompress_fallback_expected && !test_param.zlib_fallback_uncompress) {
     ASSERT_EQ(ret, Z_DATA_ERROR);
-    VerifyStatIncremented(INFLATE_ERROR_COUNT);
+    VerifyStatIncremented(Statistic::INFLATE_ERROR_COUNT);
     if (accelerator_tried) {
       if (test_param.execution_path_uncompress == QAT) {
-        VerifyStatIncremented(INFLATE_QAT_ERROR_COUNT);
+        VerifyStatIncremented(Statistic::INFLATE_QAT_ERROR_COUNT);
       } else if (test_param.execution_path_uncompress == IAA) {
-        VerifyStatIncremented(INFLATE_IAA_ERROR_COUNT);
+        VerifyStatIncremented(Statistic::INFLATE_IAA_ERROR_COUNT);
       }
     }
     error_expected = true;
@@ -662,16 +663,16 @@ TEST_P(ZlibTest, CompressDecompress) {
     ASSERT_EQ(ret, Z_STREAM_END);
     if (uncompress_fallback_expected) {
       ASSERT_EQ(execution_path, ZLIB);
-      VerifyStatIncrementedUpTo(INFLATE_ZLIB_COUNT,
+      VerifyStatIncrementedUpTo(Statistic::INFLATE_ZLIB_COUNT,
                                 test_param.input_chunks_uncompress);
     } else {
       ASSERT_EQ(execution_path, test_param.execution_path_uncompress);
       if (test_param.execution_path_uncompress == QAT) {
-        VerifyStatIncremented(INFLATE_QAT_COUNT);
+        VerifyStatIncremented(Statistic::INFLATE_QAT_COUNT);
       } else if (test_param.execution_path_uncompress == IAA) {
-        VerifyStatIncremented(INFLATE_IAA_COUNT);
+        VerifyStatIncremented(Statistic::INFLATE_IAA_COUNT);
       } else if (test_param.execution_path_uncompress == ZLIB) {
-        VerifyStatIncrementedUpTo(INFLATE_ZLIB_COUNT,
+        VerifyStatIncrementedUpTo(Statistic::INFLATE_ZLIB_COUNT,
                                   test_param.input_chunks_uncompress);
       }
     }
