@@ -18,6 +18,11 @@ class QATJob {
  public:
   QATJob() {}
   ~QATJob() { Close(); }
+
+  // Prevent copying a job
+  QATJob(const QATJob&) = delete;
+  QATJob& operator=(const QATJob&) = delete;
+
   QzSession_T* GetQATSession(int window_bits, bool gzip_ext);
   void CloseQATSession(int window_bits, bool gzip_ext);
 

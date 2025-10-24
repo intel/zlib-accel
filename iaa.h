@@ -23,6 +23,10 @@ class IAAJob {
     }
   }
 
+  // Prevent copying a job
+  IAAJob(const IAAJob&) = delete;
+  IAAJob& operator=(const IAAJob&) = delete;
+
   qpl_job* GetJob(qpl_path_t execution_path) {
     if (jobs_[execution_path] == nullptr) {
       InitJob(execution_path);
