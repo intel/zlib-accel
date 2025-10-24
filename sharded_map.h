@@ -12,9 +12,14 @@ class ShardedMap {
  public:
   Value Get(Key key) {
     unsigned int shard = GetShard(key);
-    std::unique_lock<std::shared_mutex> lock(shard_mutexes[shard]);
-    return map[shard][key];
+    std::shared_lock<std::shared_mutex> lock(shard_mutexes[shard]);
+    auto it = map[shard].find(key);
+    if (it == map[shard].end()) {
+      throw std::out_of_range("Key not found");
+    }
+    return it->second;
   }
+
   void Set(Key key, Value value) {
     unsigned int shard = GetShard(key);
     std::unique_lock<std::shared_mutex> lock(shard_mutexes[shard]);
@@ -28,14 +33,15 @@ class ShardedMap {
   void Unset(Key key) {
     unsigned int shard = GetShard(key);
     std::unique_lock<std::shared_mutex> lock(shard_mutexes[shard]);
-    delete map[shard][key];
-    map[shard].erase(key);
+    auto it = map[shard].find(key);
+    if (it != map[shard].end()) {
+      delete it->second;
+      map[shard].erase(it);
+    }
   }
 
  private:
-  unsigned int GetShard(Key key) {
-    return (unsigned int)(hash(std::to_string((long)key)) % SHARDS);
-  }
+  unsigned int GetShard(Key key) { return std::hash<Key>{}(key) % SHARDS; }
 
   std::unordered_map<Key, Value> map[SHARDS];
   std::shared_mutex shard_mutexes[SHARDS];
