@@ -6,40 +6,38 @@
 #include "config/config.h"
 #include "logging.h"
 #include "utils.h"
+
 using namespace config;
+
 #ifdef USE_IAA
-#include <iostream>
 
 #include "utils.h"
-
-#define PREPENDED_BLOCK_LENGTH 5
-#define MAX_BUFFER_SIZE (2 << 20)
 
 void IAAJob::InitJob(qpl_path_t execution_path) {
   uint32_t size;
   qpl_status status = qpl_get_job_size(execution_path, &size);
   if (status != QPL_STS_OK) {
-    jobs_[execution_path] = nullptr;
     return;
   }
+
+  QplJobPtr job = nullptr;
   try {
-    jobs_[execution_path] = reinterpret_cast<qpl_job*>(new char[size]);
+    job = CreateQplJob(size);
   } catch (std::bad_alloc& e) {
-    jobs_[execution_path] = nullptr;
     return;
   }
-  status = qpl_init_job(execution_path, jobs_[execution_path]);
+  status = qpl_init_job(execution_path, job.get());
   if (status != QPL_STS_OK) {
-    delete[] jobs_[execution_path];
-    jobs_[execution_path] = nullptr;
+    return;
   }
+
+  // Transfer ownership to the jobs_ vector
+  jobs_[execution_path] = std::move(job);
 }
 
 void IAAJob::DestroyJob(qpl_path_t execution_path) {
-  if (jobs_[execution_path] != nullptr) {
-    qpl_fini_job(jobs_[execution_path]);
-    delete[] jobs_[execution_path];
-    jobs_[execution_path] = nullptr;
+  if (jobs_[execution_path]) {
+    jobs_[execution_path].reset();
   }
 }
 
@@ -68,7 +66,7 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   }
 
   qpl_job* job = job_.GetJob(execution_path);
-  if (job == nullptr) {
+  if (!job) {
     Log(LogLevel::LOG_ERROR, "CompressIAA() Line %d Error qpl_job is null\n",
         __LINE__);
     return 1;
@@ -197,7 +195,7 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   }
 
   qpl_job* job = job_.GetJob(execution_path);
-  if (job == nullptr) {
+  if (!job) {
     Log(LogLevel::LOG_ERROR, "UncompressIAA() Line %d Error qpl_job is null\n",
         __LINE__);
     return 1;
