@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "statistics.h"
+
 #ifdef ENABLE_STATISTICS
-#include <algorithm>
+
 #include <array>
-#include <sstream>
+#include <cstddef>
+#include <cstdint>
 #include <thread>
 
 #include "config/config.h"
 #include "logging.h"
+
 using namespace config;
 
 const std::array<const char*, STATS_COUNT> stat_names{
@@ -27,8 +30,7 @@ void PrintStats() {
   if (total_operations % configs[LOG_STATS_SAMPLES] != 0) {
     return;
   }
-  LogStats("Thread: ",
-           (std::ostringstream() << std::this_thread::get_id()).str(), "\n");
+  LogStats("Thread: ", std::this_thread::get_id(), "\n");
   for (size_t i = 0; i < stats.size(); ++i) {
     LogStats(stat_names[i], " = ", stats[i], "\n");
   }

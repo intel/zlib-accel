@@ -8,13 +8,11 @@
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstring>
-#include <functional>
-#include <iostream>
-#include <limits>
-#include <mutex>
-#include <shared_mutex>
-#include <unordered_map>
+#include <memory>
+#include <string>
+#include <utility>
 
 #include "config/config.h"
 #include "logging.h"
@@ -28,6 +26,7 @@
 #include "statistics.h"
 
 using namespace config;
+
 // Disable cfi-icall as it makes calls to orig* functions fail
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((no_sanitize("cfi-icall"))), \

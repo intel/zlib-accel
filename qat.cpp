@@ -1,15 +1,19 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#ifdef USE_QAT
+
 #include "qat.h"
+
+#include <cstdint>
+#include <cstring>
+#include <new>
+#include <utility>
 
 #include "config/config.h"
 #include "logging.h"
-#include "utils.h"
 
 using namespace config;
-
-#ifdef USE_QAT
 
 void QATJob::QzSessionDeleter::operator()(QzSession_T *qzSession) const {
   if (!qzSession) {

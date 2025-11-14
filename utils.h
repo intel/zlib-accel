@@ -5,8 +5,9 @@
 
 #include <cstdint>
 
-#define GZIP_EXT_XHDR_SIZE 14
-#define GZIP_EXT_HDRFTR_SIZE 32  // size of header + footer for gzip ext format
+inline constexpr uint32_t GZIP_EXT_XHDR_SIZE = 14;
+inline constexpr uint32_t GZIP_EXT_HDRFTR_SIZE =
+    32;  // size of header + footer for gzip ext format
 
 enum class CompressedFormat { DEFLATE_RAW, ZLIB, GZIP, INVALID };
 

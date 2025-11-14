@@ -3,7 +3,9 @@
 
 #include "test_utils.h"
 
+#include <cstring>
 #include <iostream>
+#include <string>
 
 #ifdef DEBUG_LOG
 void Log(std::string message) { std::cout << message << std::endl; }

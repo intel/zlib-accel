@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <cstring>
+#include <cstddef>
 #include <string>
 
 #include "../zlib_accel.h"
