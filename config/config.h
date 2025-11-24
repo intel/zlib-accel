@@ -3,11 +3,10 @@
 
 #pragma once
 
-#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
-
-#include <stdint.h>
-
+#include <cstdint>
 #include <string>
+
+#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
 namespace config {
 enum ConfigOption {

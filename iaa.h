@@ -4,12 +4,14 @@
 #pragma once
 
 #ifdef USE_IAA
-#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "qpl/qpl.h"
+
+#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
 inline constexpr unsigned int PREPENDED_BLOCK_LENGTH = 5;
 inline constexpr unsigned int MAX_BUFFER_SIZE = (2 << 20);

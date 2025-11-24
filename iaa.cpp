@@ -1,17 +1,20 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#ifdef USE_IAA
+
 #include "iaa.h"
+
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <thread>
+#include <utility>
 
 #include "config/config.h"
 #include "logging.h"
-#include "utils.h"
 
 using namespace config;
-
-#ifdef USE_IAA
-
-#include "utils.h"
 
 void IAAJob::InitJob(qpl_path_t execution_path) {
   uint32_t size;

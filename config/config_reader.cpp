@@ -4,6 +4,8 @@
 #include "config_reader.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <fstream>
 #include <regex>
 #include <sstream>

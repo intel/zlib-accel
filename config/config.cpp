@@ -3,12 +3,11 @@
 
 #include "config.h"
 
-#include <climits>
+#include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include "config_reader.h"
-
-using namespace std;
 
 namespace config {
 

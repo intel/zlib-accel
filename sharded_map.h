@@ -1,15 +1,15 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef SHARDED_MAP_H
-#define SHARDED_MAP_H
+#pragma once
 
-#include <memory>
-#include <mutex>
+#include <functional>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
+#include <utility>
 
-static const int SHARDS = 64;
+static constexpr int SHARDS = 64;
 
 template <typename Key, typename Value>
 class ShardedMap {
@@ -45,5 +45,3 @@ class ShardedMap {
   std::shared_mutex shard_mutexes[SHARDS];
   std::hash<std::string> hash;
 };
-
-#endif  // SHARDED_MAP_H

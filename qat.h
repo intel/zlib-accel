@@ -4,13 +4,15 @@
 #pragma once
 
 #ifdef USE_QAT
-#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
 #include <qatzip.h>
 
+#include <cstdint>
 #include <memory>
 
 #include "utils.h"
+
+#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
 inline constexpr unsigned int QAT_HW_BUFF_SZ = QZ_HW_BUFF_MAX_SZ;
 

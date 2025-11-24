@@ -3,6 +3,8 @@
 
 #include "utils.h"
 
+#include <cstdint>
+
 CompressedFormat GetCompressedFormat(int window_bits) {
   if (window_bits >= -15 && window_bits <= -8) {
     return CompressedFormat::DEFLATE_RAW;
