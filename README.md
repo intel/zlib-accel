@@ -206,6 +206,11 @@ qat_compression_allow_chunking
 - If set to 1, data larger than the QAT HW buffer (512kB) will be split into chunks of HW buffer size when compressing with QAT. This causes the compressed data to be a concatenation of multiple streams (one per chunk). This is not the same behavior as for zlib, which creates a single stream. If decompression expects a single stream, this may cause issues.
 - If set to 0, this option disables chunking for QAT compression. If the input data is larger than the QAT HW buffer, QAT will not be used. This improves zlib compatibility, but it may reduce QAT utilization depending on the workload.
 
+ignore_zlib_dictionary
+- Values: 0, 1. Default: 0
+- If set to 1, zlib-accel ignores deflateSetDictionary and inflateSetDictionary.
+- If set to 0, zlib-accel honors inflateSetDictionary and deflateSetDictionary.
+
 log_level
 - Values: 0,1,2. Default 2
 - This option applies only if the shim is built with DEBUG_LOG=ON.

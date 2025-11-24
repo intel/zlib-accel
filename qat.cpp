@@ -22,16 +22,15 @@ void QATJob::QzSessionDeleter::operator()(QzSession_T *qzSession) const {
 
   int rc = qzTeardownSession(qzSession);
   if (rc != QZ_OK) {
-    Log(LogLevel::LOG_ERROR,
-        "qzTeardownSession() Line %d session %p returned %d\n", __LINE__,
-        qzSession, rc);
+    Log(LogLevel::LOG_ERROR, "qzTeardownSession() Line ", __LINE__, " session ",
+        static_cast<void *>(qzSession), " returned ", rc, "\n");
   }
 
   // Attempt to close the session
   rc = qzClose(qzSession);
   if (rc != QZ_OK) {
-    Log(LogLevel::LOG_ERROR, "qzClose() Line %d  session %p returned %d\n",
-        __LINE__, qzSession, rc);
+    Log(LogLevel::LOG_ERROR, "qzClose() Line ", __LINE__, " session ",
+        static_cast<void *>(qzSession), " returned ", rc, "\n");
   }
 
   delete qzSession;
