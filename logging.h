@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -17,32 +18,49 @@ using namespace config;
 enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
-inline std::unique_ptr<std::ofstream> log_file_stream = nullptr;
 
-inline void CreateLogFile(const char* file_name) {
-  log_file_stream = std::make_unique<std::ofstream>(file_name, std::ios::app);
+inline std::unique_ptr<std::ofstream>& LogFileStream() {
+  static std::unique_ptr<std::ofstream> stream;
+  return stream;
 }
 
-inline void CloseLogFile() { log_file_stream.reset(); }
+inline void CreateLogFile(const char* file_name) {
+  auto& s = LogFileStream();
+  s = std::make_unique<std::ofstream>(file_name, std::ios::app);
+}
+
+inline void CloseLogFile() {
+  auto& s = LogFileStream();
+  s.reset();
+}
 
 inline std::ostream& GetLogStream() {
-  if (log_file_stream && log_file_stream->is_open()) {
-    return *log_file_stream;
+  auto& s = LogFileStream();
+  if (s && s->is_open()) {
+    return *s;
   }
   return std::cout;
 }
-#endif
+
+#endif  // DEBUG_LOG || ENABLE_STATISTICS
 
 #ifdef DEBUG_LOG
-static std::mutex log_mutex;
 
+static std::mutex log_mutex;
 template <typename... Args>
 inline void Log(LogLevel level, Args&&... args) {
   std::lock_guard<std::mutex> lock(log_mutex);
-  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
+  uint32_t current_level = config::GetConfig(config::LOG_LEVEL);
+
+  if (current_level == static_cast<uint32_t>(LogLevel::LOG_NONE)) {
     return;
   }
-  auto& stream = GetLogStream();
+
+  if (static_cast<uint32_t>(level) < current_level) {
+    return;
+  }
+
+  std::ostream& stream = GetLogStream();
   switch (level) {
     case LogLevel::LOG_ERROR:
       stream << "Error: ";
@@ -56,29 +74,40 @@ inline void Log(LogLevel level, Args&&... args) {
   (..., (stream << args));
   stream << std::flush;
 }
+
 #else
 #define Log(...)
 #endif
 
 #ifdef ENABLE_STATISTICS
+
 template <typename... Args>
 inline void LogStats(Args&&... args) {
-  auto& stream = GetLogStream();
+  std::ostream& stream = GetLogStream();
   stream << "Stats:\n";
   (..., (stream << args));
   stream << std::flush;
 }
+
 #else
 #define LogStats(...)
 #endif
 
 #ifdef DEBUG_LOG
+
 template <typename... Args>
 inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data, uint32_t len,
                                     int window_bits, Args&&... args) {
-  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
+  uint32_t current_level = config::GetConfig(config::LOG_LEVEL);
+
+  if (current_level == static_cast<uint32_t>(LogLevel::LOG_NONE)) {
     return;
   }
+
+  if (static_cast<uint32_t>(level) < current_level) {
+    return;
+  }
+
   CompressedFormat format = GetCompressedFormat(window_bits);
   uint32_t header_length = GetHeaderLength(format);
   if (len >= (header_length + 1)) {
@@ -88,6 +117,7 @@ inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data, uint32_t len,
         "\n", std::forward<Args>(args)...);
   }
 }
+
 #else
 #define PrintDeflateBlockHeader(...)
 #endif
