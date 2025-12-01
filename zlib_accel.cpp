@@ -73,23 +73,21 @@ static int init_zlib_accel(void) __attribute__((constructor));
 static void cleanup_zlib_accel(void) __attribute__((destructor));
 
 // Macro that load symbols with error checking
-#define LOAD_SYMBOL(fptr, type, name)                                         \
-  do {                                                                        \
-    dlerror();                                                                \
-    fptr = reinterpret_cast<type>(dlsym(RTLD_NEXT, name));                    \
-    const char* error = dlerror();                                            \
-    if (error != nullptr) {                                                   \
-      Log(LogLevel::LOG_ERROR,                                                \
-          "init_zlib_accel Line %d Failed to load symbol '%s': %s\n",         \
-          __LINE__, name, error);                                             \
-      return 1;                                                               \
-    }                                                                         \
-    if (fptr == nullptr) {                                                    \
-      Log(LogLevel::LOG_ERROR,                                                \
-          "init_zlib_accel Line %d Symbol '%s' resolved to NULL\n", __LINE__, \
-          name);                                                              \
-      return 1;                                                               \
-    }                                                                         \
+#define LOAD_SYMBOL(fptr, type, name)                                          \
+  do {                                                                         \
+    dlerror();                                                                 \
+    fptr = reinterpret_cast<type>(dlsym(RTLD_NEXT, name));                     \
+    const char* error = dlerror();                                             \
+    if (error != nullptr) {                                                    \
+      Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,              \
+          "Failed to load symbol '", name, "': ", error, "\n");                \
+      return 1;                                                                \
+    }                                                                          \
+    if (fptr == nullptr) {                                                     \
+      Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " Symbol '", \
+          name, "' resolved to NULL\n");                                       \
+      return 1;                                                                \
+    }                                                                          \
   } while (0)
 
 static int init_zlib_accel(void) {
@@ -261,11 +259,17 @@ int ZEXPORT deflateInit2_(z_streamp strm, int level, int method,
 
 int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
                                  uInt dictLength) {
-  Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
-  DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
-  deflate_settings->path = ZLIB;
-  return orig_deflateSetDictionary(strm, dictionary, dictLength);
+  if (!configs[IGNORE_ZLIB_DICTIONARY]) {
+    Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
+    DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+    deflate_settings->path = ZLIB;
+    return orig_deflateSetDictionary(strm, dictionary, dictLength);
+  }
+  Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__,
+      " ignored because ignore_zlib_dictionary is set to ",
+      configs[IGNORE_ZLIB_DICTIONARY], "\n");
+  return Z_OK;
 }
 
 int ZEXPORT deflate(z_streamp strm, int flush) {
@@ -415,11 +419,17 @@ int ZEXPORT inflateInit2_(z_streamp strm, int window_bits, const char* version,
 
 int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
                                  uInt dictLength) {
-  Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
-  InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
-  inflate_settings->path = ZLIB;
-  return orig_inflateSetDictionary(strm, dictionary, dictLength);
+  if (!configs[IGNORE_ZLIB_DICTIONARY]) {
+    Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm), "dictLength ", dictLength, "\n");
+    InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
+    inflate_settings->path = ZLIB;
+    return orig_inflateSetDictionary(strm, dictionary, dictLength);
+  }
+  Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__,
+      " ignored because ignore_zlib_dictionary is set to ",
+      configs[IGNORE_ZLIB_DICTIONARY], "\n");
+  return Z_OK;
 }
 
 int ZEXPORT inflate(z_streamp strm, int flush) {
