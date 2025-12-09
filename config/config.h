@@ -3,11 +3,10 @@
 
 #pragma once
 
-#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
-
-#include <stdint.h>
-
+#include <cstdint>
 #include <string>
+
+#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
 namespace config {
 enum ConfigOption {
@@ -23,6 +22,7 @@ enum ConfigOption {
   QAT_PERIODICAL_POLLING,
   QAT_COMPRESSION_LEVEL,
   QAT_COMPRESSION_ALLOW_CHUNKING,
+  IGNORE_ZLIB_DICTIONARY,
   LOG_LEVEL,
   LOG_STATS_SAMPLES,
   CONFIG_MAX

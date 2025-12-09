@@ -4,6 +4,8 @@
 #include "config_reader.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -11,7 +13,7 @@
 
 #include "../logging.h"
 
-constexpr int PATH_MAX = 4096;
+constexpr int CUSTOM_PATH_MAX = 4096;
 
 bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
                             uint32_t max_value, uint32_t min_value) {
@@ -25,18 +27,15 @@ bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
     unsigned long temp = std::stoul(it->second, &pos);
 
     if (temp > UINT32_MAX) {
-      Log(LogLevel::LOG_ERROR,
-          "ConfigReader::GetValue Line %d value exceeds uint32_t range for tag "
-          "%s\n",
-          __LINE__, tag.c_str());
+      Log(LogLevel::LOG_ERROR, "ConfigReader::GetValue Line ", __LINE__,
+          " value exceeds uint32_t range for tag ", tag.c_str(), "\n");
       value = 0;
       return false;
     }
 
     if (pos != it->second.length() || temp < min_value || temp > max_value) {
-      Log(LogLevel::LOG_ERROR,
-          "ConfigReader::GetValue Line %d invalid input value for tag %s\n",
-          __LINE__, tag.c_str());
+      Log(LogLevel::LOG_ERROR, "ConfigReader::GetValue Line ", __LINE__,
+          " invalid input value for tag ", tag.c_str(), "\n");
       value = 0;
       return false;
     }
@@ -45,9 +44,8 @@ bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
     return true;
 
   } catch (const std::exception&) {
-    Log(LogLevel::LOG_ERROR,
-        "ConfigReader::GetValue Line %d invalid input value for tag %s\n",
-        __LINE__, tag.c_str());
+    Log(LogLevel::LOG_ERROR, "ConfigReader::GetValue Line ", __LINE__,
+        " invalid input value for tag ", tag.c_str(), "\n");
     value = 0;
     return false;
   }
@@ -62,9 +60,8 @@ bool ConfigReader::GetValue(const std::string& tag, std::string& value) {
   value = it->second;
 
   if (tag == "log_file" && !IsValidFileNameOrPath(value)) {
-    Log(LogLevel::LOG_ERROR,
-        "ConfigReader::GetValue Line %d invalid log_file value %s\n", __LINE__,
-        value.c_str());
+    Log(LogLevel::LOG_ERROR, "ConfigReader::GetValue Line ", __LINE__,
+        " invalid log_file value ", value.c_str(), "\n");
     value.clear();
     return false;
   }
@@ -167,7 +164,7 @@ bool ConfigReader::IsValidFileNameOrPath(const std::string& input) {
   }
 
   // Check for length constraints
-  if (input.length() > PATH_MAX) {
+  if (input.length() > CUSTOM_PATH_MAX) {
     return false;
   }
 

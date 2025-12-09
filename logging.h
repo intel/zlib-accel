@@ -3,92 +3,121 @@
 
 #pragma once
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 #include "config/config.h"
 #include "utils.h"
+
 using namespace config;
+
 enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
-inline FILE* log_file_stream = nullptr;
 
-inline static void CreateLogFile(const char* file_name) {
-  log_file_stream = fopen(file_name, "a");
+inline std::unique_ptr<std::ofstream>& LogFileStream() {
+  static std::unique_ptr<std::ofstream> stream;
+  return stream;
 }
 
-inline static void CloseLogFile() {
-  if (log_file_stream != nullptr) {
-    fclose(log_file_stream);
+inline void CreateLogFile(const char* file_name) {
+  auto& s = LogFileStream();
+  s = std::make_unique<std::ofstream>(file_name, std::ios::app);
+}
+
+inline void CloseLogFile() {
+  auto& s = LogFileStream();
+  s.reset();
+}
+
+inline std::ostream& GetLogStream() {
+  auto& s = LogFileStream();
+  if (s && s->is_open()) {
+    return *s;
   }
+  return std::cout;
 }
-#endif
+
+#endif  // DEBUG_LOG || ENABLE_STATISTICS
 
 #ifdef DEBUG_LOG
-static inline void Log(LogLevel level, const char* format, ...) {
-  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
+
+static std::mutex log_mutex;
+template <typename... Args>
+inline void Log(LogLevel level, Args&&... args) {
+  std::lock_guard<std::mutex> lock(log_mutex);
+  uint32_t current_level = config::GetConfig(config::LOG_LEVEL);
+
+  if (current_level == static_cast<uint32_t>(LogLevel::LOG_NONE)) {
     return;
   }
 
-  FILE* stream = stdout;
-  if (log_file_stream != nullptr) {
-    stream = log_file_stream;
+  if (static_cast<uint32_t>(level) < current_level) {
+    return;
   }
 
+  std::ostream& stream = GetLogStream();
   switch (level) {
     case LogLevel::LOG_ERROR:
-      fprintf(stream, "Error: ");
+      stream << "Error: ";
       break;
     case LogLevel::LOG_INFO:
-      fprintf(stream, "Info: ");
+      stream << "Info: ";
       break;
     case LogLevel::LOG_NONE:
       return;
   }
-  va_list args;
-  va_start(args, format);
-  vfprintf(stream, format, args);
-  va_end(args);
+  (..., (stream << args));
+  stream << std::flush;
 }
+
 #else
 #define Log(...)
 #endif
 
 #ifdef ENABLE_STATISTICS
-static inline void LogStats(const char* stats_str) {
-  FILE* stream = stdout;
-  if (log_file_stream != nullptr) {
-    stream = log_file_stream;
-  }
 
-  fprintf(stream, "Stats:\n");
-  fprintf(stream, "%s", stats_str);
+template <typename... Args>
+inline void LogStats(Args&&... args) {
+  std::ostream& stream = GetLogStream();
+  stream << "Stats:\n";
+  (..., (stream << args));
+  stream << std::flush;
 }
+
 #else
 #define LogStats(...)
 #endif
 
 #ifdef DEBUG_LOG
-static inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data,
-                                           uint32_t len, int window_bits) {
-  if (static_cast<uint32_t>(level) < configs[LOG_LEVEL]) {
+
+template <typename... Args>
+inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data, uint32_t len,
+                                    int window_bits, Args&&... args) {
+  uint32_t current_level = config::GetConfig(config::LOG_LEVEL);
+
+  if (current_level == static_cast<uint32_t>(LogLevel::LOG_NONE)) {
+    return;
+  }
+
+  if (static_cast<uint32_t>(level) < current_level) {
     return;
   }
 
   CompressedFormat format = GetCompressedFormat(window_bits);
   uint32_t header_length = GetHeaderLength(format);
   if (len >= (header_length + 1)) {
-    Log(level, "Deflate block header bfinal=%d, btype=%d\n",
-        data[header_length] & 0b00000001,
-        (data[header_length] & 0b00000110) >> 1);
+    Log(level, "Deflate block header bfinal = ",
+        static_cast<int>(data[header_length] & 0b00000001),
+        ", btype = ", static_cast<int>((data[header_length] & 0b00000110) >> 1),
+        "\n", std::forward<Args>(args)...);
   }
 }
+
 #else
 #define PrintDeflateBlockHeader(...)
 #endif

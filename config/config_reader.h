@@ -3,10 +3,9 @@
 
 #pragma once
 
-#include <stdint.h>
-
-#include <iostream>
+#include <cstdint>
 #include <map>
+#include <string>
 
 // The responsibility of this class is to parse the
 // Config file and store it in the std::map

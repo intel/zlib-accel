@@ -3,12 +3,11 @@
 
 #include "config.h"
 
-#include <climits>
+#include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include "config_reader.h"
-
-using namespace std;
 
 namespace config {
 
@@ -28,6 +27,7 @@ uint32_t configs[CONFIG_MAX] = {
     0,   /*qat_periodical_polling*/
     1,   /*qat_compression_level*/
     0,   /*qat_compression_allow_chunking*/
+    0,   /*ignore_zlib_dictionary*/
     2,   /*log_level*/
     1000 /*log_stats_samples*/
 };
@@ -50,7 +50,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
     "iaa_prepend_empty_block",
     "qat_periodical_polling",
     "qat_compression_level",
-	"qat_compression_allow_chunking",
+	  "qat_compression_allow_chunking",
+    "ignore_zlib_dictionary",
     "log_level",
     "log_stats_samples"
   };
@@ -83,6 +84,7 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(QAT_PERIODICAL_POLLING, 1, 0);
   trySetConfig(QAT_COMPRESSION_LEVEL, 9, 1);
   trySetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, 1, 0);
+  trySetConfig(IGNORE_ZLIB_DICTIONARY, 1, 0);
   trySetConfig(LOG_LEVEL, 2, 0);
   trySetConfig(LOG_STATS_SAMPLES, UINT32_MAX, 0);
 

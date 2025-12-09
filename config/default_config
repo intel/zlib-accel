@@ -10,5 +10,6 @@ iaa_prepend_empty_block = 0
 qat_periodical_polling = 0
 qat_compression_level = 1
 qat_compression_allow_chunking = 0
+ignore_zlib_dictionary = 0
 log_level = 2
 log_file = /tmp/zlib-accel.log

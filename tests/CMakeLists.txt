@@ -16,7 +16,12 @@ link_libraries(gtest pthread)
 # TODO Remove once crc16 references fixed in QPL
 add_link_options("-Wl,--unresolved-symbols=ignore-all")
 
-add_executable(zlib_accel_test zlib_accel_test.cpp test_utils.cpp ../utils.cpp)
+add_executable(zlib_accel_test
+    zlib_accel_test.cpp
+    logging_test.cpp
+    test_utils.cpp
+    ../utils.cpp
+)
 
 add_custom_target(run
     COMMAND ./zlib_accel_test
