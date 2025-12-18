@@ -297,6 +297,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #ifdef USE_QAT
     qat_available =
         configs[USE_QAT_COMPRESS] &&
+	output_len >= QAT_DEST_BUFFER_MIN_SIZE &&
         SupportedOptionsQAT(deflate_settings->window_bits, input_len);
 #endif
 
@@ -1352,7 +1353,6 @@ int ZEXPORT gzeof(gzFile file) {
   GzipFile* gz = gzip_files.Get(file);
   return gz->reached_eof;
 }
-
 #if defined(__clang__)
 #pragma clang attribute pop
 #endif
