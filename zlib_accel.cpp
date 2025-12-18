@@ -296,8 +296,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #endif
 #ifdef USE_QAT
     qat_available =
-        configs[USE_QAT_COMPRESS] &&
-	output_len >= QAT_DEST_BUFFER_MIN_SIZE &&
+        configs[USE_QAT_COMPRESS] && output_len >= QAT_DEST_BUFFER_MIN_SIZE &&
         SupportedOptionsQAT(deflate_settings->window_bits, input_len);
 #endif
 
