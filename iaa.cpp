@@ -218,7 +218,7 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   job->dictionary = nullptr;
 
   qpl_status status = qpl_execute_job(job);
-  if (status != QPL_STS_OK) {
+  if (status != QPL_STS_OK && status != QPL_STS_MORE_OUTPUT_NEEDED) {
     Log(LogLevel::LOG_ERROR, "UncompressIAA() Line ", __LINE__,
         " qpl_execute_job status ", status, "\n");
     return 1;
