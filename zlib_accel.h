@@ -7,7 +7,7 @@
 #include <zlib.h>
 
 // Visible for testing
-enum ExecutionPath { UNDEFINED, ZLIB, QAT, IAA };
+enum ExecutionPath { UNDEFINED, ZLIB, QAT, IAA, IGZIP };
 ExecutionPath GetDeflateExecutionPath(z_streamp strm);
 ExecutionPath GetInflateExecutionPath(z_streamp strm);
 

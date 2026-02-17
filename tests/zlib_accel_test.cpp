@@ -240,16 +240,25 @@ void SetCompressPath(ExecutionPath path, bool zlib_fallback,
   switch (path) {
     case ZLIB:
       SetConfig(USE_IAA_COMPRESS, 0);
+      SetConfig(USE_IGZIP_COMPRESS, 0);
       SetConfig(USE_QAT_COMPRESS, 0);
       SetConfig(USE_ZLIB_COMPRESS, 1);
       break;
     case QAT:
       SetConfig(USE_IAA_COMPRESS, 0);
+      SetConfig(USE_IGZIP_COMPRESS, 0);
       SetConfig(USE_QAT_COMPRESS, 1);
       SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
       break;
     case IAA:
       SetConfig(USE_IAA_COMPRESS, 1);
+      SetConfig(USE_IGZIP_COMPRESS, 0);
+      SetConfig(USE_QAT_COMPRESS, 0);
+      SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
+      break;
+    case IGZIP:
+      SetConfig(USE_IGZIP_COMPRESS, 1);
+      SetConfig(USE_IAA_COMPRESS, 0);
       SetConfig(USE_QAT_COMPRESS, 0);
       SetConfig(USE_ZLIB_COMPRESS, zlib_fallback ? 1 : 0);
       break;
@@ -265,16 +274,25 @@ void SetUncompressPath(ExecutionPath path, bool zlib_fallback,
   switch (path) {
     case ZLIB:
       SetConfig(USE_IAA_UNCOMPRESS, 0);
+      SetConfig(USE_IGZIP_UNCOMPRESS, 0);
       SetConfig(USE_QAT_UNCOMPRESS, 0);
       SetConfig(USE_ZLIB_UNCOMPRESS, 1);
       break;
     case QAT:
       SetConfig(USE_IAA_UNCOMPRESS, 0);
+      SetConfig(USE_IGZIP_UNCOMPRESS, 0);
       SetConfig(USE_QAT_UNCOMPRESS, 1);
       SetConfig(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
       break;
     case IAA:
       SetConfig(USE_IAA_UNCOMPRESS, 1);
+      SetConfig(USE_IGZIP_UNCOMPRESS, 0);
+      SetConfig(USE_QAT_UNCOMPRESS, 0);
+      SetConfig(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
+      break;
+    case IGZIP:
+      SetConfig(USE_IAA_UNCOMPRESS, 0);
+      SetConfig(USE_IGZIP_UNCOMPRESS, 1);
       SetConfig(USE_QAT_UNCOMPRESS, 0);
       SetConfig(USE_ZLIB_UNCOMPRESS, zlib_fallback ? 1 : 0);
       break;
@@ -331,6 +349,8 @@ struct TestParam {
         return "QAT";
       case IAA:
         return "IAA";
+      case IGZIP:
+        return "IGZIP";
     }
     return "";
   }
@@ -730,6 +750,10 @@ INSTANTIATE_TEST_SUITE_P(
                         ,
                         IAA
 #endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
+#endif
                         ),
         testing::Values(false, true),
         testing::Values(ZLIB
@@ -740,6 +764,10 @@ INSTANTIATE_TEST_SUITE_P(
 #ifdef USE_IAA
                         ,
                         IAA
+#endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
 #endif
                         ),
         testing::Values(false, true), testing::Values(-15, 15, 31),
@@ -828,6 +856,10 @@ INSTANTIATE_TEST_SUITE_P(
                         ,
                         IAA
 #endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
+#endif
                         ),
         testing::Values(false, true),
         testing::Values(ZLIB
@@ -838,6 +870,10 @@ INSTANTIATE_TEST_SUITE_P(
 #ifdef USE_IAA
                         ,
                         IAA
+#endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
 #endif
                         ),
         testing::Values(false, true), testing::Values(15),
@@ -924,6 +960,10 @@ INSTANTIATE_TEST_SUITE_P(
                         ,
                         IAA
 #endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
+#endif
                         ),
         testing::Values(false, true),
         testing::Values(ZLIB
@@ -934,6 +974,10 @@ INSTANTIATE_TEST_SUITE_P(
 #ifdef USE_IAA
                         ,
                         IAA
+#endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
 #endif
                         ),
         testing::Values(false, true), testing::Values(15),
@@ -1123,6 +1167,10 @@ INSTANTIATE_TEST_SUITE_P(
                         ,
                         IAA
 #endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
+#endif
                         ),
         testing::Values(false, true),
         testing::Values(ZLIB
@@ -1133,6 +1181,10 @@ INSTANTIATE_TEST_SUITE_P(
 #ifdef USE_IAA
                         ,
                         IAA
+#endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
 #endif
                         ),
         testing::Values(false, true), testing::Values(-15, 15, 31),
@@ -1204,6 +1256,10 @@ INSTANTIATE_TEST_SUITE_P(
                         ,
                         IAA
 #endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
+#endif
                         ),
         testing::Values(false, true),
         testing::Values(ZLIB
@@ -1214,6 +1270,10 @@ INSTANTIATE_TEST_SUITE_P(
 #ifdef USE_IAA
                         ,
                         IAA
+#endif
+#ifdef USE_IGZIP
+                        ,
+                        IGZIP
 #endif
                         ),
         testing::Values(false, true), testing::Values(31),
@@ -1272,6 +1332,8 @@ TEST_F(ConfigLoaderTest, LoadValidConfig) {
   EXPECT_EQ(GetConfig(USE_QAT_UNCOMPRESS), 1);
   EXPECT_EQ(GetConfig(USE_IAA_COMPRESS), 0);
   EXPECT_EQ(GetConfig(USE_IAA_UNCOMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_IGZIP_COMPRESS), 0);
+  EXPECT_EQ(GetConfig(USE_IGZIP_UNCOMPRESS), 0);
   EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 1);
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 1);
   EXPECT_EQ(GetConfig(LOG_LEVEL), 2);
