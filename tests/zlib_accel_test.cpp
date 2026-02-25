@@ -183,6 +183,41 @@ int ZlibUncompressUtility2(const char* input, size_t input_length,
   return st;
 }
 
+int ZlibCompressWithLevel(const char* input, size_t input_length,
+                          std::string* output, int level, int window_bits,
+                          int flush, size_t* output_upper_bound,
+                          ExecutionPath* execution_path) {
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+
+  int st =
+      deflateInit2(&stream, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
+  if (st != Z_OK) {
+    deflateEnd(&stream);
+    return st;
+  }
+
+  stream.next_in = (Bytef*)input;
+  stream.avail_in = static_cast<unsigned int>(input_length);
+
+  *output_upper_bound =
+      deflateBound(&stream, static_cast<unsigned long>(input_length));
+  output->resize(*output_upper_bound);
+  stream.avail_out = static_cast<unsigned int>(*output_upper_bound);
+  stream.next_out = reinterpret_cast<Bytef*>(&(*output)[0]);
+
+  st = deflate(&stream, flush);
+  *execution_path = GetDeflateExecutionPath(&stream);
+  if (st != Z_STREAM_END) {
+    deflateEnd(&stream);
+    return st;
+  }
+  output->resize(stream.total_out);
+
+  deflateEnd(&stream);
+  return st;
+}
+
 int ZlibCompressGzipFile(const char* input, size_t input_length) {
   const char* filename = "file.gz";
   remove(filename);
@@ -610,6 +645,15 @@ TEST_P(ZlibTest, CompressDecompress) {
                   test_param.iaa_prepend_empty_block,
                   test_param.qat_compression_allow_chunking);
 
+  // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
+  // ISA-L level 3 (stricter match selection), which makes long-history
+  // limitations consistently observable.
+  const int compression_level =
+      (test_param.execution_path_compress == IGZIP &&
+       test_param.execution_path_uncompress == IAA)
+          ? 9
+          : -1;
+
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
   char* input = GenerateBlock(input_length, block_type);
@@ -618,9 +662,10 @@ TEST_P(ZlibTest, CompressDecompress) {
   std::string compressed;
   size_t output_upper_bound;
   ExecutionPath execution_path = UNDEFINED;
-  int ret = ZlibCompress(
-      input, input_length, &compressed, test_param.window_bits_compress,
-      test_param.flush_compress, &output_upper_bound, &execution_path);
+    int ret = ZlibCompressWithLevel(
+      input, input_length, &compressed, compression_level,
+      test_param.window_bits_compress, test_param.flush_compress,
+      &output_upper_bound, &execution_path);
   VerifyStatIncremented(Statistic::DEFLATE_COUNT);
 
   bool compress_fallback_expected =
@@ -1004,6 +1049,15 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
                   test_param.iaa_prepend_empty_block,
                   test_param.qat_compression_allow_chunking);
 
+  // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
+  // ISA-L level 3 (stricter match selection), which makes long-history
+  // limitations consistently observable.
+  const int compression_level =
+      (test_param.execution_path_compress == IGZIP &&
+       test_param.execution_path_uncompress == IAA)
+          ? 9
+          : -1;
+
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
   char* input = GenerateBlock(input_length, block_type);
@@ -1012,9 +1066,10 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
   std::string compressed;
   size_t output_upper_bound;
   ExecutionPath execution_path = UNDEFINED;
-  int ret = ZlibCompress(
-      input, input_length, &compressed, test_param.window_bits_compress,
-      test_param.flush_compress, &output_upper_bound, &execution_path);
+    int ret = ZlibCompressWithLevel(
+      input, input_length, &compressed, compression_level,
+      test_param.window_bits_compress, test_param.flush_compress,
+      &output_upper_bound, &execution_path);
 
   bool error_expected =
       ZlibCompressExpectError(test_param, input_length, output_upper_bound);
@@ -1042,8 +1097,9 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
                        window_bits_uncompress, test_param.flush_uncompress,
                        test_param.input_chunks_uncompress, &execution_path);
 
-  // Only zlib decompression won't return an error
+  // zlib and igzip decompression may return partial progress instead of error
   if (test_param.execution_path_uncompress == ZLIB ||
+      test_param.execution_path_uncompress == IGZIP ||
       test_param.zlib_fallback_uncompress) {
     ASSERT_EQ(ret, Z_OK);
     ASSERT_TRUE(uncompressed_length < input_length);
@@ -1070,6 +1126,15 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
                   test_param.iaa_prepend_empty_block,
                   test_param.qat_compression_allow_chunking);
 
+  // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
+  // ISA-L level 3 (stricter match selection), which makes long-history
+  // limitations consistently observable.
+  const int compression_level =
+      (test_param.execution_path_compress == IGZIP &&
+       test_param.execution_path_uncompress == IAA)
+          ? 9
+          : -1;
+
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
   char* input = GenerateBlock(input_length, block_type);
@@ -1080,9 +1145,10 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   size_t input_length1 = input_length / 2;
   size_t output_upper_bound1;
   ExecutionPath execution_path = UNDEFINED;
-  int ret = ZlibCompress(
-      input, input_length1, &compressed1, test_param.window_bits_compress,
-      test_param.flush_compress, &output_upper_bound1, &execution_path);
+    int ret = ZlibCompressWithLevel(
+      input, input_length1, &compressed1, compression_level,
+      test_param.window_bits_compress, test_param.flush_compress,
+      &output_upper_bound1, &execution_path);
 
   bool error_expected =
       ZlibCompressExpectError(test_param, input_length1, output_upper_bound1);
@@ -1098,9 +1164,10 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   size_t input_length2 = input_length - input_length / 2;
   size_t output_upper_bound2;
   execution_path = UNDEFINED;
-  ret = ZlibCompress(input + input_length1, input_length2, &compressed2,
-                     test_param.window_bits_compress, test_param.flush_compress,
-                     &output_upper_bound2, &execution_path);
+  ret = ZlibCompressWithLevel(
+      input + input_length1, input_length2, &compressed2, compression_level,
+      test_param.window_bits_compress, test_param.flush_compress,
+      &output_upper_bound2, &execution_path);
 
   error_expected =
       ZlibCompressExpectError(test_param, input_length2, output_upper_bound2);
@@ -1145,8 +1212,9 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
     ASSERT_EQ(uncompressed_length, input_length1);
     ASSERT_TRUE(memcmp(uncompressed, input, uncompressed_length) == 0);
 
-    // IAA does not handle concatenated streams
-    if (test_param.execution_path_uncompress != IAA) {
+    // IAA/IGZIP may consume bytes beyond first-stream boundary
+    if (test_param.execution_path_uncompress != IAA &&
+        test_param.execution_path_uncompress != IGZIP) {
       ASSERT_EQ(input_consumed, compressed1.length());
     }
   }

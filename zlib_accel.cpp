@@ -162,7 +162,11 @@ static int init_zlib_accel(void) {
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
   if (!config::log_file.empty()) {
-    CreateLogFile(config::log_file.c_str());
+    if (!CreateLogFile(config::log_file.c_str())) {
+      Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,
+          " failed to open log_file '", config::log_file.c_str(),
+          "', falling back to stdout\n");
+    }
   }
 #endif
 

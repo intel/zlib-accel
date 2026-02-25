@@ -6,7 +6,6 @@
 #include "igzip.h"
 #include "crc.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "logging.h"
@@ -62,9 +61,9 @@ struct isal_zstream*
 InitCompressIGZIP(int level, int windowBits)
 {
 #ifdef DEBUG
-        fprintf(stderr,
-                "\nInitializing deflate with level: %d, windowBits: %d\n", level,
-                windowBits);
+        Log(LogLevel::LOG_INFO, "InitCompressIGZIP() Line ", __LINE__,
+            " initializing deflate with level ", level, ", windowBits ",
+            windowBits, "\n");
 #endif
   	Log(LogLevel::LOG_INFO, "InitCompressIGZIP() Line ", __LINE__, " level ",
       	  level, ", windowBits ",windowBits, " \n");
@@ -72,7 +71,8 @@ InitCompressIGZIP(int level, int windowBits)
         struct isal_zstream *isal_strm =
                 (struct isal_zstream *) malloc(sizeof(struct isal_zstream));
         if (!isal_strm) {
-                fprintf(stderr, "Error: Memory allocation for isal_zstream failed\n");
+                Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() Line ", __LINE__,
+                    " memory allocation for isal_zstream failed\n");
                 return nullptr;
         }
 
@@ -96,14 +96,16 @@ InitCompressIGZIP(int level, int windowBits)
                 isal_strm->level_buf = (uint8_t *)malloc(ISAL_DEF_LVL3_DEFAULT);
                 isal_strm->level_buf_size = ISAL_DEF_LVL3_DEFAULT;
         } else {
-                fprintf(stderr, "Error: Invalid compression level\n");
+                Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() Line ", __LINE__,
+                    " invalid compression level\n");
                 free(isal_strm);
                 return nullptr;
         }
 
         if (!isal_strm->level_buf) {
                 free(isal_strm);
-                fprintf(stderr, "Error: Memory allocation for level_buf failed\n");
+                Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() Line ", __LINE__,
+                    " memory allocation for level_buf failed\n");
                 return nullptr;
         }
 
@@ -116,7 +118,8 @@ InitCompressIGZIP(int level, int windowBits)
 deflateInit_(z_streamp strm, int level)
 {
         if (!strm) {
-                fprintf(stderr, "Error: z_streamp is NULL\n");
+                Log(LogLevel::LOG_ERROR, "deflateInit_() Line ", __LINE__,
+                    " z_streamp is NULL\n");
                 return -1;
         }
 
@@ -135,7 +138,8 @@ CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
   	Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__, " input_length ",
       	  *input_length, " \n");
         if (!isal_strm) {
-                fprintf(stderr, "Error: deflate isal_strm is NULL\n");
+                Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+                    " deflate isal_strm is NULL\n");
                 return -1;
         }
 
@@ -167,16 +171,19 @@ CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
                 isal_strm->end_of_stream = 1;
                 break;
         default:
-                fprintf(stderr, "Error: Invalid flush value\n");
+                Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+                    " invalid flush value\n");
                 return -1;
         }
 
 #ifdef DEBUG
-        fprintf(stderr, "Gzip flag: %d, Window bits: %d, Flush: %d, Level: %d\n",
-                isal_strm->gzip_flag, isal_strm->hist_bits, isal_strm->flush, isal_strm->level);
-        fprintf(stderr, "Before isal_deflate: avail_in=%u, next_in=%p, avail_out=%u, next_out=%p\n",
-                isal_strm->avail_in, isal_strm->next_in, isal_strm->avail_out, isal_strm->next_out);
-        fprintf(stderr, "Total out: %u, Total in %u\n", isal_strm->total_out, isal_strm->total_in);
+        Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__, " gzip_flag ",
+            isal_strm->gzip_flag, ", hist_bits ", isal_strm->hist_bits,
+            ", flush ", isal_strm->flush, ", level ", isal_strm->level,
+            ", avail_in ", isal_strm->avail_in, ", avail_out ",
+            (uint32_t)isal_strm->avail_out, ", total_out ",
+            (uint32_t)isal_strm->total_out, ", total_in ",
+            (uint32_t)isal_strm->total_in, "\n");
 #endif
 
         int comp = isal_deflate(isal_strm);
@@ -187,41 +194,53 @@ CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
         output = isal_strm->next_out;
 
 #ifdef DEBUG
-        fprintf(stderr, "After isal_deflate: avail_in=%u, next_in=%p, avail_out=%u, next_out=%p\n",
-                isal_strm->avail_in, isal_strm->next_in, isal_strm->avail_out, isal_strm->next_out);
-        fprintf(stderr, "Bytes consumed: %u, Bytes produced: %u\n", *input_length, *output_length);
+        Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__,
+            " after isal_deflate: avail_in ", isal_strm->avail_in,
+            ", avail_out ", (uint32_t)isal_strm->avail_out,
+            ", bytes_consumed ", *input_length,
+            ", bytes_produced ", *output_length, "\n");
 #endif
 
         ret = (comp == COMP_OK) ? 0 : 1;
 
 #ifdef DEBUG
         if (ret == Z_OK) {
-                fprintf(stderr, "Deflate finished successfully Z_OK\n");
+                Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__,
+                    " deflate finished successfully Z_OK\n");
         } else if (ret == Z_STREAM_END) {
-                fprintf(stderr, "Deflate finished successfully Z_STREAM_END\n");
+                Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__,
+                    " deflate finished successfully Z_STREAM_END\n");
         } else {
-                fprintf(stderr, "Deflate finished with error code: %d\n", ret);
+                Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+                    " deflate finished with error code ", ret, "\n");
                 switch (comp) {
                 case INVALID_FLUSH:
-                        fprintf(stderr, "Error: Invalid flush\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid flush\n");
                         break;
                 case INVALID_PARAM:
-                        fprintf(stderr, "Error: Invalid parameter\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid parameter\n");
                         break;
                 case STATELESS_OVERFLOW:
-                        fprintf(stderr, "Error: Stateless overflow\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " stateless overflow\n");
                         break;
                 case ISAL_INVALID_OPERATION:
-                        fprintf(stderr, "Error: Invalid operation\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid operation\n");
                         break;
                 case ISAL_INVALID_STATE:
-                        fprintf(stderr, "Error: Invalid state\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid state\n");
                         break;
                 case ISAL_INVALID_LEVEL:
-                        fprintf(stderr, "Error: Invalid level\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid level\n");
                         break;
                 case ISAL_INVALID_LEVEL_BUF:
-                        fprintf(stderr, "Error: Invalid level buffer\n");
+                        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ",
+                            __LINE__, " invalid level buffer\n");
                         break;
                 }
         }
@@ -234,7 +253,8 @@ int
 EndCompressIGZIP(struct isal_zstream* isal_strm)
 {
         if (!isal_strm) {
-                fprintf(stderr, "Error: isal_stream is NULL\n");
+                Log(LogLevel::LOG_ERROR, "EndCompressIGZIP() Line ", __LINE__,
+                    " isal_stream is NULL\n");
                 return -1;
         }
 
@@ -245,7 +265,8 @@ EndCompressIGZIP(struct isal_zstream* isal_strm)
          free(isal_strm);
 
 #ifdef DEBUG
-        fprintf(stderr, "Deflate end\n");
+        Log(LogLevel::LOG_INFO, "EndCompressIGZIP() Line ", __LINE__,
+            " deflate end\n");
 #endif
         return Z_OK;
 }
@@ -341,12 +362,14 @@ InitUncompressIGZIP(int windowBits)
         struct inflate_state *isal_strm_inflate =
                 (struct inflate_state *) malloc(sizeof(struct inflate_state));
         if (!isal_strm_inflate) {
-                fprintf(stderr, "Error: Memory allocation for inflate_state failed\n");
+                Log(LogLevel::LOG_ERROR, "InitUncompressIGZIP() Line ",
+                    __LINE__, " memory allocation for inflate_state failed\n");
                 return nullptr;
         }
 
 #ifdef DEBUG
-        fprintf(stderr, "\nInitializing inflate with windowBits: %d", windowBits);
+        Log(LogLevel::LOG_INFO, "InitUncompressIGZIP() Line ", __LINE__,
+            " initializing inflate with windowBits ", windowBits, "\n");
 #endif
   	Log(LogLevel::LOG_INFO, "InitUncompressIGZIP() Line ", __LINE__, 
       	  ", windowBits ",windowBits, " \n");
@@ -370,7 +393,8 @@ InitUncompressIGZIP(int windowBits)
 inflateInit_(z_streamp strm)
 {
         if (!strm) {
-                fprintf(stderr, "Error: z_streamp is NULL\n");
+                Log(LogLevel::LOG_ERROR, "inflateInit_() Line ", __LINE__,
+                    " z_streamp is NULL\n");
                 return Z_STREAM_ERROR;
         }
 
@@ -386,7 +410,8 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
         (void) total_in;
 
         if (!isal_strm_inflate) {
-                fprintf(stderr, "Error: isal_strm_inflate is NULL\n");
+                Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+                    " isal_strm_inflate is NULL\n");
                 return Z_STREAM_ERROR;
         }
 
@@ -428,11 +453,8 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
         if (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH &&
             isal_strm_inflate->avail_in > 0) {
                 Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
-                " WARNING: BLOCK_FINISH reached but ",isal_strm_inflate->avail_in, "bytes remain in input:\n");
-                for (unsigned int i = 0; i < isal_strm_inflate->avail_in && i < 16; i++) {
-                        fprintf(stderr, " %02x", ((unsigned char *) isal_strm_inflate->next_in)[i]);
-                }
-                fprintf(stderr, "\n");
+                " WARNING: BLOCK_FINISH reached but ",isal_strm_inflate->avail_in,
+                " bytes remain in input\n");
         }
 
         // WORKAROUND: ISA-L over-consumption fix for raw deflate mode
@@ -451,15 +473,14 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
                 // Only apply fix if the over-consumption is reasonable (1-7 bytes)
                 if (over_consumed >= 1 && over_consumed <= 7) {
 #ifdef DEBUG
-                        fprintf(stderr,
-                                "APPLYING WORKAROUND: Detected ISA-L over-consumption of %u "
-                                "bytes\n",
-                                over_consumed);
-                        fprintf(stderr, "Adjusting next_in from %p to %p, avail_in from %u to %u\n",
-                                isal_strm_inflate->next_in,
-                                (unsigned char *) isal_strm_inflate->next_in - over_consumed,
-                                isal_strm_inflate->avail_in,
-                                isal_strm_inflate->avail_in + over_consumed);
+                                                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ",
+                                                        __LINE__, " applying workaround: detected ISA-L over-consumption of ",
+                                                        over_consumed, " bytes\n");
+                                                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ",
+                                                        __LINE__, " adjusting avail_in from ",
+                                                        isal_strm_inflate->avail_in, " to ",
+                                                        isal_strm_inflate->avail_in + over_consumed,
+                                                        "\n");
 #endif
                         // Rewind the input pointer to restore over-consumed bytes
                         isal_strm_inflate->next_in =
@@ -488,32 +509,42 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
 
 #ifdef DEBUG
         if (ret == Z_OK) {
-                fprintf(stderr, "Inflate finished successfully Z_OK\n");
+                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+                    " inflate finished successfully Z_OK\n");
         } else if (ret == Z_STREAM_END) {
-                fprintf(stderr, "Inflate finished with Z_STREAM_END\n");
+                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+                    " inflate finished with Z_STREAM_END\n");
         } else {
-                fprintf(stderr, "Inflate finished with error code: %d\n", ret);
+                Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+                    " inflate finished with error code ", ret, "\n");
                 switch (decomp) {
                 case ISAL_INVALID_BLOCK:
-                        fprintf(stderr, "Error: ISA-L error - Invalid block\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - Invalid block\n");
                         break;
                 case ISAL_INVALID_SYMBOL:
-                        fprintf(stderr, "Error: ISA-L error - Invalid symbol\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - Invalid symbol\n");
                         break;
                 case ISAL_INVALID_LOOKBACK:
-                        fprintf(stderr, "Error: ISA-L error - Invalid lookback\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - Invalid lookback\n");
                         break;
                 case ISAL_END_INPUT:
-                        fprintf(stderr, "Error: ISA-L error - End of input reached unexpectedly\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - End of input reached unexpectedly\n");
                         break;
                 case ISAL_UNSUPPORTED_METHOD:
-                        fprintf(stderr, "Error: ISA-L error - Unsupported method\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - Unsupported method\n");
                         break;
                 case ISAL_NEED_DICT:
-                        fprintf(stderr, "Error: ISA-L error - Need dictionary\n");
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error - Need dictionary\n");
                         break;
                 default:
-                        fprintf(stderr, "Error: ISA-L error code: %d\n", decomp);
+                        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ",
+                            __LINE__, " ISA-L error code ", decomp, "\n");
                         break;
                 }
         }
@@ -526,7 +557,8 @@ int
 EndUncompressIGZIP(struct inflate_state *isal_strm_inflate)
 {
         if (!isal_strm_inflate) {
-                fprintf(stderr, "Error: z_streamp is NULL\n");
+                Log(LogLevel::LOG_ERROR, "EndUncompressIGZIP() Line ",
+                    __LINE__, " z_streamp is NULL\n");
                 return Z_STREAM_ERROR;
         }
 
@@ -534,7 +566,8 @@ EndUncompressIGZIP(struct inflate_state *isal_strm_inflate)
 
 
 #ifdef DEBUG
-        fprintf(stderr, "Inflate end\n");
+        Log(LogLevel::LOG_INFO, "EndUncompressIGZIP() Line ", __LINE__,
+            " inflate end\n");
 #endif
         return Z_OK;
 }
@@ -620,7 +653,8 @@ int
 ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed)
 {
         if (!isal_strm_inflate) {
-                fprintf(stderr, "Error: isal_strm_inflate is NULL\n");
+                Log(LogLevel::LOG_ERROR, "ResetUncompressIGZIP() Line ",
+                    __LINE__, " isal_strm_inflate is NULL\n");
                 return Z_STREAM_ERROR;
         }
 

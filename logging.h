@@ -24,9 +24,14 @@ inline std::unique_ptr<std::ofstream>& LogFileStream() {
   return stream;
 }
 
-inline void CreateLogFile(const char* file_name) {
+inline bool CreateLogFile(const char* file_name) {
   auto& s = LogFileStream();
   s = std::make_unique<std::ofstream>(file_name, std::ios::app);
+  if (!s || !s->is_open()) {
+    s.reset();
+    return false;
+  }
+  return true;
 }
 
 inline void CloseLogFile() {
