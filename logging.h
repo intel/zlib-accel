@@ -4,10 +4,15 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <utility>
 
 #include "config/config.h"
@@ -52,6 +57,24 @@ inline std::ostream& GetLogStream() {
 #ifdef DEBUG_LOG
 
 static std::mutex log_mutex;
+
+inline std::string FormatLogTimestamp() {
+  using clock = std::chrono::system_clock;
+  const auto now = clock::now();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) %
+      1000;
+  const std::time_t t = clock::to_time_t(now);
+
+  std::tm tm{};
+  localtime_r(&t, &tm);
+
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S") << '.' << std::setw(3)
+      << std::setfill('0') << ms.count();
+  return oss.str();
+}
+
 template <typename... Args>
 inline void Log(LogLevel level, Args&&... args) {
   std::lock_guard<std::mutex> lock(log_mutex);
@@ -67,6 +90,7 @@ inline void Log(LogLevel level, Args&&... args) {
 
   std::ostream& stream = GetLogStream();
   stream << std::dec;
+  stream << '[' << FormatLogTimestamp() << "] ";
   switch (level) {
     case LogLevel::LOG_ERROR:
       stream << "Error: ";
@@ -77,7 +101,14 @@ inline void Log(LogLevel level, Args&&... args) {
     case LogLevel::LOG_NONE:
       return;
   }
-  (..., (stream << args));
+
+  std::ostringstream line;
+  (..., (line << args));
+  std::string message = line.str();
+  if (message.empty() || message.back() != '\n') {
+    message.push_back('\n');
+  }
+  stream << message;
   stream << std::flush;
 }
 

@@ -37,11 +37,14 @@ InitUncompressIGZIP(int windowBits);
 int
 UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
 		uint32_t *input_length, uint8_t *output, uint32_t *output_length,
-                int *tofixed, unsigned long *total_in, unsigned long *total_out,
+                int window_bits, int *tofixed,
+                uint32_t *deferred_correction_bytes,
+                unsigned long *total_in, unsigned long *total_out,
                 bool *end_of_stream);
 int
 EndUncompressIGZIP(struct inflate_state *isal_strm_inflate);
 int
-ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed);
+ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed,
+                     uint32_t *deferred_correction_bytes);
 //#define Z_DEFAULT_COMPRESSION 6
 #endif

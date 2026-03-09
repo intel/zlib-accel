@@ -404,7 +404,9 @@ inflateInit_(z_streamp strm)
 int
 UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
 		uint32_t *input_length, uint8_t *output, uint32_t *output_length,
-                int *tofixed, unsigned long *total_in, unsigned long *total_out,
+                int window_bits, int *tofixed,
+                uint32_t *deferred_correction_bytes,
+                unsigned long *total_in, unsigned long *total_out,
                 bool *end_of_stream)
 {
         (void) total_in;
@@ -416,7 +418,7 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
         }
 
   	Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
-  		 "input length ", *input_length,"\n");
+  		 " input length ", *input_length,"\n");
         // set stream->avail_in, next_in, avail_out, next_out (from zstream)​
         isal_strm_inflate->next_out = output;
         const uint32_t original_avail_out = *output_length;
@@ -433,7 +435,7 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
 		" avail_out= ",(uint32_t)isal_strm_inflate->avail_out, 
 		//" next_out= ", isal_strm_inflate->next_out,
         	" Total out: ", (uint32_t)isal_strm_inflate->total_out, 
-		" Total_in: ", (unsigned long)*total_in);
+		" Total_in: ", (unsigned long)*total_in, "\n");
 
         const int decomp = isal_inflate(isal_strm_inflate);
 
@@ -457,47 +459,81 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
                 " bytes remain in input\n");
         }
 
-        // WORKAROUND: ISA-L over-consumption fix for raw deflate mode
-        if ((isal_strm_inflate->block_state == ISAL_BLOCK_FINISH ||
+        uint32_t consumed_before_adjust = 0;
+        if (isal_strm_inflate->avail_in <= original_avail_in) {
+                consumed_before_adjust =
+                        original_avail_in - isal_strm_inflate->avail_in;
+        } else {
+                Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+                    " invalid avail_in ", isal_strm_inflate->avail_in,
+                    " greater than original_avail_in ", original_avail_in,
+                    ", clamping consumed bytes to 0\n");
+                consumed_before_adjust = 0;
+        }
+
+        uint32_t rewind_adjust_bytes = 0;
+
+        // WORKAROUND: ISA-L over-consumption fix for raw deflate mode.
+        // Keep original 8-byte trailer heuristic, but for streaming callers
+        // defer correction discovered at INPUT_DONE and apply only when EOS is
+        // confirmed at BLOCK_FINISH.
+        if (window_bits < 0 && decomp == ISAL_DECOMP_OK && *tofixed == 0 &&
+            (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH ||
              isal_strm_inflate->block_state == ISAL_BLOCK_INPUT_DONE) &&
-                        (isal_strm_inflate->crc_flag == IGZIP_DEFLATE) &&
-            *tofixed == 0 && // hasn't been applied yet
-            decomp == ISAL_DECOMP_OK &&              // successful decompression
             isal_strm_inflate->avail_in < 8 && isal_strm_inflate->avail_in > 0) {
-
-                // Calculate how many bytes were likely over-consumed
-                const unsigned int expected_trailer_bytes = 8;
-                const unsigned int over_consumed =
+                const uint32_t expected_trailer_bytes = 8;
+                const uint32_t over_consumed =
                         expected_trailer_bytes - isal_strm_inflate->avail_in;
-
-                // Only apply fix if the over-consumption is reasonable (1-7 bytes)
                 if (over_consumed >= 1 && over_consumed <= 7) {
-#ifdef DEBUG
-                                                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ",
-                                                        __LINE__, " applying workaround: detected ISA-L over-consumption of ",
-                                                        over_consumed, " bytes\n");
-                                                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ",
-                                                        __LINE__, " adjusting avail_in from ",
-                                                        isal_strm_inflate->avail_in, " to ",
-                                                        isal_strm_inflate->avail_in + over_consumed,
-                                                        "\n");
-#endif
-                        // Rewind the input pointer to restore over-consumed bytes
-                        isal_strm_inflate->next_in =
-                                (unsigned char *) isal_strm_inflate->next_in - over_consumed;
-                        isal_strm_inflate->avail_in += over_consumed;
-
-                        // Mark that the workaround has been applied
-                        *tofixed = 1;
-
-                        // Also adjust the byte consumption count to reflect the actual deflate data
-                        // consumed Note: bytes_consumed is calculated later, so we'll need to
-                        // adjust it after the calculation
+                        if (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH) {
+                                rewind_adjust_bytes =
+                                        consumed_before_adjust < over_consumed
+                                                ? consumed_before_adjust
+                                                : over_consumed;
+                                if (rewind_adjust_bytes > 0) {
+                                        *tofixed = 1;
+                                        Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+                                            " raw EOS correction applied: over_consumed ",
+                                            over_consumed, ", rewind_bytes ",
+                                            rewind_adjust_bytes,
+                                            ", consumed_before_adjust ",
+                                            consumed_before_adjust,
+                                            ", consumed_after_adjust ",
+                                            (consumed_before_adjust - rewind_adjust_bytes),
+                                            "\n");
+                                }
+                        } else if (deferred_correction_bytes != nullptr &&
+                                   *deferred_correction_bytes == 0) {
+                                *deferred_correction_bytes = over_consumed;
+                                Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+                                    " raw correction deferred until EOS: over_consumed ",
+                                    over_consumed, "\n");
+                        }
                 }
         }
 
+        if (window_bits < 0 && decomp == ISAL_DECOMP_OK && *tofixed == 0 &&
+            isal_strm_inflate->block_state == ISAL_BLOCK_FINISH &&
+            deferred_correction_bytes != nullptr &&
+            *deferred_correction_bytes > 0) {
+                const uint32_t deferred = *deferred_correction_bytes;
+                rewind_adjust_bytes = consumed_before_adjust < deferred
+                                             ? consumed_before_adjust
+                                             : deferred;
+                if (rewind_adjust_bytes > 0) {
+                        *tofixed = 1;
+                        Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+                            " deferred raw EOS correction applied: deferred ",
+                            deferred, ", rewind_bytes ", rewind_adjust_bytes,
+                            ", consumed_before_adjust ", consumed_before_adjust,
+                            ", consumed_after_adjust ",
+                            (consumed_before_adjust - rewind_adjust_bytes), "\n");
+                }
+                *deferred_correction_bytes = 0;
+        }
+
         *output_length = original_avail_out - isal_strm_inflate->avail_out;
-        *input_length = original_avail_in - isal_strm_inflate->avail_in;
+        *input_length = consumed_before_adjust - rewind_adjust_bytes;
         input = isal_strm_inflate->next_in;
         output = isal_strm_inflate->next_out;
 
@@ -505,7 +541,12 @@ UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
                 *end_of_stream = (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH);
         }
 
-        int ret = (decomp == ISAL_DECOMP_OK || decomp == ISAL_END_INPUT) ? 0 : 1;
+        int ret = 1;
+        if (decomp == ISAL_DECOMP_OK || decomp == ISAL_END_INPUT) {
+                ret = 0;
+        } else if (decomp == ISAL_NEED_DICT) {
+                ret = Z_NEED_DICT;
+        }
 
 #ifdef DEBUG
         if (ret == Z_OK) {
@@ -650,7 +691,8 @@ uncompress(uint8_t *dest, unsigned long *dest_len, const uint8_t *source, unsign
 }*/
 
 int
-ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed)
+ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed,
+                     uint32_t *deferred_correction_bytes)
 {
         if (!isal_strm_inflate) {
                 Log(LogLevel::LOG_ERROR, "ResetUncompressIGZIP() Line ",
@@ -664,6 +706,9 @@ ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate, int *tofixed)
 
         // Reset workaround flag
         *tofixed = 0;
+        if (deferred_correction_bytes != nullptr) {
+                *deferred_correction_bytes = 0;
+        }
 
         return Z_OK;
 }
