@@ -230,9 +230,12 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   if (gzip_ext) {
     *input_length = gzip_ext_dest_size + GZIP_EXT_HDRFTR_SIZE;
   }
-  *end_of_stream = true;
+  // IAA decompression is stateless in this wrapper; when more output is needed
+  // the caller must continue via zlib path.
+  *end_of_stream = (status == QPL_STS_OK);
   Log(LogLevel::LOG_INFO, "UncompressIAA() Line ", __LINE__, " output size ",
-      job->total_out, "\n");
+      job->total_out, ", status ", status, ", end_of_stream ",
+      *end_of_stream, "\n");
   return 0;
 }
 

@@ -489,6 +489,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                           &output_len, qpl_path_hardware,
                           inflate_settings->window_bits, &end_of_stream);
       inflate_settings->path = IAA;
+      // IAA inflate is stateless in this wrapper. If stream end was not
+      // reached, use zlib for stateful continuation.
+      if (!end_of_stream) {
+        ret = 1;
+      }
       in_call = false;
       INCREMENT_STAT(INFLATE_IAA_COUNT);
       INCREMENT_STAT_COND(ret != 0, INFLATE_IAA_ERROR_COUNT);
@@ -681,6 +686,9 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     in_call = true;
     ret = UncompressIAA(const_cast<uint8_t*>(source), &input_len, dest,
                         &output_len, qpl_path_hardware, 15, &end_of_stream);
+    if (!end_of_stream) {
+      ret = 1;
+    }
     in_call = false;
 #endif  // USE_IAA
   } else if (path_selected == QAT) {
