@@ -234,8 +234,8 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
   // the caller must continue via zlib path.
   *end_of_stream = (status == QPL_STS_OK);
   Log(LogLevel::LOG_INFO, "UncompressIAA() Line ", __LINE__, " output size ",
-      job->total_out, ", status ", status, ", end_of_stream ",
-      *end_of_stream, "\n");
+      job->total_out, ", status ", status, ", end_of_stream ", *end_of_stream,
+      "\n");
   return 0;
 }
 
