@@ -166,11 +166,7 @@ static int init_zlib_accel(void) {
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
   if (!config::log_file.empty()) {
-    if (!CreateLogFile(config::log_file.c_str())) {
-      Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,
-          " failed to open log_file '", config::log_file.c_str(),
-          "', falling back to stdout\n");
-    }
+    CreateLogFile(config::log_file.c_str());
   }
 #endif
 
@@ -2219,15 +2215,10 @@ int ZEXPORT gzclose(gzFile file) {
 
     if (write_ret != 0) {
       ret = Z_STREAM_ERROR;
+    } else if (close_ret != Z_OK) {
+      ret = close_ret;
     } else if (truncate_ret != 0) {
       ret = Z_STREAM_ERROR;
-    } else if (close_ret != Z_OK) {
-      Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__,
-          ", ignoring zlib close return in accelerator path ", close_ret,
-          "\n");
-      ret = Z_OK;
-    } else {
-      ret = Z_OK;
     }
   } else {
     ret = orig_gzclose(file);
