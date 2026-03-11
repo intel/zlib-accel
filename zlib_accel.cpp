@@ -184,6 +184,8 @@ static void cleanup_zlib_accel(void) {
 // Avoid recursive call (e.g., if QATzip falls back to zlib internally)
 static thread_local bool in_call = false;
 
+constexpr uint8_t ZLIB_FDICT_MASK = 0x20;
+
 enum class IGZIPFinishPhase {
   ACTIVE = 0,
   DRAINING = 1,
@@ -204,7 +206,6 @@ struct DeflateSettings {
   int window_bits;
   int mem_level;
   int strategy;
-  bool uses_dictionary = false;
   std::vector<uint8_t> dictionary;
   uint32_t dictionary_crc32 = 0;
   uInt dictionary_length = 0;
@@ -234,7 +235,6 @@ struct InflateSettings {
   int trailer_overconsumption_fixed; /* indicates if fix has been applied for overconsumption issue*/
   uint32_t deferred_trailer_correction_bytes;
   bool force_zlib_for_raw_boundary = false;
-  bool uses_dictionary = false;
   std::vector<uint8_t> dictionary;
   ExecutionPath path = UNDEFINED;
   struct inflate_state *isal_strm = nullptr;
@@ -419,22 +419,6 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
         static_cast<void*>(strm), ", tid ", CurrentThreadId(),
         ", dictLength ", dictLength, "\n");
 
-    // Match zlib API semantics even when acceleration bypassed orig_deflate:
-    // dictionary must be set right after init/reset and before any progress.
-    if (strm->total_in != 0 || strm->total_out != 0) {
-      Log(LogLevel::LOG_ERROR, "deflateSetDictionary Line ", __LINE__,
-          ", strm ", static_cast<void*>(strm), ", tid ", CurrentThreadId(),
-          ", rejecting midstream dictionary set after progress total_in ",
-          strm->total_in, ", total_out ", strm->total_out, "\n");
-      Log(LogLevel::LOG_ERROR,
-          "trace event=reject_midstream_dict stream_id=", stream_id,
-          " strm=", static_cast<void*>(strm), " ret=", Z_STREAM_ERROR,
-          " total_in=", strm->total_in, " total_out=", strm->total_out,
-          " adler=", strm->adler, " dict_len=", dictLength,
-          " tid=", CurrentThreadId(), "\n");
-      return Z_STREAM_ERROR;
-    }
-
     DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
     const int ret = orig_deflateSetDictionary(strm, dictionary, dictLength);
     Log(LogLevel::LOG_INFO,
@@ -443,7 +427,6 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
         " total_out=", strm->total_out, " adler=", strm->adler,
         " dict_len=", dictLength, " tid=", CurrentThreadId(), "\n");
     if (ret == Z_OK) {
-      deflate_settings->uses_dictionary = true;
       deflate_settings->dictionary_crc32 =
         static_cast<uint32_t>(crc32(0L, dictionary, dictLength));
       deflate_settings->dictionary_length = dictLength;
@@ -470,11 +453,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   const uint64_t stream_id = GetOrCreateStreamId(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
-
-  if (deflate_settings->uses_dictionary) {
-    SetDeflatePath(deflate_settings, strm, ZLIB,
-                   "stream marked uses_dictionary");
-  }
 
   if (flush != Z_FINISH &&
       deflate_settings->igzip_finish_phase == IGZIPFinishPhase::DRAINING) {
@@ -508,8 +486,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(deflate_settings->path), ", path_name ",
       ExecutionPathToString(deflate_settings->path), ", window_bits ",
-      deflate_settings->window_bits, ", uses_dictionary ",
-      deflate_settings->uses_dictionary, ", stream_id ", stream_id,
+      deflate_settings->window_bits, ", stream_id ", stream_id,
       ", total_in ", strm->total_in, ", total_out ", strm->total_out,
       ", adler ", strm->adler, ", tid ", CurrentThreadId(), "\n");
     Log(LogLevel::LOG_INFO,
@@ -517,8 +494,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), " flush=", flush, " path=",
       ExecutionPathToString(deflate_settings->path), " avail_in=", strm->avail_in,
       " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, " uses_dict=",
-      deflate_settings->uses_dictionary, " tid=", CurrentThreadId(), "\n");
+      " total_out=", strm->total_out, " tid=", CurrentThreadId(), "\n");
 
   int ret = 1;
   bool iaa_available = false;
@@ -919,9 +895,7 @@ int ZEXPORT deflateReset(z_streamp strm) {
           " tid=", CurrentThreadId(), "\n");
     }
 
-    SetDeflatePath(deflate_settings, strm,
-                   deflate_settings->uses_dictionary ? ZLIB : UNDEFINED,
-                   "deflateReset");
+    SetDeflatePath(deflate_settings, strm, UNDEFINED, "deflateReset");
     deflate_settings->igzip_sync_flush_drained = false;
     deflate_settings->igzip_seen_stream_end = false;
     deflate_settings->igzip_finish_phase = IGZIPFinishPhase::ACTIVE;
@@ -974,10 +948,11 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
         static_cast<void*>(strm), ", tid ", CurrentThreadId(),
         ", dictLength ", dictLength, "\n");
     InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
-    inflate_settings->uses_dictionary = true;
-    SetInflatePath(inflate_settings, strm, ZLIB,
-                   "inflateSetDictionary called");
     const int ret = orig_inflateSetDictionary(strm, dictionary, dictLength);
+    if (ret == Z_OK) {
+      SetInflatePath(inflate_settings, strm, ZLIB,
+                     "inflateSetDictionary called");
+    }
     Log(LogLevel::LOG_INFO,
       "trace event=inflate_set_dict stream_id=", stream_id, " strm=",
       static_cast<void*>(strm), " ret=", ret, " total_in=", strm->total_in,
@@ -1003,8 +978,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(inflate_settings->path), ", path_name ",
       ExecutionPathToString(inflate_settings->path), ", window_bits ",
-      inflate_settings->window_bits, ", uses_dictionary ",
-      inflate_settings->uses_dictionary, ", stream_id ", stream_id,
+      inflate_settings->window_bits, ", stream_id ", stream_id,
       ", total_in ", strm->total_in, ", total_out ", strm->total_out,
       ", adler ", strm->adler, ", tid ", CurrentThreadId(), "\n");
     Log(LogLevel::LOG_INFO,
@@ -1012,8 +986,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), " flush=", flush, " path=",
       ExecutionPathToString(inflate_settings->path), " avail_in=", strm->avail_in,
       " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, " uses_dict=",
-      inflate_settings->uses_dictionary, " tid=", CurrentThreadId(), "\n");
+      " total_out=", strm->total_out, " tid=", CurrentThreadId(), "\n");
   PrintDeflateBlockHeader(LogLevel::LOG_INFO, strm->next_in, strm->avail_in,
                           inflate_settings->window_bits);
 
@@ -1082,7 +1055,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // any accelerator (QAT/IAA/IGZIP don't support preset dictionaries).
   if (!in_call && inflate_settings->path == UNDEFINED &&
       inflate_settings->window_bits >= 8 && inflate_settings->window_bits <= 15 &&
-      strm->avail_in >= 2 && (strm->next_in[1] & 0x20)) {
+      strm->avail_in >= 2 && (strm->next_in[1] & ZLIB_FDICT_MASK)) {
     Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
         static_cast<void*>(strm),
         ", FDICT bit set in zlib header, cmf ",
@@ -1209,7 +1182,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         Log(LogLevel::LOG_ERROR,
             "trace event=inflate_need_dict_signal stream_id=", stream_id,
             " strm=", static_cast<void*>(strm), " source=igzip",
-            " uses_dict=", inflate_settings->uses_dictionary,
             " total_in=", strm->total_in, " total_out=", strm->total_out,
             " adler=", strm->adler, " tid=", CurrentThreadId(), "\n");
         SetInflatePath(inflate_settings, strm, ZLIB,
@@ -1264,11 +1236,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   if (in_call || configs[USE_ZLIB_UNCOMPRESS] ||
       inflate_settings->path == ZLIB) {
     ret = orig_inflate(strm, flush);
-    if (ret == Z_NEED_DICT && !inflate_settings->uses_dictionary) {
+    if (ret == Z_NEED_DICT) {
       Log(LogLevel::LOG_ERROR,
           "trace event=inflate_need_dict_signal stream_id=", stream_id,
           " strm=", static_cast<void*>(strm), " source=zlib",
-          " uses_dict=", inflate_settings->uses_dictionary,
           " total_in=", strm->total_in, " total_out=", strm->total_out,
           " adler=", strm->adler, " tid=", CurrentThreadId(), "\n");
     }
@@ -1334,9 +1305,7 @@ int ZEXPORT inflateReset(z_streamp strm) {
   int ret = orig_inflateReset(strm);
   if (inflate_settings != nullptr) {
     inflate_settings->force_zlib_for_raw_boundary = false;
-    SetInflatePath(inflate_settings, strm,
-                   inflate_settings->uses_dictionary ? ZLIB : UNDEFINED,
-                   "inflateReset");
+    SetInflatePath(inflate_settings, strm, UNDEFINED, "inflateReset");
   }
     if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
