@@ -14,6 +14,8 @@
 
 #define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
+inline constexpr unsigned int QAT_DEST_BUFFER_MIN_SIZE = 512;
+
 inline constexpr unsigned int QAT_HW_BUFF_SZ = QZ_HW_BUFF_MAX_SZ;
 
 class QATJob {

@@ -61,6 +61,7 @@ inline void Log(LogLevel level, Args&&... args) {
   }
 
   std::ostream& stream = GetLogStream();
+  stream << std::dec;
   switch (level) {
     case LogLevel::LOG_ERROR:
       stream << "Error: ";

@@ -100,6 +100,7 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
   }
 
   // Initialize QAT hardware
+  qzSetLogLevel(LOG_NONE);
   int status = qzInit(session.get(), 0);
   if (status != QZ_OK && status != QZ_DUPLICATE) {
     Log(LogLevel::LOG_ERROR, "qzInit() failure  Line ", __LINE__, "  session ",
