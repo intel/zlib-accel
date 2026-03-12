@@ -186,12 +186,6 @@ static thread_local bool in_call = false;
 
 constexpr uint8_t ZLIB_FDICT_MASK = 0x20;
 
-enum class IGZIPFinishPhase {
-  ACTIVE = 0,
-  DRAINING = 1,
-  FINISHED = 2,
-};
-
 struct DeflateSettings {
   DeflateSettings(int _level, int _method, int _window_bits, int _mem_level,
                   int _strategy)
@@ -206,22 +200,6 @@ struct DeflateSettings {
   int window_bits;
   int mem_level;
   int strategy;
-  std::vector<uint8_t> dictionary;
-  uint32_t dictionary_crc32 = 0;
-  uInt dictionary_length = 0;
-  uint64_t dictionary_set_count = 0;
-  bool igzip_sync_flush_drained = false;
-  uint64_t igzip_calls = 0;
-  uint64_t igzip_finish_calls = 0;
-  uint64_t igzip_stream_end_count = 0;
-  uint64_t igzip_no_progress_count = 0;
-  uint64_t igzip_zbuf_error_count = 0;
-  uint64_t igzip_bytes_in = 0;
-  uint64_t igzip_bytes_out = 0;
-  bool igzip_seen_stream_end = false;
-  IGZIPFinishPhase igzip_finish_phase = IGZIPFinishPhase::ACTIVE;
-  uint64_t igzip_finish_drain_calls = 0;
-  uint64_t igzip_finish_no_progress_calls = 0;
   ExecutionPath path = UNDEFINED;
   struct isal_zstream *isal_strm = nullptr;
 };
@@ -235,7 +213,6 @@ struct InflateSettings {
   int trailer_overconsumption_fixed; /* indicates if fix has been applied for overconsumption issue*/
   uint32_t deferred_trailer_correction_bytes;
   bool force_zlib_for_raw_boundary = false;
-  std::vector<uint8_t> dictionary;
   ExecutionPath path = UNDEFINED;
   struct inflate_state *isal_strm = nullptr;
 };
@@ -296,19 +273,6 @@ static const char* ExecutionPathToString(ExecutionPath path) {
       return "IAA";
     case IGZIP:
       return "IGZIP";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-static const char* IGZIPFinishPhaseToString(IGZIPFinishPhase phase) {
-  switch (phase) {
-    case IGZIPFinishPhase::ACTIVE:
-      return "ACTIVE";
-    case IGZIPFinishPhase::DRAINING:
-      return "DRAINING";
-    case IGZIPFinishPhase::FINISHED:
-      return "FINISHED";
     default:
       return "UNKNOWN";
   }
@@ -427,18 +391,8 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
         " total_out=", strm->total_out, " adler=", strm->adler,
         " dict_len=", dictLength, " tid=", CurrentThreadId(), "\n");
     if (ret == Z_OK) {
-      deflate_settings->dictionary_crc32 =
-        static_cast<uint32_t>(crc32(0L, dictionary, dictLength));
-      deflate_settings->dictionary_length = dictLength;
-      deflate_settings->dictionary_set_count++;
       SetDeflatePath(deflate_settings, strm, ZLIB,
                      "deflateSetDictionary called");
-      Log(LogLevel::LOG_INFO,
-        "trace event=deflate_set_dict_fingerprint stream_id=", stream_id,
-        " strm=", static_cast<void*>(strm), " dict_len=", dictLength,
-        " dict_crc32=", deflate_settings->dictionary_crc32,
-        " dict_set_count=", deflate_settings->dictionary_set_count,
-        " tid=", CurrentThreadId(), "\n");
     }
     return ret;
   }
@@ -454,21 +408,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
 
-  if (flush != Z_FINISH &&
-      deflate_settings->igzip_finish_phase == IGZIPFinishPhase::DRAINING) {
-    deflate_settings->igzip_finish_phase = IGZIPFinishPhase::ACTIVE;
-    deflate_settings->igzip_finish_no_progress_calls = 0;
-  }
-
-  if (flush == Z_FINISH && deflate_settings->path == IGZIP &&
-      deflate_settings->igzip_finish_phase == IGZIPFinishPhase::FINISHED) {
-    Log(LogLevel::LOG_INFO,
-        "trace event=igzip_finish_already_complete stream_id=", stream_id,
-        " strm=", static_cast<void*>(strm), " total_in=", strm->total_in,
-        " total_out=", strm->total_out, " tid=", CurrentThreadId(), "\n");
-    return Z_STREAM_END;
-  }
-
   const bool is_streaming_flush_with_input =
       (flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH ||
        flush == Z_FULL_FLUSH || flush == Z_BLOCK) &&
@@ -480,6 +419,24 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 
   const bool is_sync_flush =
       (flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH || flush == Z_BLOCK);
+
+    const bool igzip_sync_flush_empty_reentry =
+      (deflate_settings->path == IGZIP && is_sync_flush && strm->avail_in == 0);
+    const bool igzip_finish_reentry_without_input =
+      (deflate_settings->path == IGZIP && flush == Z_FINISH &&
+       strm->avail_in == 0);
+    if (igzip_sync_flush_empty_reentry || igzip_finish_reentry_without_input) {
+    const char* reason = igzip_sync_flush_empty_reentry
+                 ? "igzip risky empty sync flush; forcing zlib"
+                 : "igzip risky finish reentry without input; forcing zlib";
+    SetDeflatePath(deflate_settings, strm, ZLIB, reason);
+    Log(LogLevel::LOG_INFO,
+      "trace event=igzip_compress_unavailable stream_id=", stream_id,
+      " strm=", static_cast<void*>(strm), " reason=", reason,
+      " flush=", flush, " avail_in=", strm->avail_in,
+      " avail_out=", strm->avail_out, " total_in=", strm->total_in,
+      " total_out=", strm->total_out, " tid=", CurrentThreadId(), "\n");
+    }
 
   Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
@@ -600,24 +557,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       const uLong pre_total_in = strm->total_in;
       const uLong pre_total_out = strm->total_out;
 
-      if (strm->avail_in > 0) {
-        deflate_settings->igzip_sync_flush_drained = false;
-      }
-
-      if (flush == Z_FINISH &&
-          deflate_settings->igzip_finish_phase == IGZIPFinishPhase::ACTIVE) {
-        deflate_settings->igzip_finish_phase = IGZIPFinishPhase::DRAINING;
-        deflate_settings->igzip_finish_no_progress_calls = 0;
-      }
-
-      if (is_sync_flush && strm->avail_in == 0 &&
-          deflate_settings->igzip_sync_flush_drained) {
-        Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
-            static_cast<void*>(strm),
-            ", repeated empty sync flush on drained IGZIP stream; returning Z_BUF_ERROR\n");
-        return Z_BUF_ERROR;
-      }
-
       if (deflate_settings->isal_strm == nullptr) {
 	      deflate_settings->method = 0;
 	      deflate_settings->isal_strm = InitCompressIGZIP(deflate_settings->level, deflate_settings->window_bits); //hardcoded window bits
@@ -632,13 +571,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       SetDeflatePath(deflate_settings, strm, IGZIP,
              "selected IGZIP accelerator");
       in_call = false;
-
-      deflate_settings->igzip_calls++;
-      if (flush == Z_FINISH) {
-        deflate_settings->igzip_finish_calls++;
-      }
-      deflate_settings->igzip_bytes_in += input_len;
-      deflate_settings->igzip_bytes_out += output_len;
 
       uint32_t output_crc32 = 0;
       uint32_t out_head_b0 = 256;
@@ -685,27 +617,12 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       strm->avail_out -= output_len;
       strm->total_out += output_len;
       if (path_selected == IGZIP) {
-        if (is_sync_flush) {
-          if (input_len > 0) {
-            deflate_settings->igzip_sync_flush_drained = false;
-          } else if (output_len > 0) {
-            deflate_settings->igzip_sync_flush_drained = true;
-          }
-        } else {
-          deflate_settings->igzip_sync_flush_drained = false;
-        }
-
         const bool no_progress = (input_len == 0 && output_len == 0);
         bool finish_done = false;
       #ifdef USE_IGZIP
         finish_done = (flush == Z_FINISH) &&
                 IsIGZIPDeflateFinished(deflate_settings->isal_strm);
       #endif
-
-        if (flush == Z_FINISH &&
-            deflate_settings->igzip_finish_phase == IGZIPFinishPhase::DRAINING) {
-          deflate_settings->igzip_finish_drain_calls++;
-        }
 
         if (flush == Z_FINISH && strm->avail_in == 0 && !finish_done) {
           const bool need_more_output_room = (strm->avail_out == 0);
@@ -741,39 +658,10 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 
         if (finish_done) {
           ret = Z_STREAM_END;
-          deflate_settings->igzip_seen_stream_end = true;
-          deflate_settings->igzip_stream_end_count++;
-          deflate_settings->igzip_finish_phase = IGZIPFinishPhase::FINISHED;
-          deflate_settings->igzip_finish_no_progress_calls = 0;
         } else if (!no_progress) {
           ret = Z_OK;
-          if (flush == Z_FINISH) {
-            deflate_settings->igzip_finish_phase = IGZIPFinishPhase::DRAINING;
-          }
-          deflate_settings->igzip_finish_no_progress_calls = 0;
         } else {
-          if (flush == Z_FINISH) {
-            deflate_settings->igzip_finish_no_progress_calls++;
-            if (strm->avail_out > 0 &&
-                deflate_settings->igzip_finish_no_progress_calls > 1) {
-              Log(LogLevel::LOG_ERROR,
-                  "trace event=igzip_finish_stall stream_id=", stream_id,
-                  " strm=", static_cast<void*>(strm), " avail_in=",
-                  strm->avail_in, " avail_out=", strm->avail_out,
-                  " total_in=", strm->total_in, " total_out=",
-                  strm->total_out, " finish_phase=",
-                  IGZIPFinishPhaseToString(deflate_settings->igzip_finish_phase),
-                  " no_progress_calls=",
-                  deflate_settings->igzip_finish_no_progress_calls,
-                  " tid=", CurrentThreadId(), "\n");
-              ret = Z_STREAM_ERROR;
-            }
-          }
-          if (ret != Z_STREAM_ERROR) {
             ret = Z_BUF_ERROR;
-          }
-          deflate_settings->igzip_zbuf_error_count++;
-          deflate_settings->igzip_no_progress_count++;
         }
       } else {
         if (strm->avail_in == 0) {
@@ -839,26 +727,6 @@ int ZEXPORT deflateEnd(z_streamp strm) {
     DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
     if (deflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
-  	Log(LogLevel::LOG_INFO,
-        "trace event=igzip_stream_summary stream_id=", stream_id,
-        " strm=", static_cast<void*>(strm),
-        " calls=", deflate_settings->igzip_calls,
-        " finish_calls=", deflate_settings->igzip_finish_calls,
-        " stream_end_count=", deflate_settings->igzip_stream_end_count,
-        " no_progress_count=", deflate_settings->igzip_no_progress_count,
-        " zbuf_error_count=", deflate_settings->igzip_zbuf_error_count,
-        " bytes_in=", deflate_settings->igzip_bytes_in,
-        " bytes_out=", deflate_settings->igzip_bytes_out,
-        " seen_stream_end=", deflate_settings->igzip_seen_stream_end,
-        " finish_phase=",
-        IGZIPFinishPhaseToString(deflate_settings->igzip_finish_phase),
-        " finish_drain_calls=", deflate_settings->igzip_finish_drain_calls,
-        " finish_no_progress_calls=",
-        deflate_settings->igzip_finish_no_progress_calls,
-        " dict_len=", deflate_settings->dictionary_length,
-        " dict_crc32=", deflate_settings->dictionary_crc32,
-        " dict_set_count=", deflate_settings->dictionary_set_count,
-        " tid=", CurrentThreadId(), "\n");
 	EndCompressIGZIP(deflate_settings->isal_strm);
 #endif
     }
@@ -884,23 +752,7 @@ int ZEXPORT deflateReset(z_streamp strm) {
   DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
   int ret = orig_deflateReset(strm);
   if (deflate_settings != nullptr) {
-    if (deflate_settings->path == IGZIP && strm != nullptr &&
-        strm->total_in > 0 && !deflate_settings->igzip_seen_stream_end) {
-      Log(LogLevel::LOG_ERROR,
-          "trace event=igzip_reset_without_stream_end stream_id=", stream_id,
-          " strm=", static_cast<void*>(strm), " total_in=", strm->total_in,
-          " total_out=", strm->total_out,
-          " calls=", deflate_settings->igzip_calls,
-          " finish_calls=", deflate_settings->igzip_finish_calls,
-          " tid=", CurrentThreadId(), "\n");
-    }
-
     SetDeflatePath(deflate_settings, strm, UNDEFINED, "deflateReset");
-    deflate_settings->igzip_sync_flush_drained = false;
-    deflate_settings->igzip_seen_stream_end = false;
-    deflate_settings->igzip_finish_phase = IGZIPFinishPhase::ACTIVE;
-    deflate_settings->igzip_finish_drain_calls = 0;
-    deflate_settings->igzip_finish_no_progress_calls = 0;
 
 #ifdef USE_IGZIP
     if (deflate_settings->isal_strm != nullptr) {
