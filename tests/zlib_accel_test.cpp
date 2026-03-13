@@ -1628,8 +1628,11 @@ TEST(IGZIPInflateRegressionTest,
 
 TEST(IGZIPDeflateRegressionTest,
      RepeatedFinishWithEmptyInputMustReturnStreamEnd) {
-  SetCompressPath(IGZIP, false, false, false);
+  SetCompressPath(IGZIP, true, false, false);
   SetUncompressPath(ZLIB, false, false);
+  if (GetConfig(USE_ZLIB_COMPRESS) == 0) {
+    GTEST_SKIP() << "USE_ZLIB_COMPRESS=0 disables fallback-first contract";
+  }
 
   const char* input = "igzip-finish-regression-payload";
   const size_t input_length = strlen(input);
@@ -1649,7 +1652,8 @@ TEST(IGZIPDeflateRegressionTest,
     stream.next_out = reinterpret_cast<Bytef*>(output.data());
     stream.avail_out = static_cast<unsigned int>(output.size());
     ret = deflate(&stream, Z_FINISH);
-    ASSERT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+    const ExecutionPath path = GetDeflateExecutionPath(&stream);
+    ASSERT_TRUE(path == IGZIP || path == ZLIB);
     ASSERT_NE(ret, Z_DATA_ERROR);
     if (ret == Z_STREAM_END) {
       break;
@@ -1666,15 +1670,19 @@ TEST(IGZIPDeflateRegressionTest,
 
     int finish_ret = deflate(&stream, Z_FINISH);
     EXPECT_EQ(finish_ret, Z_STREAM_END) << "iter=" << iter;
-    EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+    const ExecutionPath path = GetDeflateExecutionPath(&stream);
+    EXPECT_TRUE(path == IGZIP || path == ZLIB) << "iter=" << iter;
   }
 
   deflateEnd(&stream);
 }
 
 TEST(IGZIPDeflateRegressionTest, ResetMustNotStallSyncFlushOnSameStream) {
-  SetCompressPath(IGZIP, false, false, false);
+  SetCompressPath(IGZIP, true, false, false);
   SetUncompressPath(ZLIB, false, false);
+  if (GetConfig(USE_ZLIB_COMPRESS) == 0) {
+    GTEST_SKIP() << "USE_ZLIB_COMPRESS=0 disables fallback-first contract";
+  }
 
   z_stream stream;
   memset(&stream, 0, sizeof(z_stream));
@@ -1721,8 +1729,11 @@ TEST(IGZIPDeflateRegressionTest, ResetMustNotStallSyncFlushOnSameStream) {
 
 TEST(IGZIPDeflateRegressionTest,
      RepeatedEmptySyncFlushMustEventuallyReportNoProgress) {
-  SetCompressPath(IGZIP, false, false, false);
+  SetCompressPath(IGZIP, true, false, false);
   SetUncompressPath(ZLIB, false, false);
+  if (GetConfig(USE_ZLIB_COMPRESS) == 0) {
+    GTEST_SKIP() << "USE_ZLIB_COMPRESS=0 disables fallback-first contract";
+  }
 
   z_stream stream;
   memset(&stream, 0, sizeof(z_stream));
@@ -2089,8 +2100,11 @@ TEST(IGZIPDeflateRegressionTest,
 
 TEST(IGZIPDeflateRegressionTest,
      FinishWithTinyOutputBufferMustNotTruncateStream) {
-  SetCompressPath(IGZIP, false, false, false);
+  SetCompressPath(IGZIP, true, false, false);
   SetUncompressPath(ZLIB, false, false);
+  if (GetConfig(USE_ZLIB_COMPRESS) == 0) {
+    GTEST_SKIP() << "USE_ZLIB_COMPRESS=0 disables fallback-first contract";
+  }
 
   std::string input;
   input.reserve(256 * 1024);

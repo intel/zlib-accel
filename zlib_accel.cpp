@@ -203,13 +203,9 @@ struct DeflateSettings {
 
 struct InflateSettings {
   InflateSettings(int _window_bits)
-      : window_bits(_window_bits),
-        trailer_overconsumption_fixed(0),
-        deferred_trailer_correction_bytes(0) {}
+      : window_bits(_window_bits), trailer_overconsumption_fixed(0) {}
   int window_bits;
   int trailer_overconsumption_fixed; /* indicates if fix has been applied for overconsumption issue*/
-  uint32_t deferred_trailer_correction_bytes;
-  bool force_zlib_for_raw_boundary = false;
   ExecutionPath path = UNDEFINED;
   struct inflate_state *isal_strm = nullptr;
 };
@@ -248,42 +244,13 @@ class InflateStreamSettings {
 };
 InflateStreamSettings inflate_stream_settings;
 
-#ifdef USE_IGZIP
-static bool IsIGZIPDeflateFinished(const struct isal_zstream* stream) {
-  if (stream == nullptr) {
-    return false;
-  }
-  const enum isal_zstate_state state = stream->internal_state.state;
-  return state == ZSTATE_END || state == ZSTATE_TMP_END;
-}
-#endif
-
-static const char* ExecutionPathToString(ExecutionPath path) {
-  switch (path) {
-    case UNDEFINED:
-      return "UNDEFINED";
-    case ZLIB:
-      return "ZLIB";
-    case QAT:
-      return "QAT";
-    case IAA:
-      return "IAA";
-    case IGZIP:
-      return "IGZIP";
-    default:
-      return "UNKNOWN";
-  }
-}
-
 static void SetDeflatePath(DeflateSettings* settings, z_streamp strm,
                            ExecutionPath new_path, const char* reason) {
   if (settings == nullptr || settings->path == new_path) {
     return;
   }
-  Log(LogLevel::LOG_INFO, "deflate path transition Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", old ",
-      ExecutionPathToString(settings->path), ", new ",
-      ExecutionPathToString(new_path), ", reason ", reason, "\n");
+  (void)strm;
+  (void)reason;
   settings->path = new_path;
 }
 
@@ -292,10 +259,8 @@ static void SetInflatePath(InflateSettings* settings, z_streamp strm,
   if (settings == nullptr || settings->path == new_path) {
     return;
   }
-  Log(LogLevel::LOG_INFO, "inflate path transition Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", old ",
-      ExecutionPathToString(settings->path), ", new ",
-      ExecutionPathToString(new_path), ", reason ", reason, "\n");
+  (void)strm;
+  (void)reason;
   settings->path = new_path;
 }
 
@@ -303,9 +268,6 @@ int ZEXPORT deflateInit_(z_streamp strm, int level, const char* version,
                          int stream_size) {
   Log(LogLevel::LOG_INFO, "deflateInit_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", level ", level, "\n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " level=", level,
-      "\n");
 
   deflate_stream_settings.Set(strm, level, Z_DEFLATED, 15, 8,
                               Z_DEFAULT_STRATEGY);
@@ -318,17 +280,7 @@ int ZEXPORT deflateInit2_(z_streamp strm, int level, int method,
   Log(LogLevel::LOG_INFO, "deflateInit2_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", level ", level, ", window_bits ",
       window_bits, " \n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " level=", level, " method=", method,
-      " window_bits=", window_bits, " mem_level=", mem_level,
-      " strategy=", strategy, "\n");
 
-/*#ifdef USE_IGZIP
-  if (configs[USE_IGZIP_COMPRESS] && configs[USE_IGZIP_UNCOMPRESS] &&
-	!configs[USE_ZLIB_COMPRESS]) {
-	method = 0;
-  }
-#endif*/
   deflate_stream_settings.Set(strm, level, method, window_bits, mem_level,
                               strategy);
   return orig_deflateInit2_(strm, level, method, window_bits, mem_level,
@@ -339,15 +291,9 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
                                  uInt dictLength) {
   if (!configs[IGNORE_ZLIB_DICTIONARY]) {
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
-        static_cast<void*>(strm),
-        ", dictLength ", dictLength, "\n");
-
+        static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
     DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
     const int ret = orig_deflateSetDictionary(strm, dictionary, dictLength);
-    Log(LogLevel::LOG_INFO, " strm=",
-        static_cast<void*>(strm), " ret=", ret, " total_in=", strm->total_in,
-        " total_out=", strm->total_out, " adler=", strm->adler,
-        " dict_len=", dictLength, "\n");
     if (ret == Z_OK) {
       SetDeflatePath(deflate_settings, strm, ZLIB,
                      "deflateSetDictionary called");
@@ -365,48 +311,29 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
 
-  const bool is_streaming_flush_with_input =
-      (flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH ||
-       flush == Z_FULL_FLUSH || flush == Z_BLOCK) &&
-      (strm->avail_in > 0);
-  if (deflate_settings->path == UNDEFINED && is_streaming_flush_with_input) {
-    SetDeflatePath(deflate_settings, strm, ZLIB,
-                   "streaming flush with input");
-  }
-
-  const bool is_sync_flush =
-      (flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH || flush == Z_BLOCK);
-
-    const bool igzip_sync_flush_empty_reentry =
-      (deflate_settings->path == IGZIP && is_sync_flush && strm->avail_in == 0);
-    const bool igzip_finish_reentry_without_input =
-      (deflate_settings->path == IGZIP && flush == Z_FINISH &&
-       strm->avail_in == 0);
-    if (igzip_sync_flush_empty_reentry || igzip_finish_reentry_without_input) {
-    const char* reason = igzip_sync_flush_empty_reentry
-                 ? "igzip risky empty sync flush; forcing zlib"
-                 : "igzip risky finish reentry without input; forcing zlib";
-    SetDeflatePath(deflate_settings, strm, ZLIB, reason);
-    Log(LogLevel::LOG_INFO,
-      " strm=", static_cast<void*>(strm), " reason=", reason,
-      " flush=", flush, " avail_in=", strm->avail_in,
-      " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, "\n");
-    }
-
   Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(deflate_settings->path), ", path_name ",
-      ExecutionPathToString(deflate_settings->path), ", window_bits ",
+      static_cast<int>(deflate_settings->path), ", window_bits ",
       deflate_settings->window_bits,
       ", total_in ", strm->total_in, ", total_out ", strm->total_out,
       ", adler ", strm->adler, "\n");
-    Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " flush=", flush, " path=",
-      ExecutionPathToString(deflate_settings->path), " avail_in=", strm->avail_in,
-      " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, "\n");
+
+#ifdef USE_IGZIP
+  if (configs[USE_IGZIP_COMPRESS] &&
+      deflate_settings->path == UNDEFINED &&
+      IGZIPShouldFallbackDeflate(false, flush, strm->avail_in)) {
+    SetDeflatePath(deflate_settings, strm, ZLIB,
+                   "igzip fallback condition");
+  }
+  if (configs[USE_IGZIP_COMPRESS] &&
+      IGZIPShouldFallbackDeflate(deflate_settings->path == IGZIP,
+                                 flush, strm->avail_in)) {
+    SetDeflatePath(deflate_settings, strm, ZLIB,
+                   "igzip fallback condition");
+  }
+#endif
 
   int ret = 1;
   bool iaa_available = false;
@@ -415,6 +342,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   if (!in_call && deflate_settings->path != ZLIB) {
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
+    bool igzip_stream_active = false;
 
 #ifdef USE_IAA
     iaa_available = (flush == Z_FINISH) && configs[USE_IAA_COMPRESS] &&
@@ -427,40 +355,20 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         SupportedOptionsQAT(deflate_settings->window_bits, input_len);
 #endif
 #ifdef USE_IGZIP
-    const bool igzip_finish_only_mode = (flush == Z_FINISH);
-    const bool igzip_finish_buffer_ok =
-        (flush != Z_FINISH || strm->avail_out >= 256);
-    igzip_available = configs[USE_IGZIP_COMPRESS] && igzip_finish_only_mode &&
-                      igzip_finish_buffer_ok;
-  if (configs[USE_IGZIP_COMPRESS] && !igzip_finish_only_mode) {
-      if (deflate_settings->path == UNDEFINED) {
-        SetDeflatePath(deflate_settings, strm, ZLIB,
-                       "igzip unavailable for non-finish flush");
-      }
-    Log(LogLevel::LOG_INFO,
-      " strm=", static_cast<void*>(strm),
-      " reason=flush_not_finish flush=", flush,
-      " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-      " total_in=", strm->total_in, " total_out=", strm->total_out, "\n");
-  }
-  if (configs[USE_IGZIP_COMPRESS] && igzip_finish_only_mode &&
-      !igzip_finish_buffer_ok) {
-      if (deflate_settings->path == UNDEFINED) {
-        SetDeflatePath(deflate_settings, strm, ZLIB,
-                       "igzip unavailable for tiny finish buffer");
-      }
-    Log(LogLevel::LOG_INFO,
-      " strm=", static_cast<void*>(strm),
-      " reason=finish_buffer_too_small flush=", flush,
-      " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-      " total_in=", strm->total_in, " total_out=", strm->total_out, "\n");
-  }
+  igzip_stream_active =
+    (deflate_settings->path == IGZIP &&
+     deflate_settings->isal_strm != nullptr);
+    igzip_available =
+        configs[USE_IGZIP_COMPRESS] &&
+    SupportedOptionsIGZIPCompress(flush, output_len, igzip_stream_active);
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
     // one or the other
     ExecutionPath path_selected = ZLIB;
-    if (iaa_available && qat_available) {
+    if (igzip_stream_active) {
+      path_selected = IGZIP;
+    } else if (iaa_available && qat_available) {
       if (static_cast<uint32_t>(std::rand() % 100) <
           configs[IAA_COMPRESS_PERCENTAGE]) {
         path_selected = IAA;
@@ -503,18 +411,9 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #endif  // USE_QAT
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
-      const uInt pre_avail_in = strm->avail_in;
-      const uInt pre_avail_out = strm->avail_out;
-      const uLong pre_total_in = strm->total_in;
-      const uLong pre_total_out = strm->total_out;
-
       if (deflate_settings->isal_strm == nullptr) {
 	      deflate_settings->method = 0;
-	      deflate_settings->isal_strm = InitCompressIGZIP(deflate_settings->level, deflate_settings->window_bits); //hardcoded window bits
-      }
-      if (deflate_settings->isal_strm == nullptr) {
-  	Log(LogLevel::LOG_ERROR, "deflate Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", failed to initialize igzip \n");
+	      deflate_settings->isal_strm = InitCompressIGZIP(deflate_settings->level, deflate_settings->window_bits); 
       }
       in_call = true;
       ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in, &input_len, 
@@ -523,37 +422,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
              "selected IGZIP accelerator");
       in_call = false;
 
-      uint32_t output_crc32 = 0;
-      uint32_t out_head_b0 = 256;
-      uint32_t out_head_b1 = 256;
-      uint32_t out_tail_b0 = 256;
-      uint32_t out_tail_b1 = 256;
-      if (output_len > 0) {
-        output_crc32 =
-            static_cast<uint32_t>(crc32(0L, strm->next_out, output_len));
-        out_head_b0 = static_cast<uint32_t>(strm->next_out[0]);
-        if (output_len > 1) {
-          out_head_b1 = static_cast<uint32_t>(strm->next_out[1]);
-        }
-        out_tail_b0 = static_cast<uint32_t>(strm->next_out[output_len - 1]);
-        if (output_len > 1) {
-          out_tail_b1 = static_cast<uint32_t>(strm->next_out[output_len - 2]);
-        }
-      }
-
-      Log(LogLevel::LOG_INFO,
-          " strm=", static_cast<void*>(strm), " flush=", flush,
-          " pre_avail_in=", pre_avail_in, " pre_avail_out=", pre_avail_out,
-          " pre_total_in=", pre_total_in, " pre_total_out=", pre_total_out,
-          " bytes_in=", input_len, " bytes_out=", output_len,
-          " ret_raw=", ret,
-          " isal_state=",
-          (deflate_settings->isal_strm != nullptr)
-              ? static_cast<int>(deflate_settings->isal_strm->internal_state.state)
-              : -1,
-          " output_crc32=", output_crc32, " out_head_b0=", out_head_b0,
-          " out_head_b1=", out_head_b1, " out_tail_b0=", out_tail_b0,
-          " out_tail_b1=", out_tail_b1, "\n");
       //INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
       //INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
 #endif
@@ -573,32 +441,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         finish_done = (flush == Z_FINISH) &&
                 IsIGZIPDeflateFinished(deflate_settings->isal_strm);
       #endif
-
-        if (flush == Z_FINISH && strm->avail_in == 0 && !finish_done) {
-          const bool need_more_output_room = (strm->avail_out == 0);
-          int isal_state_snapshot = -1;
-#ifdef USE_IGZIP
-          if (deflate_settings->isal_strm != nullptr) {
-            isal_state_snapshot = static_cast<int>(
-                deflate_settings->isal_strm->internal_state.state);
-          }
-#endif
-          if (need_more_output_room) {
-            Log(LogLevel::LOG_INFO, " strm=", static_cast<void*>(strm),
-                " finish_done=0 avail_in=", strm->avail_in,
-                " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-                " total_out=", strm->total_out,
-                " isal_state=", isal_state_snapshot, "\n");
-          } else if (output_len == 0) {
-            Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
-                " finish_done=0 avail_in=", strm->avail_in,
-                " avail_out=", strm->avail_out,
-                " output_len=", output_len,
-                " total_in=", strm->total_in,
-                " total_out=", strm->total_out,
-                    " isal_state=", isal_state_snapshot, "\n");
-          }
-        }
 
         if (finish_done) {
           ret = Z_STREAM_END;
@@ -620,14 +462,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
           ", bytes_in ", input_len, ", bytes_out ", output_len,
           ", avail_in ", strm->avail_in, ", avail_out ", strm->avail_out,
           ", path ", static_cast<int>(deflate_settings->path), ", path_name ",
-          ExecutionPathToString(deflate_settings->path), "\n");
-      Log(LogLevel::LOG_INFO, " strm=",
-          static_cast<void*>(strm), " ret=", ret, " engine=accelerator",
-          " path=", ExecutionPathToString(deflate_settings->path),
-          " bytes_in=", input_len, " bytes_out=", output_len,
-          " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-          " total_in=", strm->total_in, " total_out=", strm->total_out,
-          " adler=", strm->adler, "\n");
+          static_cast<int>(deflate_settings->path), "\n");
       return ret;
     }
   }
@@ -648,13 +483,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", zlib return code ", ret, ", avail_in ",
       strm->avail_in, ", avail_out ", strm->avail_out, ", path ",
       static_cast<int>(deflate_settings->path), ", path_name ",
-      ExecutionPathToString(deflate_settings->path), "\n");
-    Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " ret=", ret, " engine=zlib",
-      " path=", ExecutionPathToString(deflate_settings->path),
-      " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-      " total_in=", strm->total_in, " total_out=", strm->total_out,
-      " adler=", strm->adler, "\n");
+      static_cast<int>(deflate_settings->path), "\n");
 
   INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
   return ret;
@@ -670,20 +499,12 @@ int ZEXPORT deflateEnd(z_streamp strm) {
 #endif
     }
   deflate_stream_settings.Unset(strm);
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " total_in=", (strm ? strm->total_in : 0),
-      " total_out=", (strm ? strm->total_out : 0), " adler=",
-      (strm ? strm->adler : 0), "\n");
   return orig_deflateEnd(strm);
 }
 
 int ZEXPORT deflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " total_in=", (strm ? strm->total_in : 0),
-      " total_out=", (strm ? strm->total_out : 0), " adler=",
-      (strm ? strm->adler : 0), "\n");
   DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
   int ret = orig_deflateReset(strm);
   if (deflate_settings != nullptr) {
@@ -705,9 +526,6 @@ int ZEXPORT inflateInit_(z_streamp strm, const char* version, int stream_size) {
   inflate_stream_settings.Set(strm, 15);
   Log(LogLevel::LOG_INFO, "inflateInit_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), "\n");
-
   return orig_inflateInit_(strm, version, stream_size);
 }
 
@@ -716,9 +534,6 @@ int ZEXPORT inflateInit2_(z_streamp strm, int window_bits, const char* version,
   inflate_stream_settings.Set(strm, window_bits);
   Log(LogLevel::LOG_INFO, "inflateInit2_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", window_bits ", window_bits, "\n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " window_bits=", window_bits, "\n");
-
   return orig_inflateInit2_(strm, window_bits, version, stream_size);
 }
 
@@ -734,10 +549,6 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
       SetInflatePath(inflate_settings, strm, ZLIB,
                      "inflateSetDictionary called");
     }
-    Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " ret=", ret, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, " adler=", strm->adler,
-      " dict_len=", dictLength, "\n");
     return ret;
   }
   Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__,
@@ -756,15 +567,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(inflate_settings->path), ", path_name ",
-      ExecutionPathToString(inflate_settings->path), ", window_bits ",
+      static_cast<int>(inflate_settings->path), ", window_bits ",
       inflate_settings->window_bits,
       ", total_in ", strm->total_in, ", total_out ", strm->total_out,
       ", adler ", strm->adler, "\n");
-    Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " flush=", flush, " path=",
-      ExecutionPathToString(inflate_settings->path), " avail_in=", strm->avail_in,
-      " avail_out=", strm->avail_out, " total_in=", strm->total_in,
-      " total_out=", strm->total_out, "\n");
+
   PrintDeflateBlockHeader(LogLevel::LOG_INFO, strm->next_in, strm->avail_in,
                           inflate_settings->window_bits);
 
@@ -774,56 +581,38 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   bool qat_available = false;
   bool igzip_available = false;
 
-  if (inflate_settings->force_zlib_for_raw_boundary &&
-      inflate_settings->path != ZLIB) {
-    SetInflatePath(inflate_settings, strm, ZLIB,
-                   "raw boundary guard pinned stream to zlib");
-  }
-
   const bool igzip_stream_active =
       (inflate_settings->path == IGZIP && inflate_settings->isal_strm != nullptr);
+
+#ifdef USE_IGZIP
+  const bool igzip_supported_options =
+      !in_call && configs[USE_IGZIP_UNCOMPRESS] &&
+      SupportedOptionsIGZIPUncompress(inflate_settings->window_bits,
+                                      strm->avail_in, strm->avail_out,
+                                      igzip_stream_active);
 
   // Keep stateful IGZIP stream handling on the same engine.
   // For avail_in==0, let IGZIP process any buffered bits in its internal
   // state before reporting Z_BUF_ERROR.
-#ifdef USE_IGZIP
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
-    uint32_t input_len = 0;
-    uint32_t output_len = strm->avail_out;
+    if (!igzip_supported_options) {
+      SetInflatePath(inflate_settings, strm, ZLIB,
+                     "IGZIP unsupported options for no-input stream");
+    } else {
+      in_call = true;
+      IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
+          strm, inflate_settings->isal_strm, inflate_settings->window_bits,
+          &inflate_settings->trailer_overconsumption_fixed, &ret);
+      in_call = false;
 
-    in_call = true;
-    ret = UncompressIGZIP(inflate_settings->isal_strm, strm->next_in, &input_len,
-                strm->next_out, &output_len,
-                inflate_settings->window_bits,
-                          &inflate_settings->trailer_overconsumption_fixed,
-                          &inflate_settings->deferred_trailer_correction_bytes,
-                          &strm->total_in, &strm->total_out, &end_of_stream);
-    in_call = false;
-
-    if (ret == 0) {
-      strm->next_out += output_len;
-      strm->avail_out -= output_len;
-      strm->total_out += output_len;
-
-      if (output_len > 0) {
-        ret = end_of_stream ? Z_STREAM_END : Z_OK;
-      } else {
-        ret = Z_BUF_ERROR;
+      if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
+      SetInflatePath(inflate_settings, strm, ZLIB,
+                     "igzip raw input_done ambiguity fallback");
+      // Continue through normal zlib fallback path.
+      } else if (action == IGZIP_NO_INPUT_RETURN) {
+        return ret;
       }
-
-      Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
-          static_cast<void*>(strm),
-          ", active IGZIP stream with avail_in==0, return code ", ret,
-          ", avail_in ", strm->avail_in, ", avail_out ", strm->avail_out,
-          ", bytes_in 0, bytes_out ", output_len, ", end_of_stream ",
-          end_of_stream, ", window_bits ", inflate_settings->window_bits, "\n");
-      return ret;
     }
-
-    Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
-        static_cast<void*>(strm),
-        ", active IGZIP stream with avail_in==0 and no buffered progress, returning Z_BUF_ERROR\n");
-    return Z_BUF_ERROR;
   }
 #endif
 
@@ -833,11 +622,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   if (!in_call && inflate_settings->path == UNDEFINED &&
       inflate_settings->window_bits >= 8 && inflate_settings->window_bits <= 15 &&
       strm->avail_in >= 2 && (strm->next_in[1] & ZLIB_FDICT_MASK)) {
-    Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
-        static_cast<void*>(strm),
-        ", FDICT bit set in zlib header, cmf ",
-        static_cast<int>(strm->next_in[0]), ", flg ",
-        static_cast<int>(strm->next_in[1]), "\n");
     SetInflatePath(inflate_settings, strm, ZLIB,
                    "FDICT bit detected in zlib header");
   }
@@ -861,10 +645,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         SupportedOptionsQAT(inflate_settings->window_bits, input_len);
 #endif
 #ifdef USE_IGZIP
-    igzip_available = configs[USE_IGZIP_UNCOMPRESS]; //&&
-	  //  inflate_settings->window_bits == 15;
-  Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", igzip_available? ", igzip_available, "\n");
+    igzip_available = igzip_supported_options;
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
@@ -917,53 +698,36 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 #endif  // USE_QAT
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
-      if (inflate_settings->isal_strm == nullptr) {
-  Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", about to initalize igzip\n");
-    	      inflate_settings->isal_strm = InitUncompressIGZIP(inflate_settings->window_bits); //hardcoded window bits
-      }
-      if (inflate_settings->isal_strm == nullptr) {
-  	Log(LogLevel::LOG_ERROR, "inflate Line ", __LINE__, ", strm ",
-      static_cast<void*>(strm), ", failed to initalize igzip\n ");
-	      return Z_DATA_ERROR;
-      }
       in_call = true;
-      ret =
-          UncompressIGZIP(inflate_settings->isal_strm, strm->next_in, &input_len, strm->next_out,
-        &output_len, inflate_settings->window_bits,
-        &inflate_settings->trailer_overconsumption_fixed,
-        &inflate_settings->deferred_trailer_correction_bytes,
-    			  &strm->total_in, &strm->total_out, &end_of_stream
-                        /*inflate_settings->window_bits, &end_of_stream*/);
+      const IGZIPInflatePathAction path_action =
+          IGZIPRunInflateAndSelectPathAction(
+              strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
+              &inflate_settings->trailer_overconsumption_fixed, &input_len,
+              &output_len, &ret, &end_of_stream, pre_avail_in);
+      in_call = false;
 
-        const uInt remaining_after_igzip =
-          (pre_avail_in >= input_len) ? (pre_avail_in - input_len) : 0;
-        if (ret == 0 && inflate_settings->window_bits < 0 && end_of_stream &&
-          remaining_after_igzip > 0 && strm->total_in == 0 &&
-          strm->total_out == 0) {
-        inflate_settings->force_zlib_for_raw_boundary = true;
-        Log(LogLevel::LOG_ERROR,
-          " strm=", static_cast<void*>(strm), " bytes_in=", input_len,
-          " bytes_out=", output_len, " pre_avail_in=", pre_avail_in,
-          " remaining_in=", remaining_after_igzip, "\n");
-        ret = 1;
-        end_of_stream = false;
-        SetInflatePath(inflate_settings, strm, ZLIB,
-                 "raw boundary guard fallback");
-        }
+      if (inflate_settings->isal_strm == nullptr) {
+        return Z_DATA_ERROR;
+      }
 
-      if (ret == Z_NEED_DICT) {
+      if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
         Log(LogLevel::LOG_ERROR,
             " strm=", static_cast<void*>(strm), " source=igzip",
             " total_in=", strm->total_in, " total_out=", strm->total_out,
             " adler=", strm->adler, "\n");
         SetInflatePath(inflate_settings, strm, ZLIB,
                        "IGZIP returned Z_NEED_DICT");
-      } else if (inflate_settings->path != ZLIB) {
+      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "IGZIP requested raw trailer fallback");
+      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "raw boundary guard fallback");
+      } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
+                 inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, strm, IGZIP,
                        "selected IGZIP accelerator");
       }
-      in_call = false;
       //INCREMENT_STAT(INFLATE_IGZIP_COUNT);
       //INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
 #endif
@@ -992,15 +756,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
           ", avail_in ", strm->avail_in, ", avail_out ", strm->avail_out,
           ", end_of_stream ", end_of_stream, ", path ",
           static_cast<int>(inflate_settings->path), ", path_name ",
-          ExecutionPathToString(inflate_settings->path), ", window_bits ",
+          static_cast<int>(inflate_settings->path), ", window_bits ",
           inflate_settings->window_bits, "\n");
-      Log(LogLevel::LOG_INFO, " strm=",
-          static_cast<void*>(strm), " ret=", ret, " engine=accelerator",
-          " path=", ExecutionPathToString(inflate_settings->path),
-          " bytes_in=", input_len, " bytes_out=", output_len,
-          " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-          " total_in=", strm->total_in, " total_out=", strm->total_out,
-          " adler=", strm->adler, "\n");
       return ret;
     }
   }
@@ -1027,14 +784,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", zlib return code ", ret, ", avail_in ",
       strm->avail_in, ", avail_out ", strm->avail_out, ", path ",
       static_cast<int>(inflate_settings->path), ", path_name ",
-      ExecutionPathToString(inflate_settings->path), ", window_bits ",
+      static_cast<int>(inflate_settings->path), ", window_bits ",
       inflate_settings->window_bits, "\n");
-    Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " ret=", ret, " engine=zlib",
-      " path=", ExecutionPathToString(inflate_settings->path),
-      " avail_in=", strm->avail_in, " avail_out=", strm->avail_out,
-      " total_in=", strm->total_in, " total_out=", strm->total_out,
-      " adler=", strm->adler, "\n");
 
   INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
   return ret;
@@ -1050,40 +801,26 @@ int ZEXPORT inflateEnd(z_streamp strm) {
 #endif
     }
   inflate_stream_settings.Unset(strm);
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " total_in=", (strm ? strm->total_in : 0),
-      " total_out=", (strm ? strm->total_out : 0), " adler=",
-      (strm ? strm->adler : 0), "\n");
   return orig_inflateEnd(strm);
 }
 
 int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  Log(LogLevel::LOG_INFO, " strm=",
-      static_cast<void*>(strm), " total_in=", (strm ? strm->total_in : 0),
-      " total_out=", (strm ? strm->total_out : 0), " adler=",
-      (strm ? strm->adler : 0), "\n");
   InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
   const bool was_igzip_path =
       (inflate_settings != nullptr && inflate_settings->path == IGZIP);
   int ret = orig_inflateReset(strm);
   if (inflate_settings != nullptr) {
-    inflate_settings->force_zlib_for_raw_boundary = false;
     SetInflatePath(inflate_settings, strm, UNDEFINED, "inflateReset");
   }
     if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
 	ResetUncompressIGZIP(inflate_settings->isal_strm, 
-			&inflate_settings->trailer_overconsumption_fixed,
-                        &inflate_settings->deferred_trailer_correction_bytes);
+                        &inflate_settings->trailer_overconsumption_fixed);
 #endif
     if (was_igzip_path) {
       inflate_settings->trailer_overconsumption_fixed = 1;
-      inflate_settings->deferred_trailer_correction_bytes = 0;
-      Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
-          static_cast<void*>(strm),
-          ", rewinds disabled after IGZIP reset\n");
     }
     }
 
@@ -1112,7 +849,9 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS];
+  igzip_available =
+      configs[USE_IGZIP_COMPRESS] &&
+  SupportedOptionsIGZIPCompress(Z_FINISH, output_len, false);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1211,7 +950,9 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
+  igzip_available =
+      configs[USE_IGZIP_UNCOMPRESS] &&
+  SupportedOptionsIGZIPUncompress(15, input_len, output_len, false);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1249,7 +990,6 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source),
                             &input_len, dest, &output_len, 15, &tofixed,
-                            nullptr,
                             &total_in, &total_out, &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
@@ -1509,7 +1249,9 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS];
+  igzip_available =
+      configs[USE_IGZIP_COMPRESS] &&
+  SupportedOptionsIGZIPCompress(Z_FINISH, *output_length, false);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1582,7 +1324,10 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
+  igzip_available =
+      configs[USE_IGZIP_UNCOMPRESS] &&
+  SupportedOptionsIGZIPUncompress(31, *input_length, *output_length,
+              false);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1621,7 +1366,7 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, input, input_length, output,
-                            output_length, 31, &tofixed, nullptr,
+                              output_length, 31, &tofixed,
                             &total_in, &total_out,
                             end_of_stream);
       EndUncompressIGZIP(isal_strm);
@@ -1676,10 +1421,10 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
     gz->deflate_stream.avail_out = static_cast<unsigned int>(gz->io_buf_size);
     ret = orig_deflate(&gz->deflate_stream, Z_FINISH);
     Log(LogLevel::LOG_INFO, "CompressAndWrite Line ", __LINE__, ", file ",
-        static_cast<void*>(file), ", zlib return code ", ret, ", input ",
-        input_len, ", output ", output_len, ", avail_in ",
-        gz->deflate_stream.avail_in, ", avail_out ",
-        gz->deflate_stream.avail_out, "\n");
+      static_cast<void*>(file), ", zlib return code ", ret, ", input ",
+      input_len, ", output ", output_len, ", avail_in ",
+      gz->deflate_stream.avail_in, ", avail_out ",
+      gz->deflate_stream.avail_out, "\n");
     if (ret == Z_STREAM_END) {
       gz->data_buf_pos = gz->data_buf_content - gz->deflate_stream.avail_in;
       output_len = gz->io_buf_size - gz->deflate_stream.avail_out;
@@ -1840,8 +1585,8 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
             ret = GzreadAcceleratorUncompress(gz, input, &input_len, output,
                                               &output_len, &end_of_stream);
             Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
-                static_cast<void*>(file), ", accelerator return code ", ret,
-                ", input ", input_len, ", output ", output_len, "\n");
+              static_cast<void*>(file), ", accelerator return code ", ret,
+              ", input ", input_len, ", output ", output_len, "\n");
 
             // If we didn't reach end-of-stream, it means io_buf is not large
             // enough to hold the entire stream
@@ -1865,10 +1610,10 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
                 static_cast<unsigned int>(gz->data_buf_size);
             ret = orig_inflate(&gz->inflate_stream, Z_SYNC_FLUSH);
             Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
-                static_cast<void*>(file), ", zlib return code ", ret,
-                ", input ", input_len, ", output ", output_len, ", avail_in ",
-                gz->inflate_stream.avail_in, ", avail_out ",
-                gz->inflate_stream.avail_out, "\n");
+              static_cast<void*>(file), ", zlib return code ", ret,
+              ", input ", input_len, ", output ", output_len, ", avail_in ",
+              gz->inflate_stream.avail_in, ", avail_out ",
+              gz->inflate_stream.avail_out, "\n");
             if (ret == Z_STREAM_END || ret == Z_OK) {
               gz->io_buf_pos +=
                   (gz->io_buf_content - gz->inflate_stream.avail_in);
@@ -1957,7 +1702,6 @@ int ZEXPORT gzclose(gzFile file) {
   } else {
     ret = orig_gzclose(file);
   }
-
   Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", return code ", ret, ", buffered processed ",
       gz->data_buf_pos, "\n");
