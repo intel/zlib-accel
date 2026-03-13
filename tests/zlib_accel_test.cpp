@@ -6,10 +6,10 @@
 #include <gtest/gtest.h>
 #include <stdio.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -195,8 +195,8 @@ int ZlibCompressWithLevel(const char* input, size_t input_length,
   z_stream stream;
   memset(&stream, 0, sizeof(z_stream));
 
-  int st =
-      deflateInit2(&stream, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
+  int st = deflateInit2(&stream, level, Z_DEFLATED, window_bits, 8,
+                        Z_DEFAULT_STRATEGY);
   if (st != Z_OK) {
     deflateEnd(&stream);
     return st;
@@ -653,11 +653,10 @@ TEST_P(ZlibTest, CompressDecompress) {
   // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
   // ISA-L level 3 (stricter match selection), which makes long-history
   // limitations consistently observable.
-  const int compression_level =
-      (test_param.execution_path_compress == IGZIP &&
-       test_param.execution_path_uncompress == IAA)
-          ? 9
-          : -1;
+  const int compression_level = (test_param.execution_path_compress == IGZIP &&
+                                 test_param.execution_path_uncompress == IAA)
+                                    ? 9
+                                    : -1;
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -667,7 +666,7 @@ TEST_P(ZlibTest, CompressDecompress) {
   std::string compressed;
   size_t output_upper_bound;
   ExecutionPath execution_path = UNDEFINED;
-    int ret = ZlibCompressWithLevel(
+  int ret = ZlibCompressWithLevel(
       input, input_length, &compressed, compression_level,
       test_param.window_bits_compress, test_param.flush_compress,
       &output_upper_bound, &execution_path);
@@ -1057,11 +1056,10 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
   // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
   // ISA-L level 3 (stricter match selection), which makes long-history
   // limitations consistently observable.
-  const int compression_level =
-      (test_param.execution_path_compress == IGZIP &&
-       test_param.execution_path_uncompress == IAA)
-          ? 9
-          : -1;
+  const int compression_level = (test_param.execution_path_compress == IGZIP &&
+                                 test_param.execution_path_uncompress == IAA)
+                                    ? 9
+                                    : -1;
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -1071,7 +1069,7 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressPartialStream) {
   std::string compressed;
   size_t output_upper_bound;
   ExecutionPath execution_path = UNDEFINED;
-    int ret = ZlibCompressWithLevel(
+  int ret = ZlibCompressWithLevel(
       input, input_length, &compressed, compression_level,
       test_param.window_bits_compress, test_param.flush_compress,
       &output_upper_bound, &execution_path);
@@ -1134,11 +1132,10 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   // For IGZIP->IAA compatibility checks, force max zlib level so IGZIP uses
   // ISA-L level 3 (stricter match selection), which makes long-history
   // limitations consistently observable.
-  const int compression_level =
-      (test_param.execution_path_compress == IGZIP &&
-       test_param.execution_path_uncompress == IAA)
-          ? 9
-          : -1;
+  const int compression_level = (test_param.execution_path_compress == IGZIP &&
+                                 test_param.execution_path_uncompress == IAA)
+                                    ? 9
+                                    : -1;
 
   size_t input_length = test_param.block_size;
   BlockCompressibilityType block_type = test_param.block_type;
@@ -1150,7 +1147,7 @@ TEST_P(ZlibPartialAndMultiStreamTest, CompressDecompressMultiStream) {
   size_t input_length1 = input_length / 2;
   size_t output_upper_bound1;
   ExecutionPath execution_path = UNDEFINED;
-    int ret = ZlibCompressWithLevel(
+  int ret = ZlibCompressWithLevel(
       input, input_length1, &compressed1, compression_level,
       test_param.window_bits_compress, test_param.flush_compress,
       &output_upper_bound1, &execution_path);
@@ -1396,10 +1393,10 @@ TEST(IGZIPInflateRegressionTest,
   SetCompressPath(ZLIB, false, false, false);
   SetUncompressPath(IGZIP, false, false);
 
-  std::vector<size_t> input_sizes = {
-      1,   2,   3,    7,    8,    15,   16,   31,   32,   63,   64,
-      127, 128, 255,  256,  511,  512,  1023, 1024, 2047, 2048, 4095,
-      4096, 8191, 8192, 16384, 32768};
+  std::vector<size_t> input_sizes = {1,    2,    3,    7,    8,     15,   16,
+                                     31,   32,   63,   64,   127,   128,  255,
+                                     256,  511,  512,  1023, 1024,  2047, 2048,
+                                     4095, 4096, 8191, 8192, 16384, 32768};
 
   for (size_t input_length : input_sizes) {
     std::vector<char> input(input_length);
@@ -1444,7 +1441,7 @@ TEST(IGZIPInflateRegressionTest,
     stream.avail_in = 0;
     int empty_ret = inflate(&stream, Z_SYNC_FLUSH);
     EXPECT_TRUE(empty_ret == Z_BUF_ERROR || empty_ret == Z_OK ||
-          empty_ret == Z_STREAM_END);
+                empty_ret == Z_STREAM_END);
     EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
 
     uint8_t trailing_byte = 0;
@@ -1473,8 +1470,9 @@ TEST(IGZIPInflateRegressionTest,
   std::string compressed;
   size_t output_upper_bound;
   ExecutionPath execution_path = UNDEFINED;
-  int ret = ZlibCompress(empty_payload.data(), empty_payload.size(), &compressed,
-                         -15, Z_FINISH, &output_upper_bound, &execution_path);
+  int ret =
+      ZlibCompress(empty_payload.data(), empty_payload.size(), &compressed, -15,
+                   Z_FINISH, &output_upper_bound, &execution_path);
   ASSERT_EQ(ret, Z_STREAM_END);
   ASSERT_EQ(execution_path, ZLIB);
   ASSERT_GT(compressed.size(), 0u);
@@ -1507,8 +1505,7 @@ TEST(IGZIPInflateRegressionTest,
   inflateEnd(&stream);
 }
 
-TEST(IGZIPInflateRegressionTest,
-     RawStreamEndMustPreserveEightTrailingBytes) {
+TEST(IGZIPInflateRegressionTest, RawStreamEndMustPreserveEightTrailingBytes) {
   SetCompressPath(ZLIB, false, false, false);
   SetUncompressPath(IGZIP, false, false);
 
@@ -1558,8 +1555,7 @@ TEST(IGZIPInflateRegressionTest,
   DestroyBlock(input);
 }
 
-TEST(IGZIPInflateRegressionTest,
-     RawSplitInputDefersCorrectionUntilStreamEnd) {
+TEST(IGZIPInflateRegressionTest, RawSplitInputDefersCorrectionUntilStreamEnd) {
   SetCompressPath(ZLIB, false, false, false);
   SetUncompressPath(IGZIP, false, false);
 
@@ -1783,8 +1779,7 @@ TEST(IGZIPDeflateRegressionTest,
   deflateEnd(&stream);
 }
 
-TEST(IGZIPDeflateRegressionTest,
-  DictionaryStreamMustStayOnZlibAcrossReset) {
+TEST(IGZIPDeflateRegressionTest, DictionaryStreamMustStayOnZlibAcrossReset) {
   SetCompressPath(IGZIP, false, false, false);
   SetUncompressPath(ZLIB, false, false);
   SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
@@ -1796,9 +1791,8 @@ TEST(IGZIPDeflateRegressionTest,
             Z_OK);
 
   const char dict[] = "0123456789abcdef";
-  ASSERT_EQ(deflateSetDictionary(
-                &stream, reinterpret_cast<const Bytef*>(dict),
-                static_cast<uInt>(sizeof(dict) - 1)),
+  ASSERT_EQ(deflateSetDictionary(&stream, reinterpret_cast<const Bytef*>(dict),
+                                 static_cast<uInt>(sizeof(dict) - 1)),
             Z_OK);
   EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
 
@@ -1823,9 +1817,8 @@ TEST(IGZIPDeflateRegressionTest,
   ASSERT_EQ(deflateReset(&stream), Z_OK);
 
   // Re-set dictionary after reset (standard zlib API usage).
-  ASSERT_EQ(deflateSetDictionary(
-                &stream, reinterpret_cast<const Bytef*>(dict),
-                static_cast<uInt>(sizeof(dict) - 1)),
+  ASSERT_EQ(deflateSetDictionary(&stream, reinterpret_cast<const Bytef*>(dict),
+                                 static_cast<uInt>(sizeof(dict) - 1)),
             Z_OK);
   EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
 
@@ -1860,8 +1853,7 @@ TEST(IGZIPDeflateRegressionTest,
   ret = inflate(&verify, Z_NO_FLUSH);
   EXPECT_EQ(ret, Z_NEED_DICT);
 
-  ASSERT_EQ(inflateSetDictionary(&verify,
-                                 reinterpret_cast<const Bytef*>(dict),
+  ASSERT_EQ(inflateSetDictionary(&verify, reinterpret_cast<const Bytef*>(dict),
                                  static_cast<uInt>(sizeof(dict) - 1)),
             Z_OK);
   ret = inflate(&verify, Z_FINISH);
@@ -2046,15 +2038,13 @@ TEST(IGZIPDeflateRegressionTest,
                          Z_DEFAULT_STRATEGY),
             Z_OK);
   ASSERT_EQ(deflateSetDictionary(
-                &cstream,
-                reinterpret_cast<const Bytef*>(dictionary.data()),
+                &cstream, reinterpret_cast<const Bytef*>(dictionary.data()),
                 static_cast<uInt>(dictionary.size())),
             Z_OK);
   ASSERT_EQ(GetDeflateExecutionPath(&cstream), ZLIB);
 
   std::vector<unsigned char> compressed(compressBound(input.size()));
-  cstream.next_in = reinterpret_cast<Bytef*>(
-      const_cast<char*>(input.data()));
+  cstream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
   cstream.avail_in = static_cast<unsigned int>(input.size());
   cstream.next_out = compressed.data();
   cstream.avail_out = static_cast<unsigned int>(compressed.size());
@@ -2083,8 +2073,7 @@ TEST(IGZIPDeflateRegressionTest,
   ret = inflate(&dstream, Z_NO_FLUSH);
   if (ret == Z_NEED_DICT) {
     ASSERT_EQ(inflateSetDictionary(
-                  &dstream,
-                  reinterpret_cast<const Bytef*>(dictionary.data()),
+                  &dstream, reinterpret_cast<const Bytef*>(dictionary.data()),
                   static_cast<uInt>(dictionary.size())),
               Z_OK);
     ret = inflate(&dstream, Z_FINISH);
@@ -2120,8 +2109,7 @@ TEST(IGZIPDeflateRegressionTest,
                          Z_DEFAULT_STRATEGY),
             Z_OK);
 
-  cstream.next_in =
-      reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+  cstream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
   cstream.avail_in = static_cast<unsigned int>(input.size());
 
   std::vector<unsigned char> compressed;
@@ -2200,8 +2188,7 @@ TEST(IGZIPDeflateRegressionTest,
   std::vector<unsigned char> compressed;
   compressed.reserve(input.size());
 
-  cstream.next_in =
-      reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+  cstream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
   cstream.avail_in = static_cast<unsigned int>(input.size());
 
   unsigned char sync_chunk[256];
@@ -2263,7 +2250,7 @@ TEST(IGZIPDeflateRegressionTest,
 }
 
 TEST(IGZIPInflateRegressionTest,
-  NeedDictFromIGZIPMustFallbackToZlibOnFirstInflateCall) {
+     NeedDictFromIGZIPMustFallbackToZlibOnFirstInflateCall) {
   SetCompressPath(ZLIB, false, false, false);
   SetUncompressPath(IGZIP, false, false);
   SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
@@ -2283,15 +2270,13 @@ TEST(IGZIPInflateRegressionTest,
                          Z_DEFAULT_STRATEGY),
             Z_OK);
   ASSERT_EQ(deflateSetDictionary(
-                &cstream,
-                reinterpret_cast<const Bytef*>(dictionary.data()),
+                &cstream, reinterpret_cast<const Bytef*>(dictionary.data()),
                 static_cast<uInt>(dictionary.size())),
             Z_OK);
   ASSERT_EQ(GetDeflateExecutionPath(&cstream), ZLIB);
 
   std::vector<unsigned char> compressed(compressBound(input.size()));
-  cstream.next_in =
-      reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+  cstream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
   cstream.avail_in = static_cast<unsigned int>(input.size());
   cstream.next_out = compressed.data();
   cstream.avail_out = static_cast<unsigned int>(compressed.size());
@@ -2322,8 +2307,7 @@ TEST(IGZIPInflateRegressionTest,
   ASSERT_EQ(ret, Z_NEED_DICT);
 
   ASSERT_EQ(inflateSetDictionary(
-                &dstream,
-                reinterpret_cast<const Bytef*>(dictionary.data()),
+                &dstream, reinterpret_cast<const Bytef*>(dictionary.data()),
                 static_cast<uInt>(dictionary.size())),
             Z_OK);
   ret = inflate(&dstream, Z_FINISH);
@@ -2510,8 +2494,8 @@ static void RunMidstreamSetDictionaryRegression(ExecutionPath accel_path) {
               observed_before_dict == ZLIB);
 
   const unsigned char dict[] = "midstream-dictionary";
-  const int dict_ret = deflateSetDictionary(
-      &cstream, dict, static_cast<uInt>(sizeof(dict) - 1));
+  const int dict_ret =
+      deflateSetDictionary(&cstream, dict, static_cast<uInt>(sizeof(dict) - 1));
 
   // zlib semantics require dictionary to be set before any deflate output.
   // Accepting this call midstream can desynchronize accelerator and zlib state.
