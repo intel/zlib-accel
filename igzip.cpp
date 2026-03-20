@@ -435,11 +435,11 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
   const uint32_t remaining_after_igzip =
       (pre_avail_in >= *input_length) ? (pre_avail_in - *input_length) : 0;
 
-  if (*ret == 0 && window_bits < 0 && *end_of_stream &&
-      remaining_after_igzip > 0 && strm->total_in == 0 &&
-      strm->total_out == 0) {
+    if (*ret == 0 && window_bits < 0 && *end_of_stream &&
+      remaining_after_igzip > 0 && *tofixed == 0 &&
+      strm->total_in == 0 && strm->total_out == 0) {
     Log(LogLevel::LOG_ERROR,
-        "IGZIPRunInflateAndSelectPathAction() raw boundary guard strm=",
+        "IGZIPRunInflateAndSelectPathAction() raw boundary guard FIRED strm=",
         static_cast<void *>(strm), " bytes_in=", *input_length,
         " bytes_out=", *output_length, " pre_avail_in=", pre_avail_in,
         " remaining_in=", remaining_after_igzip, "\n");
@@ -497,31 +497,41 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
 
   uint32_t rewind_adjust_bytes = 0;
 
-  // WORKAROUND: ISA-L over-consumption fix for raw deflate mode.
-  // Option 2 behavior: if ambiguity appears at INPUT_DONE, request caller
-  // fallback to zlib instead of carrying deferred state.
-  if (window_bits < 0 && decomp == ISAL_DECOMP_OK && *tofixed == 0 &&
-      (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH ||
-       isal_strm_inflate->block_state == ISAL_BLOCK_INPUT_DONE) &&
-      isal_strm_inflate->avail_in < 8 && isal_strm_inflate->avail_in > 0) {
-    const uint32_t expected_trailer_bytes = 8;
-    const uint32_t over_consumed =
-        expected_trailer_bytes - isal_strm_inflate->avail_in;
-    if (over_consumed >= 1 && over_consumed <= 7) {
-      if (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH) {
-        rewind_adjust_bytes = consumed_before_adjust < over_consumed
-                                  ? consumed_before_adjust
-                                  : over_consumed;
-        if (rewind_adjust_bytes > 0) {
-          *tofixed = 1;
-        }
-      } else {
-        Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
-            " raw INPUT_DONE ambiguity detected: over_consumed ", over_consumed,
-            ", requesting zlib fallback\n");
-        return Z_DATA_ERROR;
-      }
+  // WORKAROUND: ISA-L raw-deflate over-consumption fix.
+  // ISAL pre-loads input in 8-byte word chunks into a 64-bit shift register
+  // (read_in). After BLOCK_FINISH, read_in_length >> 3 is the exact byte
+  // count over-consumed, covering all avail_in scenarios: [0], [1,7], [8],
+  // and >8 (multi-frame), where prior heuristics were blind or inaccurate.
+  if (window_bits < 0 &&
+      (decomp == ISAL_DECOMP_OK || decomp == ISAL_END_INPUT) &&
+      isal_strm_inflate->block_state == ISAL_BLOCK_FINISH) {
+    const uint32_t read_in_correction =
+        (isal_strm_inflate->read_in_length > 0)
+            ? static_cast<uint32_t>(isal_strm_inflate->read_in_length >> 3)
+            : 0u;
+    Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+        " raw_finish avail_in ", isal_strm_inflate->avail_in,
+        " read_in_length_bits ", isal_strm_inflate->read_in_length,
+        " read_in_correction_bytes ", read_in_correction, "\n");
+    if (read_in_correction > 0) {
+      rewind_adjust_bytes = (read_in_correction <= consumed_before_adjust)
+                                ? read_in_correction
+                                : consumed_before_adjust;
+      *tofixed = 1;
     }
+  }
+
+  // WORKAROUND: BLOCK_INPUT_DONE — output-buffer-limited with ambiguous
+  // trailer bytes. read_in_length does not apply here (not yet at BLOCK_FINISH);
+  // request caller fallback to zlib. BLOCK_FINISH is fully handled above.
+  if (window_bits < 0 && decomp == ISAL_DECOMP_OK && *tofixed == 0 &&
+      isal_strm_inflate->block_state == ISAL_BLOCK_INPUT_DONE &&
+      isal_strm_inflate->avail_in < 8 && isal_strm_inflate->avail_in > 0) {
+    const uint32_t over_consumed = 8u - isal_strm_inflate->avail_in;
+    Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
+        " raw INPUT_DONE ambiguity detected: over_consumed ", over_consumed,
+        ", requesting zlib fallback\n");
+    return Z_DATA_ERROR;
   }
 
   *output_length = original_avail_out - isal_strm_inflate->avail_out;
