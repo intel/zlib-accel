@@ -427,8 +427,8 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #ifdef USE_IGZIP
     // IAA→IGZIP fallback: if IAA failed and IGZIP is available, retry with
     // IGZIP before falling through to software zlib.
-    if (path_selected == IAA && ret != 0 &&
-        configs[IAA_FALLBACK_IGZIP] && igzip_available) {
+    if (path_selected == IAA && ret != 0 && configs[IAA_FALLBACK_IGZIP] &&
+        igzip_available) {
       // IAA may have modified input_len/output_len on failure — restore them.
       input_len = strm->avail_in;
       output_len = strm->avail_out;
@@ -758,8 +758,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 #ifdef USE_IGZIP
     // IAA→IGZIP fallback: if IAA failed and IGZIP is available, retry with
     // IGZIP before falling through to software zlib.
-    if (path_selected == IAA && ret != 0 &&
-        configs[IAA_FALLBACK_IGZIP] && igzip_available) {
+    if (path_selected == IAA && ret != 0 && configs[IAA_FALLBACK_IGZIP] &&
+        igzip_available) {
       // IAA may have modified input_len/output_len on failure — restore them.
       input_len = strm->avail_in;
       output_len = strm->avail_out;
@@ -1049,8 +1049,8 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source), &input_len,
-                            dest, &output_len, 15, &read_in_correction_applied, &total_in,
-                            &total_out, &end_of_stream);
+                            dest, &output_len, 15, &read_in_correction_applied,
+                            &total_in, &total_out, &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
         ret = 1;
@@ -1425,9 +1425,9 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
       int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
-      ret =
-          UncompressIGZIP(isal_strm, input, input_length, output, output_length,
-                          31, &read_in_correction_applied, &total_in, &total_out, end_of_stream);
+      ret = UncompressIGZIP(isal_strm, input, input_length, output,
+                            output_length, 31, &read_in_correction_applied,
+                            &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
     }
     gz->path = IGZIP;

@@ -18,11 +18,10 @@ using namespace config;
 const std::array<const char*, STATS_COUNT> stat_names{
     {"deflate_count", "deflate_error_count", "deflate_qat_count",
      "deflate_qat_error_count", "deflate_iaa_count", "deflate_iaa_error_count",
-     "deflate_igzip_count", "deflate_igzip_error_count",
-     "deflate_zlib_count", "inflate_count", "inflate_error_count",
-     "inflate_qat_count", "inflate_qat_error_count", "inflate_iaa_count",
-     "inflate_iaa_error_count", "inflate_igzip_count",
-     "inflate_igzip_error_count", "inflate_zlib_count"}};
+     "deflate_igzip_count", "deflate_igzip_error_count", "deflate_zlib_count",
+     "inflate_count", "inflate_error_count", "inflate_qat_count",
+     "inflate_qat_error_count", "inflate_iaa_count", "inflate_iaa_error_count",
+     "inflate_igzip_count", "inflate_igzip_error_count", "inflate_zlib_count"}};
 
 thread_local std::array<uint64_t, STATS_COUNT> stats{};
 

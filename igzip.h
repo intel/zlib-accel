@@ -66,9 +66,8 @@ struct inflate_state *InitUncompressIGZIP(int windowBits);
 int UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
                     uint32_t *input_length, uint8_t *output,
                     uint32_t *output_length, int window_bits,
-                    int *read_in_correction_applied,
-                    unsigned long *total_in, unsigned long *total_out,
-                    bool *end_of_stream);
+                    int *read_in_correction_applied, unsigned long *total_in,
+                    unsigned long *total_out, bool *end_of_stream);
 int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate);
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate,
                          int *read_in_correction_applied);
