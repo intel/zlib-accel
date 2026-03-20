@@ -203,10 +203,10 @@ struct DeflateSettings {
 
 struct InflateSettings {
   InflateSettings(int _window_bits)
-      : window_bits(_window_bits), trailer_overconsumption_fixed(0) {}
+      : window_bits(_window_bits), read_in_correction_applied(0) {}
   int window_bits;
-  int trailer_overconsumption_fixed; /* indicates if fix has been applied for
-                                        overconsumption issue*/
+  int read_in_correction_applied; /* set when read_in_length correction was
+                                     applied in the current inflate call */
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
 };
@@ -596,7 +596,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       in_call = true;
       IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
           strm, inflate_settings->isal_strm, inflate_settings->window_bits,
-          &inflate_settings->trailer_overconsumption_fixed, &ret);
+          &inflate_settings->read_in_correction_applied, &ret);
       in_call = false;
 
       if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
@@ -700,7 +700,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
               strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &inflate_settings->trailer_overconsumption_fixed, &input_len,
+              &inflate_settings->read_in_correction_applied, &input_len,
               &output_len, &ret, &end_of_stream, pre_avail_in);
       in_call = false;
 
@@ -803,8 +803,6 @@ int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
-  const bool was_igzip_path =
-      (inflate_settings != nullptr && inflate_settings->path == IGZIP);
   int ret = orig_inflateReset(strm);
   if (inflate_settings != nullptr) {
     SetInflatePath(inflate_settings, strm, UNDEFINED, "inflateReset");
@@ -812,11 +810,8 @@ int ZEXPORT inflateReset(z_streamp strm) {
   if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
     ResetUncompressIGZIP(inflate_settings->isal_strm,
-                         &inflate_settings->trailer_overconsumption_fixed);
+                         &inflate_settings->read_in_correction_applied);
 #endif
-    if (was_igzip_path) {
-      inflate_settings->trailer_overconsumption_fixed = 1;
-    }
   }
 
   return ret;
@@ -981,11 +976,11 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int tofixed = 0;
+      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source), &input_len,
-                            dest, &output_len, 15, &tofixed, &total_in,
+                            dest, &output_len, 15, &read_in_correction_applied, &total_in,
                             &total_out, &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
@@ -1358,12 +1353,12 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int tofixed = 0;
+      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret =
           UncompressIGZIP(isal_strm, input, input_length, output, output_length,
-                          31, &tofixed, &total_in, &total_out, end_of_stream);
+                          31, &read_in_correction_applied, &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
     }
     gz->path = IGZIP;

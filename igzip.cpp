@@ -360,7 +360,7 @@ struct inflate_state *InitUncompressIGZIP(int windowBits) {
   // strm->total_out = 0;
   // strm->total_in = 0;
 
-  // s->trailer_overconsumption_fixed = 0; // Initialize the workaround flag
+  // s->read_in_correction_applied = 0;
 
   ConfigureInflateWindow(isal_strm_inflate, windowBits);
 
@@ -369,9 +369,9 @@ struct inflate_state *InitUncompressIGZIP(int windowBits) {
 
 IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
     z_streamp strm, struct inflate_state *isal_strm_inflate, int window_bits,
-    int *tofixed, int *ret) {
+    int *read_in_correction_applied, int *ret) {
   if (strm == nullptr || isal_strm_inflate == nullptr || ret == nullptr ||
-      tofixed == nullptr || strm->avail_in != 0) {
+      read_in_correction_applied == nullptr || strm->avail_in != 0) {
     return IGZIP_NO_INPUT_NOT_HANDLED;
   }
 
@@ -380,7 +380,8 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
   bool end_of_stream = true;
 
   *ret = UncompressIGZIP(isal_strm_inflate, strm->next_in, &input_len,
-                         strm->next_out, &output_len, window_bits, tofixed,
+                         strm->next_out, &output_len, window_bits,
+                         read_in_correction_applied,
                          &strm->total_in, &strm->total_out, &end_of_stream);
 
   if (*ret == Z_DATA_ERROR) {
@@ -407,11 +408,12 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
 
 IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
     z_streamp strm, struct inflate_state **isal_strm_inflate, int window_bits,
-    int *tofixed, uint32_t *input_length, uint32_t *output_length, int *ret,
-    bool *end_of_stream, uint32_t pre_avail_in) {
+    int *read_in_correction_applied, uint32_t *input_length,
+    uint32_t *output_length, int *ret, bool *end_of_stream,
+    uint32_t pre_avail_in) {
   if (strm == nullptr || isal_strm_inflate == nullptr ||
       input_length == nullptr || output_length == nullptr || ret == nullptr ||
-      end_of_stream == nullptr || tofixed == nullptr) {
+      end_of_stream == nullptr || read_in_correction_applied == nullptr) {
     if (ret != nullptr) {
       *ret = Z_DATA_ERROR;
     }
@@ -429,14 +431,15 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
   }
 
   *ret = UncompressIGZIP(*isal_strm_inflate, strm->next_in, input_length,
-                         strm->next_out, output_length, window_bits, tofixed,
+                         strm->next_out, output_length, window_bits,
+                         read_in_correction_applied,
                          &strm->total_in, &strm->total_out, end_of_stream);
 
   const uint32_t remaining_after_igzip =
       (pre_avail_in >= *input_length) ? (pre_avail_in - *input_length) : 0;
 
     if (*ret == 0 && window_bits < 0 && *end_of_stream &&
-      remaining_after_igzip > 0 && *tofixed == 0 &&
+      remaining_after_igzip > 0 && *read_in_correction_applied == 0 &&
       strm->total_in == 0 && strm->total_out == 0) {
     Log(LogLevel::LOG_ERROR,
         "IGZIPRunInflateAndSelectPathAction() raw boundary guard FIRED strm=",
@@ -463,7 +466,8 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
 
 int UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
                     uint32_t *input_length, uint8_t *output,
-                    uint32_t *output_length, int window_bits, int *tofixed,
+                    uint32_t *output_length, int window_bits,
+                    int *read_in_correction_applied,
                     unsigned long *total_in, unsigned long *total_out,
                     bool *end_of_stream) {
   (void)total_in;
@@ -517,19 +521,20 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
       rewind_adjust_bytes = (read_in_correction <= consumed_before_adjust)
                                 ? read_in_correction
                                 : consumed_before_adjust;
-      *tofixed = 1;
+      *read_in_correction_applied = 1;
     }
   }
 
   // WORKAROUND: BLOCK_INPUT_DONE — output-buffer-limited with ambiguous
   // trailer bytes. read_in_length does not apply here (not yet at BLOCK_FINISH);
   // request caller fallback to zlib. BLOCK_FINISH is fully handled above.
-  if (window_bits < 0 && decomp == ISAL_DECOMP_OK && *tofixed == 0 &&
+  if (window_bits < 0 && decomp == ISAL_DECOMP_OK &&
+      *read_in_correction_applied == 0 &&
       isal_strm_inflate->block_state == ISAL_BLOCK_INPUT_DONE &&
       isal_strm_inflate->avail_in < 8 && isal_strm_inflate->avail_in > 0) {
-    const uint32_t over_consumed = 8u - isal_strm_inflate->avail_in;
     Log(LogLevel::LOG_INFO, "UncompressIGZIP() Line ", __LINE__,
-        " raw INPUT_DONE ambiguity detected: over_consumed ", over_consumed,
+        " raw INPUT_DONE ambiguity detected: over_consumed ",
+        8u - isal_strm_inflate->avail_in,
         ", requesting zlib fallback\n");
     return Z_DATA_ERROR;
   }
@@ -621,7 +626,7 @@ int inflateSetDictionary(z_streamp strm, unsigned char *dict_data,
 }
 
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate,
-                         int *tofixed) {
+                         int *read_in_correction_applied) {
   if (!isal_strm_inflate) {
     Log(LogLevel::LOG_ERROR, "ResetUncompressIGZIP() Line ", __LINE__,
         " isal_strm_inflate is NULL\n");
@@ -631,8 +636,7 @@ int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate,
   // Reset ISA-L inflate state
   isal_inflate_reset(isal_strm_inflate);
 
-  // Reset workaround flag
-  *tofixed = 0;
+  *read_in_correction_applied = 0;
 
   return Z_OK;
 }
