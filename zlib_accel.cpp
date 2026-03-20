@@ -419,8 +419,8 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
                      "selected IGZIP accelerator");
       in_call = false;
 
-      // INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-      // INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+      INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
 #endif
     }
 
@@ -725,8 +725,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         SetInflatePath(inflate_settings, strm, IGZIP,
                        "selected IGZIP accelerator");
       }
-      // INCREMENT_STAT(INFLATE_IGZIP_COUNT);
-      // INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
+      INCREMENT_STAT(INFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
 #endif
     }
 
