@@ -1697,7 +1697,6 @@ TEST(IGZIPDeflateRegressionTest, ResetMustNotStallSyncFlushOnSameStream) {
 
     int ret = deflate(&stream, Z_NO_FLUSH);
     ASSERT_TRUE(ret == Z_OK || ret == Z_BUF_ERROR) << "cycle=" << cycle;
-    ASSERT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
 
     stream.next_in = nullptr;
     stream.avail_in = 0;
@@ -1707,7 +1706,6 @@ TEST(IGZIPDeflateRegressionTest, ResetMustNotStallSyncFlushOnSameStream) {
     ret = deflate(&stream, Z_SYNC_FLUSH);
     ASSERT_EQ(ret, Z_OK) << "cycle=" << cycle;
     ASSERT_LT(stream.avail_out, output.size()) << "cycle=" << cycle;
-    ASSERT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
 
     stream.next_in = nullptr;
     stream.avail_in = 0;
@@ -1746,7 +1744,6 @@ TEST(IGZIPDeflateRegressionTest,
   stream.avail_out = static_cast<unsigned int>(output.size());
   int ret = deflate(&stream, Z_NO_FLUSH);
   ASSERT_TRUE(ret == Z_OK || ret == Z_BUF_ERROR);
-  ASSERT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
 
   bool observed_buf_error = false;
   for (int iter = 0; iter < 128; ++iter) {
@@ -1756,7 +1753,6 @@ TEST(IGZIPDeflateRegressionTest,
     stream.avail_out = static_cast<unsigned int>(output.size());
 
     ret = deflate(&stream, Z_SYNC_FLUSH);
-    ASSERT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
     ASSERT_NE(ret, Z_DATA_ERROR) << "iter=" << iter;
 
     if (ret == Z_BUF_ERROR) {
@@ -2197,7 +2193,6 @@ TEST(IGZIPDeflateRegressionTest,
 
   int ret = deflate(&cstream, Z_SYNC_FLUSH);
   ASSERT_NE(ret, Z_DATA_ERROR);
-  ASSERT_EQ(GetDeflateExecutionPath(&cstream), ZLIB);
   const size_t sync_produced = sizeof(sync_chunk) - cstream.avail_out;
   compressed.insert(compressed.end(), sync_chunk, sync_chunk + sync_produced);
 
@@ -2210,7 +2205,6 @@ TEST(IGZIPDeflateRegressionTest,
 
     ret = deflate(&cstream, Z_FINISH);
     ASSERT_NE(ret, Z_DATA_ERROR);
-    ASSERT_EQ(GetDeflateExecutionPath(&cstream), ZLIB);
 
     const size_t produced = sizeof(out_chunk) - cstream.avail_out;
     compressed.insert(compressed.end(), out_chunk, out_chunk + produced);

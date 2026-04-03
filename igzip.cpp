@@ -21,8 +21,6 @@ static uint16_t ClampHistBits(int bits) {
   return (uint16_t)bits;
 }
 
-static constexpr uint32_t kIGZIPMinFinishOutputSize = 256;
-
 static void ConfigureDeflateWindow(struct isal_zstream *isal_strm,
                                    int windowBits) {
   if (windowBits < 0) {
@@ -73,18 +71,9 @@ bool IsIGZIPDeflateFinished(const struct isal_zstream *stream) {
 
 bool SupportedOptionsIGZIPCompress(int flush, uint32_t output_length,
                                    bool stream_on_igzip_path) {
-  if (flush != Z_FINISH) {
-    Log(LogLevel::LOG_INFO, "SupportedOptionsIGZIPCompress() Line ", __LINE__,
-        " flush ", flush, " is not Z_FINISH; IGZIP deflate path disabled\n");
-    return false;
-  }
-  if (!stream_on_igzip_path && output_length < kIGZIPMinFinishOutputSize) {
-    Log(LogLevel::LOG_INFO, "SupportedOptionsIGZIPCompress() Line ", __LINE__,
-        " output length ", output_length,
-        " is less than minimum finish buffer ", kIGZIPMinFinishOutputSize,
-        "\n");
-    return false;
-  }
+  (void)flush;
+  (void)output_length;
+  (void)stream_on_igzip_path;
   return true;
 }
 
@@ -92,48 +81,17 @@ bool SupportedOptionsIGZIPUncompress(int window_bits, uint32_t input_length,
                                      uint32_t output_length,
                                      bool stream_on_igzip_path) {
   (void)window_bits;
+  (void)input_length;
   (void)output_length;
-
-  if (!stream_on_igzip_path && input_length == 0) {
-    Log(LogLevel::LOG_INFO, "SupportedOptionsIGZIPUncompress() Line ", __LINE__,
-        " fallback reason=no_input_on_new_stream input_length ", input_length,
-        " output_length ", output_length, "\n");
-    return false;
-  }
-
+  (void)stream_on_igzip_path;
   return true;
-}
-
-static bool IsIGZIPSyncFlush(int flush) {
-  return flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH || flush == Z_BLOCK;
 }
 
 bool IGZIPShouldFallbackDeflate(bool stream_on_igzip_path, int flush,
                                 uint32_t avail_in) {
-  const bool is_streaming_flush =
-      (flush == Z_SYNC_FLUSH || flush == Z_PARTIAL_FLUSH ||
-       flush == Z_FULL_FLUSH || flush == Z_BLOCK);
-
-  if (!stream_on_igzip_path && is_streaming_flush && avail_in > 0) {
-    Log(LogLevel::LOG_INFO, "IGZIPShouldFallbackDeflate() Line ", __LINE__,
-        " fallback reason=streaming_flush_with_input flush ", flush,
-        " avail_in ", avail_in, "\n");
-    return true;
-  }
-
-  if (!stream_on_igzip_path || avail_in != 0) {
-    return false;
-  }
-
-  if (IsIGZIPSyncFlush(flush)) {
-    Log(LogLevel::LOG_INFO, "IGZIPShouldFallbackDeflate() Line ", __LINE__,
-        " fallback reason=empty_sync_flush_reentry flush ", flush, " avail_in ",
-        avail_in, "\n");
-    return true;
-  }
-  if (flush == Z_FINISH) {
-    return false;
-  }
+  (void)stream_on_igzip_path;
+  (void)flush;
+  (void)avail_in;
   return false;
 }
 
@@ -241,6 +199,18 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
       isal_strm->avail_in, ", avail_out ", (uint32_t)isal_strm->avail_out,
       ", total_out ", (uint32_t)isal_strm->total_out, ", total_in ",
       (uint32_t)isal_strm->total_in, "\n");
+
+  // ISA-L always emits sync bytes on SYNC_FLUSH regardless of pending data.
+  // When the stream is already byte-aligned (ZSTATE_NEW_HDR) and there is no
+  // new input, no real progress can be made — return 0 progress so the caller
+  // reports Z_BUF_ERROR, matching zlib's semantics for empty flush calls.
+  if (isal_strm->avail_in == 0 && isal_strm->flush == SYNC_FLUSH &&
+      isal_strm->end_of_stream == 0 &&
+      isal_strm->internal_state.state == ZSTATE_NEW_HDR) {
+    *output_length = 0;
+    *input_length = 0;
+    return 0;
+  }
 
   int comp = isal_deflate(isal_strm);
 

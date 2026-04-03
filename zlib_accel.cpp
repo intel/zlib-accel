@@ -294,6 +294,12 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
     DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+    // Reject mid-stream: if an accelerator is active, the underlying zlib stream
+    // has not been advanced, so orig_deflateSetDictionary would incorrectly accept
+    // the call. Per zlib spec, dictionary must be set before compression begins.
+    if (deflate_settings->path != UNDEFINED && deflate_settings->path != ZLIB) {
+      return Z_STREAM_ERROR;
+    }
     const int ret = orig_deflateSetDictionary(strm, dictionary, dictLength);
     if (ret == Z_OK) {
       SetDeflatePath(deflate_settings, strm, ZLIB,
@@ -614,23 +620,18 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // For avail_in==0, let IGZIP process any buffered bits in its internal
   // state before reporting Z_BUF_ERROR.
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
-    if (!igzip_supported_options) {
-      SetInflatePath(inflate_settings, strm, ZLIB,
-                     "IGZIP unsupported options for no-input stream");
-    } else {
-      in_call = true;
-      IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
-          strm, inflate_settings->isal_strm, inflate_settings->window_bits,
-          &inflate_settings->read_in_correction_applied, &ret);
-      in_call = false;
+    in_call = true;
+    IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
+        strm, inflate_settings->isal_strm, inflate_settings->window_bits,
+        &inflate_settings->read_in_correction_applied, &ret);
+    in_call = false;
 
-      if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
-        SetInflatePath(inflate_settings, strm, ZLIB,
-                       "igzip raw input_done ambiguity fallback");
-        // Continue through normal zlib fallback path.
-      } else if (action == IGZIP_NO_INPUT_RETURN) {
-        return ret;
-      }
+    if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
+      SetInflatePath(inflate_settings, strm, ZLIB,
+                     "igzip raw input_done ambiguity fallback");
+      // Continue through normal zlib fallback path.
+    } else if (action == IGZIP_NO_INPUT_RETURN) {
+      return ret;
     }
   }
 #endif
