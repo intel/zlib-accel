@@ -255,44 +255,32 @@ bool SupportedOptionsIAA(int window_bits, uint32_t input_length,
   return false;
 }
 
-bool PrependedEmptyBlockPresent(uint8_t* input, uint32_t input_length,
-                                CompressedFormat format) {
-  uint32_t header_length = GetHeaderLength(format);
-  if (header_length + PREPENDED_BLOCK_LENGTH > input_length) {
-    return false;
-  }
-
-  if (input[header_length] == 0 && input[header_length + 1] == 0 &&
-      input[header_length + 2] == 0 && input[header_length + 3] == 0xFF &&
-      input[header_length + 4] == 0xFF) {
-    Log(LogLevel::LOG_INFO, "PrependedEmptyBlockPresent() Line ", __LINE__,
-        " Empty block detected\n");
-    return true;
-  }
-
-  return false;
-}
-
 bool IsIAADecompressible(uint8_t* input, uint32_t input_length,
                          int window_bits) {
   CompressedFormat format = GetCompressedFormat(window_bits);
   if (format == CompressedFormat::ZLIB) {
     int window = GetWindowSizeFromZlibHeader(input, input_length);
-    Log(LogLevel::LOG_INFO, "IsIAADecompressible() Line ", __LINE__, " window ",
-        window, "\n");
     return window <= 12;
-  } else {
-    // if no empty block markers selected, we cannot tell for sure it's
-    // IAA-decompression, but we assume it is.
-    if (configs[IAA_PREPEND_EMPTY_BLOCK] == 0) {
-      return true;
-    } else if (configs[IAA_PREPEND_EMPTY_BLOCK] == 1 &&
-               PrependedEmptyBlockPresent(input, input_length, format)) {
-      return true;
-    } else {
-      return false;
-    }
   }
+  // For raw deflate and gzip formats, QPL always reports total_in ==
+  // available_in regardless of where BFINAL=1 falls in the stream. This is
+  // safe only when the caller provides avail_in == actual_compressed_size
+  // (e.g. Lucene stored-field reads, where the exact compressed size is known
+  // from the .fdt file format).
+  //
+  // Callers that do not know the compressed size a priori — notably Java's
+  // ZipInputStream, which uses a fixed 512-byte internal buffer and feeds
+  // chunks of that size to inflate() — will have avail_in > actual_csize.
+  // QPL consuming all 512 bytes then reporting total_in=512 when actual_csize
+  // was 2 triggers ZipException at the Java level.
+  //
+  // Guard: only attempt IAA when input_length > 512. ZipInputStream always
+  // feeds chunks of at most 512 bytes, so any call above that threshold is
+  // guaranteed not to be a ZipInputStream-chunked read. Lucene stored-field
+  // entries are typically much larger than 512 bytes; the few that are smaller
+  // fall back to IGZIP which is also correct.
+  static constexpr uint32_t kZipInputStreamBufferSize = 512;
+  return input_length > kZipInputStreamBufferSize;
 }
 
 #endif  // USE_IAA
