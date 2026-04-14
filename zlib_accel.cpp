@@ -450,6 +450,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       SetDeflatePath(deflate_settings, strm, IGZIP,
                      "IAA failed, IGZIP fallback");
       in_call = false;
+      path_selected = IGZIP;  // use IGZIP return-code semantics below
       INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
       INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
     }
