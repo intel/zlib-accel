@@ -649,7 +649,9 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   }
 
   if (!in_call && strm->avail_in > 0 && inflate_settings->path != ZLIB) {
+#ifdef USE_IGZIP
     const uInt pre_avail_in = strm->avail_in;
+#endif
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
 
