@@ -215,6 +215,7 @@ log_level
 - Values: 0,1,2,3. Default 3
 - This option applies only if the shim is built with DEBUG_LOG=ON.
 - If 0, no log messages are shown. If 1, debug, info, and error messages are shown. If 2, info and error messages are shown. If 3, only error messages are shown.
+- Migration note: the numeric meanings changed from earlier versions. In particular, older configurations that used `log_level=2` for "error only" must now use `log_level=3`. Review existing `log_level` settings when upgrading to ensure the expected verbosity.
 
 log_stats_samples
 - Values: 0-INT_MAX. Default 1000
