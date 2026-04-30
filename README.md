@@ -59,8 +59,10 @@ make
 CMake supports the following options:
 - USE_QAT (ON/OFF): include QAT acceleration
 - USE_IAA (ON/OFF): include IAA acceleration
+- USE_IGZIP (ON/OFF): include IGZIP acceleration (requires ISA-L)
 - QPL_PATH: path to QPL for IAA acceleration (if not in a standard directory)
 - QATZIP_PATH: path to QATzip for QAT acceleration (if not in a standard directory)
+- ISAL_PATH: path to ISA-L for IGZIP acceleration (if not in a standard directory)
 - DEBUG_LOG (ON/OFF): enable logging
 - ENABLE_STATISTICS (ON/OFF): enable statistics
 - COVERAGE (ON/OFF): enable test coverage (more details in a later section)
@@ -83,6 +85,9 @@ Requirements for IAA
 - idxd driver, available in-tree in Linux kernel
 - [accel-config](https://github.com/intel/idxd-config)
 - [Query Processing Library](https://github.com/intel/qpl)
+
+Requirements for IGZIP
+- [ISA-L (Intel Intelligent Storage Acceleration Library)](https://github.com/intel/isa-l)
 
 A setup with both QAT and IAA enabled has been tested on an AWS m7i.metal-24xl instance (Ubuntu 22.04, kernel 6.8.0).
 Refer to the links above for instructions on how to install the dependencies.
