@@ -99,8 +99,27 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
     return;
   }
 
+  // Map zlib-accel log level to QATzip log level
+  LogLevel logLevel =
+      static_cast<LogLevel>(config::GetConfig(config::LOG_LEVEL));
+  QzLogLevel_T qzLogLevel = LOG_NONE;
+  switch (logLevel) {
+    default:
+      qzLogLevel = LOG_NONE;
+      break;
+    case LogLevel::LOG_DEBUG:
+      qzLogLevel = LOG_DEBUG3;
+      break;
+    case LogLevel::LOG_INFO:
+      qzLogLevel = LOG_INFO;
+      break;
+    case LogLevel::LOG_ERROR:
+      qzLogLevel = LOG_ERROR;
+      break;
+  }
+  qzSetLogLevel(qzLogLevel);
+
   // Initialize QAT hardware
-  qzSetLogLevel(LOG_NONE);
   int status = qzInit(session.get(), 0);
   if (status != QZ_OK && status != QZ_DUPLICATE) {
     Log(LogLevel::LOG_ERROR, "qzInit() failure  Line ", __LINE__, "  session ",

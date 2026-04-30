@@ -212,9 +212,9 @@ ignore_zlib_dictionary
 - If set to 0, zlib-accel honors inflateSetDictionary and deflateSetDictionary.
 
 log_level
-- Values: 0,1,2. Default 2
+- Values: 0,1,2,3. Default 3
 - This option applies only if the shim is built with DEBUG_LOG=ON.
-- If 1, error and info log messages are shown. If 2, only error log messages are shown. If 0, no log messages are shown.
+- If 0, no log messages are shown. If 1, debug, info, and error messages are shown. If 2, info and error messages are shown. If 3, only error messages are shown.
 
 log_stats_samples
 - Values: 0-INT_MAX. Default 1000

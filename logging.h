@@ -15,7 +15,7 @@
 
 using namespace config;
 
-enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
+enum class LogLevel { LOG_NONE = 0, LOG_DEBUG = 1, LOG_INFO = 2, LOG_ERROR = 3 };
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
 
@@ -68,6 +68,9 @@ inline void Log(LogLevel level, Args&&... args) {
       break;
     case LogLevel::LOG_INFO:
       stream << "Info: ";
+      break;
+    case LogLevel::LOG_DEBUG:
+      stream << "Debug: ";
       break;
     case LogLevel::LOG_NONE:
       return;
