@@ -172,7 +172,8 @@ TEST_F(LoggingTest, LogDebugLevel) {
 }
 
 /**
- * @test Verifies that DEBUG-level messages are filtered out when LOG_LEVEL=INFO.
+ * @test Verifies that DEBUG-level messages are filtered out when
+ * LOG_LEVEL=INFO.
  */
 TEST_F(LoggingTest, LogDebugFilteredByInfo) {
   CreateLogFile(test_log_file.c_str());

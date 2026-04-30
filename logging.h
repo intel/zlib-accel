@@ -15,7 +15,12 @@
 
 using namespace config;
 
-enum class LogLevel { LOG_NONE = 0, LOG_DEBUG = 1, LOG_INFO = 2, LOG_ERROR = 3 };
+enum class LogLevel {
+  LOG_NONE = 0,
+  LOG_DEBUG = 1,
+  LOG_INFO = 2,
+  LOG_ERROR = 3
+};
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
 

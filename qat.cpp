@@ -99,7 +99,10 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
     return;
   }
 
-  // Map zlib-accel log level to QATzip log level
+  // Map zlib-accel log level to QATzip log level.
+  // Only honoured when the shim is built with DEBUG_LOG=ON; otherwise
+  // QATzip logging is silenced to match the documented log_level behaviour.
+#ifdef DEBUG_LOG
   LogLevel logLevel =
       static_cast<LogLevel>(config::GetConfig(config::LOG_LEVEL));
   QzLogLevel_T qzLogLevel = LOG_NONE;
@@ -118,6 +121,9 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
       break;
   }
   qzSetLogLevel(qzLogLevel);
+#else
+  qzSetLogLevel(LOG_NONE);
+#endif
 
   // Initialize QAT hardware
   int status = qzInit(session.get(), 0);
