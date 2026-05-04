@@ -178,6 +178,8 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
   // When the stream is already byte-aligned (ZSTATE_NEW_HDR) and there is no
   // new input, no real progress can be made — return 0 progress so the caller
   // reports Z_BUF_ERROR, matching zlib's semantics for empty flush calls.
+  // ZSTATE_NEW_HDR is the idle/byte-aligned state in ISA-L's internal deflate
+  // state machine; validated against ISA-L v2.32.0 (commit c196241).
   if (isal_strm->avail_in == 0 && isal_strm->flush == SYNC_FLUSH &&
       isal_strm->end_of_stream == 0 &&
       isal_strm->internal_state.state == ZSTATE_NEW_HDR) {
@@ -576,9 +578,11 @@ int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate,
     return Z_STREAM_ERROR;
   }
 
-  // Reset ISA-L inflate state
+  // Reset ISA-L inflate state. isal_inflate_reset clears the internal
+  // read_in / read_in_length buffer, so any over-consumption correction
+  // applied during the previous stream session no longer applies.
+  // Clear the flag so the new session fires the correction fresh if needed.
   isal_inflate_reset(isal_strm_inflate);
-
   *read_in_correction_applied = 0;
 
   return Z_OK;
