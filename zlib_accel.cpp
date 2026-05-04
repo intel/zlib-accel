@@ -328,18 +328,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       deflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
 
-#ifdef USE_IGZIP
-  if (configs[USE_IGZIP_COMPRESS] && deflate_settings->path == UNDEFINED &&
-      IGZIPShouldFallbackDeflate(false, flush, strm->avail_in)) {
-    SetDeflatePath(deflate_settings, strm, ZLIB, "igzip fallback condition");
-  }
-  if (configs[USE_IGZIP_COMPRESS] &&
-      IGZIPShouldFallbackDeflate(deflate_settings->path == IGZIP, flush,
-                                 strm->avail_in)) {
-    SetDeflatePath(deflate_settings, strm, ZLIB, "igzip fallback condition");
-  }
-#endif
-
   int ret = 1;
   bool iaa_available = false;
   bool qat_available = false;
@@ -363,9 +351,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #ifdef USE_IGZIP
     igzip_stream_active = (deflate_settings->path == IGZIP &&
                            deflate_settings->isal_strm != nullptr);
-    igzip_available =
-        configs[USE_IGZIP_COMPRESS] &&
-        SupportedOptionsIGZIPCompress(flush, output_len, igzip_stream_active);
+    igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
@@ -614,10 +600,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 
 #ifdef USE_IGZIP
   const bool igzip_supported_options =
-      !in_call && configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(inflate_settings->window_bits,
-                                      strm->avail_in, strm->avail_out,
-                                      igzip_stream_active);
+      !in_call && configs[USE_IGZIP_UNCOMPRESS];
 
   // Keep stateful IGZIP stream handling on the same engine.
   // For avail_in==0, let IGZIP process any buffered bits in its internal
@@ -914,8 +897,7 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS] &&
-                    SupportedOptionsIGZIPCompress(Z_FINISH, output_len, false);
+  igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1013,9 +995,7 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(15, input_len, output_len, false);
+  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1315,9 +1295,7 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_COMPRESS] &&
-      SupportedOptionsIGZIPCompress(Z_FINISH, *output_length, false);
+  igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1391,9 +1369,7 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(31, *input_length, *output_length, false);
+  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;

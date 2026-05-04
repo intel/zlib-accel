@@ -29,11 +29,6 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush, uint8_t *input,
                   uint32_t *output_length, unsigned long *total_in,
                   unsigned long *total_out);
 bool IsIGZIPDeflateFinished(const struct isal_zstream *stream);
-bool SupportedOptionsIGZIPCompress(int flush, uint32_t output_length,
-                                   bool stream_on_igzip_path);
-bool SupportedOptionsIGZIPUncompress(int window_bits, uint32_t input_length,
-                                     uint32_t output_length,
-                                     bool stream_on_igzip_path);
 enum IGZIPNoInputAction {
   IGZIP_NO_INPUT_NOT_HANDLED,
   IGZIP_NO_INPUT_RETURN,
@@ -58,8 +53,6 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
     uint32_t *output_length, int *ret, bool *end_of_stream,
     uint32_t pre_avail_in);
 
-bool IGZIPShouldFallbackDeflate(bool stream_on_igzip_path, int flush,
-                                uint32_t avail_in);
 int EndCompressIGZIP(struct isal_zstream *isal_strm);
 
 struct inflate_state *InitUncompressIGZIP(int windowBits);

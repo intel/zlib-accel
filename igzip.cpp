@@ -69,32 +69,6 @@ bool IsIGZIPDeflateFinished(const struct isal_zstream *stream) {
   return state == ZSTATE_END;
 }
 
-bool SupportedOptionsIGZIPCompress(int flush, uint32_t output_length,
-                                   bool stream_on_igzip_path) {
-  (void)flush;
-  (void)output_length;
-  (void)stream_on_igzip_path;
-  return true;
-}
-
-bool SupportedOptionsIGZIPUncompress(int window_bits, uint32_t input_length,
-                                     uint32_t output_length,
-                                     bool stream_on_igzip_path) {
-  (void)window_bits;
-  (void)input_length;
-  (void)output_length;
-  (void)stream_on_igzip_path;
-  return true;
-}
-
-bool IGZIPShouldFallbackDeflate(bool stream_on_igzip_path, int flush,
-                                uint32_t avail_in) {
-  (void)stream_on_igzip_path;
-  (void)flush;
-  (void)avail_in;
-  return false;
-}
-
 struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
   Log(LogLevel::LOG_INFO, "InitCompressIGZIP() Line ", __LINE__,
       " initializing deflate with level ", level, ", windowBits ", windowBits,
