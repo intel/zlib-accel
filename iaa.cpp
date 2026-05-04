@@ -99,9 +99,19 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
     output_shift += GZIP_EXT_XHDR_SIZE;
   }
 
-  // If prepending an empty block, leave space for it to be added
-  // For zlib format, we don't need an empty block as a marker, as the zlib
-  // header includes info about the window size
+  // DEPRECATED: iaa_prepend_empty_block is no longer used by the decompressor.
+  // The original design used a 5-byte empty stored-block marker written at the
+  // start of IAA-compressed output so that the decompressor could detect and
+  // trust IAA-compressed data (which uses a 4kB history window). This approach
+  // was abandoned because QPL hardware always consumes all available_in bytes
+  // regardless of where the BFINAL=1 token falls (overconsumption bug), so a
+  // caller-supplied exact boundary is required instead. IsIAADecompressible now
+  // uses a 512-byte minimum input length threshold to gate IAA decompression:
+  // Java ZipInputStream feeds <=512-byte chunks (csize unknown), triggering
+  // overconsumption; Lucene stored-field reads always provide the exact
+  // compressed size (>512 bytes), where consuming all input is correct.
+  // The config option is retained for backward compatibility and will be
+  // removed in a future release.
   bool prepend_empty_block = false;
   CompressedFormat format = GetCompressedFormat(window_bits);
   if (format != CompressedFormat::ZLIB &&

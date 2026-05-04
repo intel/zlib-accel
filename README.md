@@ -189,14 +189,12 @@ iaa_compress_percentage
 
 iaa_prepend_empty_block
 - Values: 0,1. Default: 0
-- Prepend an empty stored block to the compressed data to "mark" that the data was compressed by IAA.
-- IAA has a 4kB history window limit and it is not able to decompress blocks that use a longer history window (up to 32kB per deflate standard).
-- During decompression, this marker indicates that the data was compressed by IAA and is therefore guarateed decompressible by IAA.
+- **Deprecated.** This option is retained for backward compatibility and will be removed in a future release. Setting it to 1 has no effect on decompression.
+- Background: the original design prepended a 5-byte empty stored-block marker to IAA-compressed output so the decompressor could identify IAA-produced data (which uses a 4kB history window). This approach was abandoned because QPL hardware always consumes all `available_in` bytes regardless of where the stream boundary falls, making marker-based detection unreliable when the caller does not supply the exact compressed size. IAA decompression eligibility is now determined by a 512-byte minimum input length threshold: callers such as Java's `ZipInputStream` feed chunks of ≤512 bytes when the compressed size is unknown, while Lucene stored-field reads always supply the exact size (>512 bytes).
 
 iaa_uncompress_percentage
 - Values: 0-100. Default: 50
 - If both IAA and QAT are enabled, percentage of decompression calls to offload to IAA.
-- If iaa_prepend_empty_block = 1, this percentage is only applied to data with the empty block marker.
 
 qat_periodical_polling = 0
 - Values: 0,1. Default: 0
