@@ -298,7 +298,8 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     // stream has not been advanced, so orig_deflateSetDictionary would
     // incorrectly accept the call. Per zlib spec, dictionary must be set before
     // compression begins.
-    if (deflate_settings->path != UNDEFINED && deflate_settings->path != ZLIB) {
+    if (deflate_settings != nullptr && deflate_settings->path != UNDEFINED &&
+        deflate_settings->path != ZLIB) {
       return Z_STREAM_ERROR;
     }
     const int ret = orig_deflateSetDictionary(strm, dictionary, dictLength);
