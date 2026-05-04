@@ -205,8 +205,9 @@ struct InflateSettings {
   InflateSettings(int _window_bits)
       : window_bits(_window_bits), read_in_correction_applied(0) {}
   int window_bits;
-  int read_in_correction_applied; /* set when read_in_length correction was
-                                     applied in the current inflate call */
+  int read_in_correction_applied; /* set once per stream when the
+                                     read_in_length over-consumption correction
+                                     fires; cleared only on inflateReset */
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
 };
@@ -754,7 +755,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       output_len = strm->avail_out;
       end_of_stream = true;
       in_call = true;
-      inflate_settings->read_in_correction_applied = 0;
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
               strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
