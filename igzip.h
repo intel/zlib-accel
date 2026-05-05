@@ -12,8 +12,9 @@ typedef struct internal_state2 {
   int level;
   int w_bits;
   struct inflate_state *isal_strm_inflate;
-  int read_in_correction_applied; /* Set when read_in_length correction was
-                                     applied in the current inflate call */
+  int read_in_correction_applied; /* Set once per stream session when the
+                                     read_in_length over-consumption correction
+                                     fires; cleared only on inflateReset */
 } inflate_state2;
 
 typedef struct internal_state {
