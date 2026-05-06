@@ -570,6 +570,19 @@ int inflateSetDictionary(z_streamp strm, unsigned char *dict_data,
   return isal_inflate_set_dict(s->isal_strm_inflate, dict_data, dict_len);
 }
 
+void ResetCompressIGZIP(struct isal_zstream *isal_strm, int windowBits) {
+  // isal_deflate_reset preserves gzip_flag, hist_bits, level, and level_buf.
+  // gzip_flag must be restored: after the first chunk ISA-L changes it from
+  // IGZIP_ZLIB (3) to IGZIP_ZLIB_NO_HDR (4) to suppress the header on
+  // continuation calls. Without this reset, the next stream reused via
+  // deflateReset would produce headerless output, causing decompressors
+  // (e.g. Java Inflater with nowrap=false) to reject every subsequent chunk.
+  isal_deflate_reset(isal_strm);
+  isal_strm->end_of_stream = 0;
+  isal_strm->flush = NO_FLUSH;
+  ConfigureDeflateWindow(isal_strm, windowBits);
+}
+
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate,
                          int *read_in_correction_applied) {
   if (!isal_strm_inflate) {

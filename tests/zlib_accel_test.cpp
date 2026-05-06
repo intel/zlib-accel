@@ -1784,6 +1784,65 @@ TEST(IGZIPDeflateRegressionTest,
   deflateEnd(&stream);
 }
 
+// Regression test for: deflateReset on a reused IGZIP stream must restore the
+// zlib header (gzip_flag = IGZIP_ZLIB) so that each independent chunk is
+// self-contained and decompressible by a fresh zlib inflater.  Without the
+// fix, isal_deflate_reset preserved gzip_flag = IGZIP_ZLIB_NO_HDR (4) and the
+// second and subsequent chunks were emitted without a zlib header, causing
+// Java's Inflater (nowrap=false) to report "incorrect header check".
+TEST(IGZIPDeflateRegressionTest,
+     ResetMustRestoreZlibHeaderForSubsequentChunks) {
+  SetCompressPath(IGZIP, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         /*windowBits=*/15, /*memLevel=*/8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const int kChunks = 5;
+  const int kChunkSize = 16384;
+  const int kCompBound = deflateBound(&cstream, kChunkSize);
+
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    // Each chunk is independent data compressed with a fresh IGZIP stream
+    // (via deflateReset).
+    std::vector<uint8_t> input(kChunkSize,
+                               static_cast<uint8_t>('A' + chunk % 26));
+    std::vector<uint8_t> compressed(kCompBound);
+
+    cstream.next_in = input.data();
+    cstream.avail_in = static_cast<uInt>(input.size());
+    cstream.next_out = compressed.data();
+    cstream.avail_out = static_cast<uInt>(compressed.size());
+
+    ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END) << "chunk=" << chunk;
+    ASSERT_EQ(GetDeflateExecutionPath(&cstream), IGZIP) << "chunk=" << chunk;
+
+    const size_t compressed_size = compressed.size() - cstream.avail_out;
+
+    // Decompress with a fresh zlib inflater — requires a valid zlib header.
+    std::vector<uint8_t> decompressed(kChunkSize);
+    z_stream dstream;
+    memset(&dstream, 0, sizeof(z_stream));
+    ASSERT_EQ(inflateInit(&dstream), Z_OK) << "chunk=" << chunk;
+    dstream.next_in = compressed.data();
+    dstream.avail_in = static_cast<uInt>(compressed_size);
+    dstream.next_out = decompressed.data();
+    dstream.avail_out = static_cast<uInt>(decompressed.size());
+    ASSERT_EQ(inflate(&dstream, Z_FINISH), Z_STREAM_END)
+        << "chunk=" << chunk
+        << ": decompression failed (missing zlib header after deflateReset?)";
+    ASSERT_EQ(decompressed, input) << "chunk=" << chunk;
+    inflateEnd(&dstream);
+
+    ASSERT_EQ(deflateReset(&cstream), Z_OK) << "chunk=" << chunk;
+  }
+
+  deflateEnd(&cstream);
+}
+
 TEST(IGZIPDeflateRegressionTest, DictionaryStreamMustStayOnZlibAcrossReset) {
   SetCompressPath(IGZIP, false, false, false);
   SetUncompressPath(ZLIB, false, false);

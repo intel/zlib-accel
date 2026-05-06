@@ -529,9 +529,8 @@ int ZEXPORT deflateReset(z_streamp strm) {
 
 #ifdef USE_IGZIP
     if (deflate_settings->isal_strm != nullptr) {
-      isal_deflate_reset(deflate_settings->isal_strm);
-      deflate_settings->isal_strm->end_of_stream = 0;
-      deflate_settings->isal_strm->flush = NO_FLUSH;
+      ResetCompressIGZIP(deflate_settings->isal_strm,
+                         deflate_settings->window_bits);
     }
 #endif
   }
