@@ -59,8 +59,10 @@ make
 CMake supports the following options:
 - USE_QAT (ON/OFF): include QAT acceleration
 - USE_IAA (ON/OFF): include IAA acceleration
+- USE_IGZIP (ON/OFF): include IGZIP acceleration (requires ISA-L)
 - QPL_PATH: path to QPL for IAA acceleration (if not in a standard directory)
 - QATZIP_PATH: path to QATzip for QAT acceleration (if not in a standard directory)
+- ISAL_PATH: path to ISA-L for IGZIP acceleration (if not in a standard directory)
 - DEBUG_LOG (ON/OFF): enable logging
 - ENABLE_STATISTICS (ON/OFF): enable statistics
 - COVERAGE (ON/OFF): enable test coverage (more details in a later section)
@@ -83,6 +85,9 @@ Requirements for IAA
 - idxd driver, available in-tree in Linux kernel
 - [accel-config](https://github.com/intel/idxd-config)
 - [Query Processing Library](https://github.com/intel/qpl)
+
+Requirements for IGZIP
+- [ISA-L (Intel Intelligent Storage Acceleration Library)](https://github.com/intel/isa-l)
 
 A setup with both QAT and IAA enabled has been tested on an AWS m7i.metal-24xl instance (Ubuntu 22.04, kernel 6.8.0).
 Refer to the links above for instructions on how to install the dependencies.
@@ -178,20 +183,22 @@ use_zlib_uncompress
 - Enable zlib for decompression
 - Setting to 1 is recommended, to allow fall back to zlib in case accelerators cannot be used or experience an error.
 
+iaa_fallback_igzip
+- Values: 0,1. Default: 0
+- If 1, and an IAA compression or decompression operation fails, the request is retried using IGZIP (if enabled) before falling back to software zlib. Useful on machines where IAA hardware is intermittently unavailable.
+
 iaa_compress_percentage
 - Values: 0-100. Default: 50
 - If both IAA and QAT are enabled, percentage of compression calls to offload to IAA.
 
 iaa_prepend_empty_block
 - Values: 0,1. Default: 0
-- Prepend an empty stored block to the compressed data to "mark" that the data was compressed by IAA.
-- IAA has a 4kB history window limit and it is not able to decompress blocks that use a longer history window (up to 32kB per deflate standard).
-- During decompression, this marker indicates that the data was compressed by IAA and is therefore guarateed decompressible by IAA.
+- **Deprecated.** This option is retained for backward compatibility and will be removed in a future release. Setting it to 1 has no effect on decompression.
+- Background: the original design prepended a 5-byte empty stored-block marker to IAA-compressed output so the decompressor could identify IAA-produced data (which uses a 4kB history window). This approach was abandoned because QPL hardware always consumes all `available_in` bytes regardless of where the stream boundary falls, making marker-based detection unreliable when the caller does not supply the exact compressed size. IAA decompression eligibility is now determined by a 512-byte minimum input length threshold: callers such as Java's `ZipInputStream` feed chunks of ≤512 bytes when the compressed size is unknown, while Lucene stored-field reads always supply the exact size (>512 bytes).
 
 iaa_uncompress_percentage
 - Values: 0-100. Default: 50
 - If both IAA and QAT are enabled, percentage of decompression calls to offload to IAA.
-- If iaa_prepend_empty_block = 1, this percentage is only applied to data with the empty block marker.
 
 qat_periodical_polling = 0
 - Values: 0,1. Default: 0
