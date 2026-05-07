@@ -100,30 +100,35 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
   }
 
   // Map zlib-accel log level to QATzip log level.
-  // Only honoured when the shim is built with DEBUG_LOG=ON; otherwise
-  // QATzip logging is silenced to match the documented log_level behaviour.
+  // qzSetLogLevel is a QATzip global; call it once per process regardless
+  // of how many QAT sessions are created.
+  static std::once_flag qz_log_level_flag;
+  std::call_once(qz_log_level_flag, []() {
+    QzLogLevel_T qzLogLevel = LOG_NONE;
 #ifdef DEBUG_LOG
-  LogLevel logLevel =
-      static_cast<LogLevel>(config::GetConfig(config::LOG_LEVEL));
-  QzLogLevel_T qzLogLevel = LOG_NONE;
-  switch (logLevel) {
-    default:
-      qzLogLevel = LOG_NONE;
-      break;
-    case LogLevel::LOG_DEBUG:
-      qzLogLevel = LOG_DEBUG3;
-      break;
-    case LogLevel::LOG_INFO:
-      qzLogLevel = LOG_INFO;
-      break;
-    case LogLevel::LOG_ERROR:
-      qzLogLevel = LOG_ERROR;
-      break;
-  }
-  qzSetLogLevel(qzLogLevel);
-#else
-  qzSetLogLevel(LOG_NONE);
+    LogLevel logLevel =
+        static_cast<LogLevel>(config::GetConfig(config::LOG_LEVEL));
+    switch (logLevel) {
+      case LogLevel::LOG_NONE:
+        qzLogLevel = LOG_NONE;
+        break;
+      case LogLevel::LOG_ERROR:
+        qzLogLevel = LOG_ERROR;
+        break;
+      case LogLevel::LOG_INFO:
+        qzLogLevel = LOG_INFO;
+        break;
+      case LogLevel::LOG_DEBUG:
+        qzLogLevel = LOG_DEBUG3;
+        break;
+      default:
+        // Unreachable: all LogLevel values are handled above.
+        qzLogLevel = LOG_NONE;
+        break;
+    }
 #endif
+    qzSetLogLevel(qzLogLevel);
+  });
 
   // Initialize QAT hardware
   int status = qzInit(session.get(), 0);

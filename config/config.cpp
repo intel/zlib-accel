@@ -28,7 +28,7 @@ uint32_t configs[CONFIG_MAX] = {
     1,   /*qat_compression_level*/
     0,   /*qat_compression_allow_chunking*/
     0,   /*ignore_zlib_dictionary*/
-    3,   /*log_level*/
+    1,   /*log_level*/
     1000 /*log_stats_samples*/
 };
 
