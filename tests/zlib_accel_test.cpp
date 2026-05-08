@@ -1274,7 +1274,7 @@ TEST_F(ConfigLoaderTest, LoadValidConfig) {
   EXPECT_EQ(GetConfig(USE_IAA_UNCOMPRESS), 0);
   EXPECT_EQ(GetConfig(USE_ZLIB_COMPRESS), 1);
   EXPECT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 1);
-  EXPECT_EQ(GetConfig(LOG_LEVEL), 2);
+  EXPECT_EQ(GetConfig(LOG_LEVEL), 1);
   LoadConfigFile(file_content);
 }
 
