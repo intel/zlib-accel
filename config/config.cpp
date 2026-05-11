@@ -21,6 +21,8 @@ uint32_t configs[CONFIG_MAX] = {
     0,   /*use_iaa_uncompress*/
     1,   /*use_zlib_compress*/
     1,   /*use_zlib_uncompress*/
+    0,   /*use_igzip_compress*/
+    0,   /*use_igzip_uncompress*/
     50,  /*iaa_compress_percentage*/
     50,  /*iaa_uncompress_percentage*/
     0,   /*iaa_prepend_empty_block*/
@@ -45,6 +47,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
     "use_iaa_uncompress",
     "use_zlib_compress",
     "use_zlib_uncompress",
+    "use_igzip_compress",
+    "use_igzip_uncompress",
     "iaa_compress_percentage",
     "iaa_uncompress_percentage",
     "iaa_prepend_empty_block",
@@ -78,6 +82,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(USE_IAA_UNCOMPRESS, 1, 0);
   trySetConfig(USE_ZLIB_COMPRESS, 1, 0);
   trySetConfig(USE_ZLIB_UNCOMPRESS, 1, 0);
+  trySetConfig(USE_IGZIP_COMPRESS, 1, 0);
+  trySetConfig(USE_IGZIP_UNCOMPRESS, 1, 0);
   trySetConfig(IAA_COMPRESS_PERCENTAGE, 100, 0);
   trySetConfig(IAA_UNCOMPRESS_PERCENTAGE, 100, 0);
   trySetConfig(IAA_PREPEND_EMPTY_BLOCK, 1, 0);

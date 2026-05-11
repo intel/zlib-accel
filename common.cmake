@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 option(USE_IAA "Use IAA (requires QPL)" OFF)
+option(USE_IGZIP "Use IGZIP (requires isa-l)" OFF)
 option(USE_QAT "Use QAT (requires QATzip)" OFF)
 option(DEBUG_LOG "for logging" ON)
 option(COVERAGE "for coverage" OFF)
@@ -12,6 +13,10 @@ option(TSAN "Enable ThreadSanitizer" OFF)
 
 if(USE_IAA)
   add_compile_definitions(USE_IAA)
+endif()
+
+if(USE_IGZIP)
+	add_compile_definitions(USE_IGZIP)
 endif()
 
 if(USE_QAT)
@@ -86,6 +91,21 @@ if(USE_IAA)
     include_directories(${QPL_PATH}/include/qpl ${QPL_PATH}/include)
     link_directories(PUBLIC ${QPL_PATH}/lib64 ${QPL_PATH}/lib)
     link_libraries(qpl)
+  endif()
+endif()
+
+if(USE_IGZIP)
+	if(NOT DEFINED ISAL_PATH)
+	  find_package(isal REQUIRED)
+	  if(isal_FOUND)
+	    message(STATUS "Found ISA-L: ${isal_DIR}")
+	    link_libraries(isal)
+	  endif()
+	  else()
+    message(STATUS "Using ISAL_PATH: ${ISAL_PATH}")
+    include_directories(${ISAL_PATH}/include)
+    link_directories(PUBLIC ${ISAL_PATH}/.libs)
+    link_libraries(isal)
   endif()
 endif()
 

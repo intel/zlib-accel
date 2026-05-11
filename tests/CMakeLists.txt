@@ -24,7 +24,7 @@ add_executable(zlib_accel_test
 )
 
 add_custom_target(run
-    COMMAND ./zlib_accel_test
+    COMMAND ./zlib_accel_test # --gtest_filter=ConfigLoaderTest.LoadValidConfig
     DEPENDS zlib_accel_test
 )
 
