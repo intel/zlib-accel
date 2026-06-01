@@ -203,10 +203,11 @@ struct DeflateSettings {
 
 struct InflateSettings {
   InflateSettings(int _window_bits)
-      : window_bits(_window_bits), trailer_overconsumption_fixed(0) {}
+      : window_bits(_window_bits), read_in_correction_applied(0) {}
   int window_bits;
-  int trailer_overconsumption_fixed; /* indicates if fix has been applied for
-                                        overconsumption issue*/
+  int read_in_correction_applied; /* set once per stream when the
+                                     read_in_length over-consumption correction
+                                     fires; cleared only on inflateReset */
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
 };
@@ -294,6 +295,14 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
     DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+    // Reject mid-stream: if an accelerator is active, the underlying zlib
+    // stream has not been advanced, so orig_deflateSetDictionary would
+    // incorrectly accept the call. Per zlib spec, dictionary must be set before
+    // compression begins.
+    if (deflate_settings != nullptr && deflate_settings->path != UNDEFINED &&
+        deflate_settings->path != ZLIB) {
+      return Z_STREAM_ERROR;
+    }
     const int ret = orig_deflateSetDictionary(strm, dictionary, dictLength);
     if (ret == Z_OK) {
       SetDeflatePath(deflate_settings, strm, ZLIB,
@@ -320,18 +329,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       deflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
 
-#ifdef USE_IGZIP
-  if (configs[USE_IGZIP_COMPRESS] && deflate_settings->path == UNDEFINED &&
-      IGZIPShouldFallbackDeflate(false, flush, strm->avail_in)) {
-    SetDeflatePath(deflate_settings, strm, ZLIB, "igzip fallback condition");
-  }
-  if (configs[USE_IGZIP_COMPRESS] &&
-      IGZIPShouldFallbackDeflate(deflate_settings->path == IGZIP, flush,
-                                 strm->avail_in)) {
-    SetDeflatePath(deflate_settings, strm, ZLIB, "igzip fallback condition");
-  }
-#endif
-
   int ret = 1;
   bool iaa_available = false;
   bool qat_available = false;
@@ -355,9 +352,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #ifdef USE_IGZIP
     igzip_stream_active = (deflate_settings->path == IGZIP &&
                            deflate_settings->isal_strm != nullptr);
-    igzip_available =
-        configs[USE_IGZIP_COMPRESS] &&
-        SupportedOptionsIGZIPCompress(flush, output_len, igzip_stream_active);
+    igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
@@ -419,10 +414,36 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
                      "selected IGZIP accelerator");
       in_call = false;
 
-      // INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-      // INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+      INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
 #endif
     }
+
+#ifdef USE_IGZIP
+    // IAA→IGZIP fallback: if IAA failed and IGZIP is available, retry with
+    // IGZIP before falling through to software zlib.
+    if (path_selected == IAA && ret != 0 && configs[IAA_FALLBACK_IGZIP] &&
+        igzip_available) {
+      // IAA may have modified input_len/output_len on failure — restore them.
+      input_len = strm->avail_in;
+      output_len = strm->avail_out;
+      if (deflate_settings->isal_strm == nullptr) {
+        deflate_settings->method = 0;
+        deflate_settings->isal_strm = InitCompressIGZIP(
+            deflate_settings->level, deflate_settings->window_bits);
+      }
+      in_call = true;
+      ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
+                          &input_len, strm->next_out, &output_len,
+                          &strm->total_in, &strm->total_out);
+      SetDeflatePath(deflate_settings, strm, IGZIP,
+                     "IAA failed, IGZIP fallback");
+      in_call = false;
+      path_selected = IGZIP;  // use IGZIP return-code semantics below
+      INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+    }
+#endif  // USE_IGZIP iaa fallback
 
     if (ret == 0) {
       strm->next_in += input_len;
@@ -508,9 +529,8 @@ int ZEXPORT deflateReset(z_streamp strm) {
 
 #ifdef USE_IGZIP
     if (deflate_settings->isal_strm != nullptr) {
-      isal_deflate_reset(deflate_settings->isal_strm);
-      deflate_settings->isal_strm->end_of_stream = 0;
-      deflate_settings->isal_strm->flush = NO_FLUSH;
+      ResetCompressIGZIP(deflate_settings->isal_strm,
+                         deflate_settings->window_bits);
     }
 #endif
   }
@@ -580,32 +600,24 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 
 #ifdef USE_IGZIP
   const bool igzip_supported_options =
-      !in_call && configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(inflate_settings->window_bits,
-                                      strm->avail_in, strm->avail_out,
-                                      igzip_stream_active);
+      !in_call && configs[USE_IGZIP_UNCOMPRESS];
 
   // Keep stateful IGZIP stream handling on the same engine.
   // For avail_in==0, let IGZIP process any buffered bits in its internal
   // state before reporting Z_BUF_ERROR.
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
-    if (!igzip_supported_options) {
-      SetInflatePath(inflate_settings, strm, ZLIB,
-                     "IGZIP unsupported options for no-input stream");
-    } else {
-      in_call = true;
-      IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
-          strm, inflate_settings->isal_strm, inflate_settings->window_bits,
-          &inflate_settings->trailer_overconsumption_fixed, &ret);
-      in_call = false;
+    in_call = true;
+    IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
+        strm, inflate_settings->isal_strm, inflate_settings->window_bits,
+        &inflate_settings->read_in_correction_applied, &ret);
+    in_call = false;
 
-      if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
-        SetInflatePath(inflate_settings, strm, ZLIB,
-                       "igzip raw input_done ambiguity fallback");
-        // Continue through normal zlib fallback path.
-      } else if (action == IGZIP_NO_INPUT_RETURN) {
-        return ret;
-      }
+    if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
+      SetInflatePath(inflate_settings, strm, ZLIB,
+                     "igzip raw input_done ambiguity fallback");
+      // Continue through normal zlib fallback path.
+    } else if (action == IGZIP_NO_INPUT_RETURN) {
+      return ret;
     }
   }
 #endif
@@ -622,7 +634,9 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   }
 
   if (!in_call && strm->avail_in > 0 && inflate_settings->path != ZLIB) {
+#ifdef USE_IGZIP
     const uInt pre_avail_in = strm->avail_in;
+#endif
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
 
@@ -700,7 +714,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
               strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &inflate_settings->trailer_overconsumption_fixed, &input_len,
+              &inflate_settings->read_in_correction_applied, &input_len,
               &output_len, &ret, &end_of_stream, pre_avail_in);
       in_call = false;
 
@@ -725,10 +739,53 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         SetInflatePath(inflate_settings, strm, IGZIP,
                        "selected IGZIP accelerator");
       }
-      // INCREMENT_STAT(INFLATE_IGZIP_COUNT);
-      // INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
+      INCREMENT_STAT(INFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
 #endif
     }
+
+#ifdef USE_IGZIP
+    // IAA→IGZIP fallback: if IAA failed and IGZIP is available, retry with
+    // IGZIP before falling through to software zlib.
+    if (path_selected == IAA && ret != 0 && configs[IAA_FALLBACK_IGZIP] &&
+        igzip_available) {
+      // IAA may have modified input_len/output_len on failure — restore them.
+      input_len = strm->avail_in;
+      output_len = strm->avail_out;
+      end_of_stream = true;
+      in_call = true;
+      const IGZIPInflatePathAction path_action =
+          IGZIPRunInflateAndSelectPathAction(
+              strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
+              &inflate_settings->read_in_correction_applied, &input_len,
+              &output_len, &ret, &end_of_stream, pre_avail_in);
+      in_call = false;
+
+      if (inflate_settings->isal_strm == nullptr) {
+        return Z_DATA_ERROR;
+      }
+
+      if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
+        Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
+            " source=igzip (iaa fallback)", " total_in=", strm->total_in,
+            " total_out=", strm->total_out, " adler=", strm->adler, "\n");
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "IAA->IGZIP fallback: Z_NEED_DICT");
+      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "IAA->IGZIP fallback: raw trailer");
+      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "IAA->IGZIP fallback: raw boundary");
+      } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
+                 inflate_settings->path != ZLIB) {
+        SetInflatePath(inflate_settings, strm, IGZIP,
+                       "IAA failed, IGZIP fallback succeeded");
+      }
+      INCREMENT_STAT(INFLATE_IGZIP_COUNT);
+      INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
+    }
+#endif  // USE_IGZIP iaa fallback
 
     if (ret == 0) {
       strm->next_in += input_len;
@@ -803,8 +860,6 @@ int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
-  const bool was_igzip_path =
-      (inflate_settings != nullptr && inflate_settings->path == IGZIP);
   int ret = orig_inflateReset(strm);
   if (inflate_settings != nullptr) {
     SetInflatePath(inflate_settings, strm, UNDEFINED, "inflateReset");
@@ -812,11 +867,8 @@ int ZEXPORT inflateReset(z_streamp strm) {
   if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
     ResetUncompressIGZIP(inflate_settings->isal_strm,
-                         &inflate_settings->trailer_overconsumption_fixed);
+                         &inflate_settings->read_in_correction_applied);
 #endif
-    if (was_igzip_path) {
-      inflate_settings->trailer_overconsumption_fixed = 1;
-    }
   }
 
   return ret;
@@ -844,8 +896,7 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS] &&
-                    SupportedOptionsIGZIPCompress(Z_FINISH, output_len, false);
+  igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -943,9 +994,7 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(15, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(15, input_len, output_len, false);
+  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -981,12 +1030,12 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int tofixed = 0;
+      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source), &input_len,
-                            dest, &output_len, 15, &tofixed, &total_in,
-                            &total_out, &end_of_stream);
+                            dest, &output_len, 15, &read_in_correction_applied,
+                            &total_in, &total_out, &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
         ret = 1;
@@ -1245,9 +1294,7 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_COMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_COMPRESS] &&
-      SupportedOptionsIGZIPCompress(Z_FINISH, *output_length, false);
+  igzip_available = configs[USE_IGZIP_COMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1321,9 +1368,7 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
       configs[USE_QAT_UNCOMPRESS] && SupportedOptionsQAT(31, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available =
-      configs[USE_IGZIP_UNCOMPRESS] &&
-      SupportedOptionsIGZIPUncompress(31, *input_length, *output_length, false);
+  igzip_available = configs[USE_IGZIP_UNCOMPRESS];
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1358,12 +1403,12 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int tofixed = 0;
+      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
-      ret =
-          UncompressIGZIP(isal_strm, input, input_length, output, output_length,
-                          31, &tofixed, &total_in, &total_out, end_of_stream);
+      ret = UncompressIGZIP(isal_strm, input, input_length, output,
+                            output_length, 31, &read_in_correction_applied,
+                            &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
     }
     gz->path = IGZIP;
