@@ -2553,7 +2553,7 @@ TEST(IAAFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
 }
 #endif  // USE_IAA
 
-#ifdef USE_QAT
+#if defined(USE_QAT) && defined(USE_IGZIP)
 // QAT->IGZIP fallback tests.
 // On machines without QAT hardware, CompressQAT/UncompressQAT return non-zero,
 // which naturally triggers the fallback path. These tests verify:
@@ -2621,7 +2621,8 @@ TEST(QATFallbackIGZIPTest, DeflateDoesNotUseIGZIPWhenFallbackDisabled) {
   stream.next_out = output.data();
   stream.avail_out = static_cast<uInt>(output.size());
 
-  deflate(&stream, Z_FINISH);
+  int ret = deflate(&stream, Z_FINISH);
+  ASSERT_EQ(ret, Z_STREAM_END);
 
   // With fallback disabled, IGZIP must not be selected for a QAT-configured
   // stream; it should fall through to zlib.
@@ -2707,7 +2708,8 @@ TEST(QATFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
   dstream.next_out = reinterpret_cast<Bytef*>(uncompressed.data());
   dstream.avail_out = static_cast<uInt>(uncompressed.size());
 
-  inflate(&dstream, Z_FINISH);
+  ret = inflate(&dstream, Z_FINISH);
+  ASSERT_EQ(ret, Z_STREAM_END);
 
   // With fallback disabled, IGZIP must not be selected for a QAT-configured
   // inflate stream; it should fall through to zlib.
@@ -2718,7 +2720,7 @@ TEST(QATFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
   SetConfig(IGZIP_FALLBACK, 0);
   DestroyBlock(input);
 }
-#endif  // USE_QAT
+#endif  // USE_QAT && USE_IGZIP
 
 #endif
 
