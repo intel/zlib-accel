@@ -433,14 +433,12 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         deflate_settings->isal_strm = InitCompressIGZIP(
             deflate_settings->level, deflate_settings->window_bits);
       }
-      const char* failed_accelerator = path_selected == IAA ? "IAA" : "QAT";
       in_call = true;
       ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
                           &input_len, strm->next_out, &output_len,
                           &strm->total_in, &strm->total_out);
-      SetDeflatePath(
-          deflate_settings, strm, IGZIP,
-          std::string(failed_accelerator) + " failed, IGZIP fallback");
+      SetDeflatePath(deflate_settings, strm, IGZIP,
+                     "accelerator failed, IGZIP fallback");
       in_call = false;
       path_selected = IGZIP;  // use IGZIP return-code semantics below
       INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
@@ -757,7 +755,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       input_len = strm->avail_in;
       output_len = strm->avail_out;
       end_of_stream = true;
-      const char* failed_accelerator = path_selected == IAA ? "IAA" : "QAT";
       in_call = true;
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
@@ -775,22 +772,18 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
             " source=igzip (accelerator fallback)",
             " total_in=", strm->total_in, " total_out=", strm->total_out,
             " adler=", strm->adler, "\n");
-        SetInflatePath(
-            inflate_settings, strm, ZLIB,
-            std::string(failed_accelerator) + "->IGZIP fallback: Z_NEED_DICT");
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "accelerator->IGZIP fallback: Z_NEED_DICT");
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
-        SetInflatePath(
-            inflate_settings, strm, ZLIB,
-            std::string(failed_accelerator) + "->IGZIP fallback: raw trailer");
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "accelerator->IGZIP fallback: raw trailer");
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
-        SetInflatePath(
-            inflate_settings, strm, ZLIB,
-            std::string(failed_accelerator) + "->IGZIP fallback: raw boundary");
+        SetInflatePath(inflate_settings, strm, ZLIB,
+                       "accelerator->IGZIP fallback: raw boundary");
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, strm, IGZIP,
-                       std::string(failed_accelerator) +
-                           " failed, IGZIP fallback succeeded");
+                       "accelerator failed, IGZIP fallback succeeded");
       }
       INCREMENT_STAT(INFLATE_IGZIP_COUNT);
       INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
