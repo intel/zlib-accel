@@ -438,7 +438,8 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
                           &input_len, strm->next_out, &output_len,
                           &strm->total_in, &strm->total_out);
       SetDeflatePath(deflate_settings, strm, IGZIP,
-                     "accelerator failed, IGZIP fallback");
+                     path_selected == QAT ? "QAT failed, IGZIP fallback"
+                                          : "IAA failed, IGZIP fallback");
       in_call = false;
       path_selected = IGZIP;  // use IGZIP return-code semantics below
       INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
@@ -767,23 +768,32 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         return Z_DATA_ERROR;
       }
 
+      const char* failed_accelerator = (path_selected == QAT) ? "QAT" : "IAA";
       if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
         Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
-            " source=igzip (accelerator fallback)",
+            " source=igzip (", failed_accelerator, " fallback)",
             " total_in=", strm->total_in, " total_out=", strm->total_out,
             " adler=", strm->adler, "\n");
         SetInflatePath(inflate_settings, strm, ZLIB,
-                       "accelerator->IGZIP fallback: Z_NEED_DICT");
+                       path_selected == QAT
+                           ? "QAT->IGZIP fallback: Z_NEED_DICT"
+                           : "IAA->IGZIP fallback: Z_NEED_DICT");
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
         SetInflatePath(inflate_settings, strm, ZLIB,
-                       "accelerator->IGZIP fallback: raw trailer");
+                       path_selected == QAT
+                           ? "QAT->IGZIP fallback: raw trailer"
+                           : "IAA->IGZIP fallback: raw trailer");
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
         SetInflatePath(inflate_settings, strm, ZLIB,
-                       "accelerator->IGZIP fallback: raw boundary");
+                       path_selected == QAT
+                           ? "QAT->IGZIP fallback: raw boundary"
+                           : "IAA->IGZIP fallback: raw boundary");
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, strm, IGZIP,
-                       "accelerator failed, IGZIP fallback succeeded");
+                       path_selected == QAT
+                           ? "QAT failed, IGZIP fallback succeeded"
+                           : "IAA failed, IGZIP fallback succeeded");
       }
       INCREMENT_STAT(INFLATE_IGZIP_COUNT);
       INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);

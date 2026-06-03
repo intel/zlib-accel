@@ -2454,7 +2454,8 @@ TEST(IAAFallbackIGZIPTest, DeflateDoesNotUseIGZIPWhenFallbackDisabled) {
   stream.next_out = output.data();
   stream.avail_out = static_cast<uInt>(output.size());
 
-  deflate(&stream, Z_FINISH);
+  const int ret = deflate(&stream, Z_FINISH);
+  ASSERT_EQ(ret, Z_STREAM_END);
 
   // With fallback disabled, IGZIP must not be selected for an IAA-configured
   // stream; it should fall through to zlib.
