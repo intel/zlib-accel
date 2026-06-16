@@ -183,9 +183,9 @@ use_zlib_uncompress
 - Enable zlib for decompression
 - Setting to 1 is recommended, to allow fall back to zlib in case accelerators cannot be used or experience an error.
 
-iaa_fallback_igzip
-- Values: 0,1. Default: 0
-- If 1, and an IAA compression or decompression operation fails, the request is retried using IGZIP (if enabled) before falling back to software zlib. Useful on machines where IAA hardware is intermittently unavailable.
+igzip_fallback
+- Values: 0,1. Default: 1
+- If 1, and an IAA or QAT compression/decompression operation fails, the request is retried using IGZIP (if enabled) before falling back to software zlib. Useful on machines where hardware accelerators are intermittently unavailable.
 
 iaa_compress_percentage
 - Values: 0-100. Default: 50
