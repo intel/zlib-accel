@@ -8,6 +8,8 @@ project (zlib-accel
         DESCRIPTION "Zlib shim to accelerate deflate/inflate")
 
 include(common.cmake)
+find_package(TBB REQUIRED COMPONENTS tbb)
+link_libraries(TBB::tbb)
 link_libraries(dl)
 
 option(ENABLE_STATISTICS "Enable statistics" OFF)
