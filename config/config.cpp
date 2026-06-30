@@ -51,7 +51,7 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
     "iaa_prepend_empty_block",
     "qat_periodical_polling",
     "qat_compression_level",
-	  "qat_compression_allow_chunking",
+    "qat_compression_allow_chunking",
     "ignore_zlib_dictionary",
     "log_level",
     "log_stats_samples",
