@@ -202,8 +202,7 @@ struct DeflateSettings {
 };
 
 struct InflateSettings {
-  InflateSettings(int _window_bits)
-      : window_bits(_window_bits) {}
+  InflateSettings(int _window_bits) : window_bits(_window_bits) {}
   int window_bits;
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
@@ -605,8 +604,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // state before reporting Z_BUF_ERROR.
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
     in_call = true;
-    IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
-        strm, inflate_settings->isal_strm, &ret);
+    IGZIPNoInputAction action =
+        IGZIPHandleActiveStreamNoInput(strm, inflate_settings->isal_strm, &ret);
     in_call = false;
 
     if (action == IGZIP_NO_INPUT_RETURN) {
@@ -1023,8 +1022,8 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source), &input_len,
-                            dest, &output_len,
-                            &total_in, &total_out, &end_of_stream);
+                            dest, &output_len, &total_in, &total_out,
+                            &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
         ret = 1;
@@ -1394,9 +1393,9 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
     } else {
       unsigned long total_in = 0;
       unsigned long total_out = 0;
-      ret = UncompressIGZIP(isal_strm, input, input_length, output,
-                            output_length,
-                            &total_in, &total_out, end_of_stream);
+      ret =
+          UncompressIGZIP(isal_strm, input, input_length, output, output_length,
+                          &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
     }
     gz->path = IGZIP;

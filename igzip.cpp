@@ -321,8 +321,8 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
   bool end_of_stream = true;
 
   *ret = UncompressIGZIP(isal_strm_inflate, strm->next_in, &input_len,
-                         strm->next_out, &output_len,
-                         &strm->total_in, &strm->total_out, &end_of_stream);
+                         strm->next_out, &output_len, &strm->total_in,
+                         &strm->total_out, &end_of_stream);
 
   if (*ret == 0) {
     strm->next_out += output_len;
@@ -364,8 +364,8 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
   }
 
   *ret = UncompressIGZIP(*isal_strm_inflate, strm->next_in, input_length,
-                         strm->next_out, output_length,
-                         &strm->total_in, &strm->total_out, end_of_stream);
+                         strm->next_out, output_length, &strm->total_in,
+                         &strm->total_out, end_of_stream);
 
   // Raw boundary guard removed: ISA-L PR#215 (cd72fd7) fixes avail_in
   // over-consumption at BLOCK_FINISH in isal_inflate; the guard is no
