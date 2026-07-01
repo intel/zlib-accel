@@ -203,11 +203,8 @@ struct DeflateSettings {
 
 struct InflateSettings {
   InflateSettings(int _window_bits)
-      : window_bits(_window_bits), read_in_correction_applied(0) {}
+      : window_bits(_window_bits) {}
   int window_bits;
-  int read_in_correction_applied; /* set once per stream when the
-                                     read_in_length over-consumption correction
-                                     fires; cleared only on inflateReset */
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
 };
@@ -531,8 +528,7 @@ int ZEXPORT deflateReset(z_streamp strm) {
 
 #ifdef USE_IGZIP
     if (deflate_settings->isal_strm != nullptr) {
-      ResetCompressIGZIP(deflate_settings->isal_strm,
-                         deflate_settings->window_bits);
+      ResetCompressIGZIP(deflate_settings->isal_strm);
     }
 #endif
   }
@@ -610,15 +606,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
     in_call = true;
     IGZIPNoInputAction action = IGZIPHandleActiveStreamNoInput(
-        strm, inflate_settings->isal_strm, inflate_settings->window_bits,
-        &inflate_settings->read_in_correction_applied, &ret);
+        strm, inflate_settings->isal_strm, &ret);
     in_call = false;
 
-    if (action == IGZIP_NO_INPUT_FALLBACK_ZLIB) {
-      SetInflatePath(inflate_settings, strm, ZLIB,
-                     "igzip raw input_done ambiguity fallback");
-      // Continue through normal zlib fallback path.
-    } else if (action == IGZIP_NO_INPUT_RETURN) {
+    if (action == IGZIP_NO_INPUT_RETURN) {
       return ret;
     }
   }
@@ -636,9 +627,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   }
 
   if (!in_call && strm->avail_in > 0 && inflate_settings->path != ZLIB) {
-#ifdef USE_IGZIP
-    const uInt pre_avail_in = strm->avail_in;
-#endif
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
 
@@ -716,8 +704,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
               strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &inflate_settings->read_in_correction_applied, &input_len,
-              &output_len, &ret, &end_of_stream, pre_avail_in);
+              &input_len, &output_len, &ret, &end_of_stream);
       in_call = false;
 
       if (inflate_settings->isal_strm == nullptr) {
@@ -733,9 +720,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
         SetInflatePath(inflate_settings, strm, ZLIB,
                        "IGZIP requested raw trailer fallback");
-      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
-        SetInflatePath(inflate_settings, strm, ZLIB,
-                       "raw boundary guard fallback");
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, strm, IGZIP,
@@ -760,8 +744,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       const IGZIPInflatePathAction path_action =
           IGZIPRunInflateAndSelectPathAction(
               strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &inflate_settings->read_in_correction_applied, &input_len,
-              &output_len, &ret, &end_of_stream, pre_avail_in);
+              &input_len, &output_len, &ret, &end_of_stream);
       in_call = false;
 
       if (inflate_settings->isal_strm == nullptr) {
@@ -783,11 +766,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                        path_selected == QAT
                            ? "QAT->IGZIP fallback: raw trailer"
                            : "IAA->IGZIP fallback: raw trailer");
-      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_RAW_BOUNDARY) {
-        SetInflatePath(inflate_settings, strm, ZLIB,
-                       path_selected == QAT
-                           ? "QAT->IGZIP fallback: raw boundary"
-                           : "IAA->IGZIP fallback: raw boundary");
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, strm, IGZIP,
@@ -879,8 +857,7 @@ int ZEXPORT inflateReset(z_streamp strm) {
   }
   if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
-    ResetUncompressIGZIP(inflate_settings->isal_strm,
-                         &inflate_settings->read_in_correction_applied);
+    ResetUncompressIGZIP(inflate_settings->isal_strm);
 #endif
   }
 
@@ -1043,11 +1020,10 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, const_cast<uint8_t*>(source), &input_len,
-                            dest, &output_len, 15, &read_in_correction_applied,
+                            dest, &output_len,
                             &total_in, &total_out, &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
@@ -1416,11 +1392,10 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
-      int read_in_correction_applied = 0;
       unsigned long total_in = 0;
       unsigned long total_out = 0;
       ret = UncompressIGZIP(isal_strm, input, input_length, output,
-                            output_length, 31, &read_in_correction_applied,
+                            output_length,
                             &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
     }
