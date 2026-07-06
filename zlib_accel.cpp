@@ -784,12 +784,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       strm->next_out += output_len;
       strm->avail_out -= output_len;
       strm->total_out += output_len;
-      if (input_len > 0 || output_len > 0) {
-        if (end_of_stream) {
-          ret = Z_STREAM_END;
-        } else {
-          ret = Z_OK;
-        }
+      if (end_of_stream) {
+        ret = Z_STREAM_END;
+      } else if (input_len > 0 || output_len > 0) {
+        ret = Z_OK;
       } else {
         ret = Z_BUF_ERROR;
       }

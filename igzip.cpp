@@ -328,8 +328,10 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
     strm->next_out += output_len;
     strm->avail_out -= output_len;
     strm->total_out += output_len;
-    if (output_len > 0) {
-      *ret = end_of_stream ? Z_STREAM_END : Z_OK;
+    if (end_of_stream) {
+      *ret = Z_STREAM_END;
+    } else if (output_len > 0) {
+      *ret = Z_OK;
     } else {
       *ret = Z_BUF_ERROR;
     }
