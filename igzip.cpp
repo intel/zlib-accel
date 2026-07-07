@@ -422,8 +422,8 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate, uint8_t *input,
   // Bug 2 guard removed: ISA-L PR#215 (cd72fd7) makes BLOCK_FINISH correctly
   // restore avail_in after over-consumption into read_in. Continuing past
   // BLOCK_INPUT_DONE (even with avail_in 1-7) reaches BLOCK_FINISH with the
-  // correct stream boundary. No fallback needed. (Verified 2026-06-22 via
-  // /tmp/test_block_input_done.cpp, Test F.)
+  // correct stream boundary. No fallback needed.
+  // (ISA-L >= 2.32.1 enforced at configure time via common.cmake.)
 
   *output_length = original_avail_out - isal_strm_inflate->avail_out;
   *input_length = consumed_before_adjust;
