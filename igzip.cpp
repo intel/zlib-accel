@@ -144,25 +144,25 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
 
   // stream->flush mapping
   switch (flush) {
-  case Z_NO_FLUSH:
-    isal_strm->flush = NO_FLUSH;
-    break;
-  case Z_SYNC_FLUSH:
-  case Z_PARTIAL_FLUSH:
-  case Z_BLOCK:
-    isal_strm->flush = SYNC_FLUSH;
-    break;
-  case Z_FULL_FLUSH:
-    isal_strm->flush = FULL_FLUSH;
-    break;
-  case Z_FINISH:
-    isal_strm->flush = FULL_FLUSH;
-    isal_strm->end_of_stream = 1;
-    break;
-  default:
-    Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-        " invalid flush value\n");
-    return -1;
+    case Z_NO_FLUSH:
+      isal_strm->flush = NO_FLUSH;
+      break;
+    case Z_SYNC_FLUSH:
+    case Z_PARTIAL_FLUSH:
+    case Z_BLOCK:
+      isal_strm->flush = SYNC_FLUSH;
+      break;
+    case Z_FULL_FLUSH:
+      isal_strm->flush = FULL_FLUSH;
+      break;
+    case Z_FINISH:
+      isal_strm->flush = FULL_FLUSH;
+      isal_strm->end_of_stream = 1;
+      break;
+    default:
+      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+          " invalid flush value\n");
+      return -1;
   }
 
   Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__, " gzip_flag ",
@@ -210,34 +210,34 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
     Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
         " deflate finished with error code ", ret, "\n");
     switch (comp) {
-    case INVALID_FLUSH:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid flush\n");
-      break;
-    case INVALID_PARAM:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid parameter\n");
-      break;
-    case STATELESS_OVERFLOW:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " stateless overflow\n");
-      break;
-    case ISAL_INVALID_OPERATION:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid operation\n");
-      break;
-    case ISAL_INVALID_STATE:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid state\n");
-      break;
-    case ISAL_INVALID_LEVEL:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid level\n");
-      break;
-    case ISAL_INVALID_LEVEL_BUF:
-      Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
-          " invalid level buffer\n");
-      break;
+      case INVALID_FLUSH:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid flush\n");
+        break;
+      case INVALID_PARAM:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid parameter\n");
+        break;
+      case STATELESS_OVERFLOW:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " stateless overflow\n");
+        break;
+      case ISAL_INVALID_OPERATION:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid operation\n");
+        break;
+      case ISAL_INVALID_STATE:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid state\n");
+        break;
+      case ISAL_INVALID_LEVEL:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid level\n");
+        break;
+      case ISAL_INVALID_LEVEL_BUF:
+        Log(LogLevel::LOG_ERROR, "CompressIGZIP() Line ", __LINE__,
+            " invalid level buffer\n");
+        break;
     }
   }
 
@@ -269,8 +269,7 @@ int deflateSetDictionary(z_streamp strm, unsigned char *dict_data,
 
   deflate_state *s = (deflate_state *)strm->state;
 
-  if (!s || !s->isal_strm)
-    return Z_STREAM_ERROR;
+  if (!s || !s->isal_strm) return Z_STREAM_ERROR;
 
   return isal_deflate_set_dict(s->isal_strm, dict_data, dict_len);
 }
@@ -451,34 +450,34 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
     Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
         " inflate finished with error code ", ret, "\n");
     switch (decomp) {
-    case ISAL_INVALID_BLOCK:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - Invalid block\n");
-      break;
-    case ISAL_INVALID_SYMBOL:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - Invalid symbol\n");
-      break;
-    case ISAL_INVALID_LOOKBACK:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - Invalid lookback\n");
-      break;
-    case ISAL_END_INPUT:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - End of input reached unexpectedly\n");
-      break;
-    case ISAL_UNSUPPORTED_METHOD:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - Unsupported method\n");
-      break;
-    case ISAL_NEED_DICT:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error - Need dictionary\n");
-      break;
-    default:
-      Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
-          " ISA-L error code ", decomp, "\n");
-      break;
+      case ISAL_INVALID_BLOCK:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - Invalid block\n");
+        break;
+      case ISAL_INVALID_SYMBOL:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - Invalid symbol\n");
+        break;
+      case ISAL_INVALID_LOOKBACK:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - Invalid lookback\n");
+        break;
+      case ISAL_END_INPUT:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - End of input reached unexpectedly\n");
+        break;
+      case ISAL_UNSUPPORTED_METHOD:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - Unsupported method\n");
+        break;
+      case ISAL_NEED_DICT:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error - Need dictionary\n");
+        break;
+      default:
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() Line ", __LINE__,
+            " ISA-L error code ", decomp, "\n");
+        break;
     }
   }
 
@@ -506,8 +505,7 @@ int inflateSetDictionary(z_streamp strm, unsigned char *dict_data,
 
   const inflate_state2 *s = (inflate_state2 *)strm->state;
 
-  if (!s || !s->isal_strm_inflate)
-    return Z_STREAM_ERROR;
+  if (!s || !s->isal_strm_inflate) return Z_STREAM_ERROR;
 
   return isal_inflate_set_dict(s->isal_strm_inflate, dict_data, dict_len);
 }
