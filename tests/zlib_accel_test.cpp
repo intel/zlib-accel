@@ -1843,6 +1843,116 @@ TEST(IGZIPDeflateRegressionTest,
   deflateEnd(&cstream);
 }
 
+// Regression: after inflate() returns Z_STREAM_END and avail_in is left
+// pointing at trailing bytes (Bug 1 fix), a subsequent inflate() call with
+// those trailing bytes must return Z_STREAM_END, not Z_BUF_ERROR. The IGZIP
+// stream is still active (not freed), and isal_inflate on a finished stream
+// returns ISAL_END_INPUT with 0 consumed — the avail_in>0 path in inflate()
+// previously fell through to Z_BUF_ERROR when input_len==output_len==0.
+TEST(IGZIPInflateRegressionTest,
+     InflateAfterStreamEndWithTrailingBytesReturnsStreamEnd) {
+  SetCompressPath(IGZIP, false, false, false);
+  SetUncompressPath(IGZIP, false, false);
+
+  // Compress with IGZIP (raw deflate).
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  const size_t kPayloadSize = 4096;
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  std::vector<uint8_t> payload(kPayloadSize, 'Q');
+  std::vector<uint8_t> compressed(deflateBound(&cstream, kPayloadSize));
+  cstream.next_in = payload.data();
+  cstream.avail_in = static_cast<uInt>(kPayloadSize);
+  cstream.next_out = compressed.data();
+  cstream.avail_out = static_cast<uInt>(compressed.size());
+  ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&cstream), IGZIP);
+  const size_t compressed_size = compressed.size() - cstream.avail_out;
+  deflateEnd(&cstream);
+
+  // Build input buffer: compressed stream + 8 trailing bytes.
+  std::vector<uint8_t> input_buf(compressed.begin(),
+                                 compressed.begin() + compressed_size);
+  input_buf.insert(input_buf.end(), {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'});
+
+  z_stream dstream;
+  memset(&dstream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&dstream, -15), Z_OK);
+  std::vector<uint8_t> output(kPayloadSize * 2);
+
+  dstream.next_in = input_buf.data();
+  dstream.avail_in = static_cast<uInt>(input_buf.size());
+  dstream.next_out = output.data();
+  dstream.avail_out = static_cast<uInt>(output.size());
+
+  // First call: IGZIP decompresses the stream and leaves 8 trailing bytes.
+  ASSERT_EQ(inflate(&dstream, Z_SYNC_FLUSH), Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&dstream), IGZIP);
+  ASSERT_EQ(dstream.avail_in, 8u) << "Bug 1 fix should rewind trailing bytes";
+
+  // Second call: avail_in==8 > 0, IGZIP stream still active. isal_inflate on
+  // a finished stream produces no I/O — must return Z_STREAM_END, not
+  // Z_BUF_ERROR.
+  dstream.next_out = output.data();
+  dstream.avail_out = static_cast<uInt>(output.size());
+  EXPECT_EQ(inflate(&dstream, Z_SYNC_FLUSH), Z_STREAM_END);
+
+  inflateEnd(&dstream);
+}
+
+// Regression: after inflate() returns Z_STREAM_END with avail_in==0, a
+// subsequent inflate() call with avail_in==0 (IGZIPHandleActiveStreamNoInput
+// path) must return Z_STREAM_END, not Z_BUF_ERROR.
+TEST(IGZIPInflateRegressionTest,
+     InflateWithZeroInputAfterStreamEndReturnsStreamEnd) {
+  SetCompressPath(IGZIP, false, false, false);
+  SetUncompressPath(IGZIP, false, false);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  const size_t kPayloadSize = 4096;
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  std::vector<uint8_t> payload(kPayloadSize, 'Q');
+  std::vector<uint8_t> compressed(deflateBound(&cstream, kPayloadSize));
+  cstream.next_in = payload.data();
+  cstream.avail_in = static_cast<uInt>(kPayloadSize);
+  cstream.next_out = compressed.data();
+  cstream.avail_out = static_cast<uInt>(compressed.size());
+  ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&cstream), IGZIP);
+  const size_t compressed_size = compressed.size() - cstream.avail_out;
+  deflateEnd(&cstream);
+
+  z_stream dstream;
+  memset(&dstream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&dstream, -15), Z_OK);
+  std::vector<uint8_t> output(kPayloadSize * 2);
+
+  dstream.next_in = compressed.data();
+  dstream.avail_in = static_cast<uInt>(compressed_size);
+  dstream.next_out = output.data();
+  dstream.avail_out = static_cast<uInt>(output.size());
+
+  // First call: consumes all compressed bytes exactly, avail_in drops to 0.
+  ASSERT_EQ(inflate(&dstream, Z_SYNC_FLUSH), Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&dstream), IGZIP);
+  ASSERT_EQ(dstream.avail_in, 0u);
+
+  // Second call: avail_in==0, IGZIP stream still active
+  // (IGZIPHandleActiveStreamNoInput path). isal_inflate on a finished stream
+  // with no input produces no output — must return Z_STREAM_END, not
+  // Z_BUF_ERROR.
+  dstream.next_out = output.data();
+  dstream.avail_out = static_cast<uInt>(output.size());
+  EXPECT_EQ(inflate(&dstream, Z_SYNC_FLUSH), Z_STREAM_END);
+
+  inflateEnd(&dstream);
+}
+
 TEST(IGZIPDeflateRegressionTest, DictionaryStreamMustStayOnZlibAcrossReset) {
   SetCompressPath(IGZIP, false, false, false);
   SetUncompressPath(ZLIB, false, false);
