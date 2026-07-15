@@ -15,7 +15,14 @@
 
 using namespace config;
 
-enum class LogLevel { LOG_NONE = 0, LOG_INFO = 1, LOG_ERROR = 2 };
+// Log verbosity levels. 0 = silent; higher values = more verbose.
+// Matches QATzip's QzLogLevel_T convention.
+enum class LogLevel {
+  LOG_NONE = 0,
+  LOG_ERROR = 1,
+  LOG_INFO = 2,
+  LOG_DEBUG = 3
+};
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
 
@@ -56,7 +63,7 @@ inline void Log(LogLevel level, Args&&... args) {
     return;
   }
 
-  if (static_cast<uint32_t>(level) < current_level) {
+  if (static_cast<uint32_t>(level) > current_level) {
     return;
   }
 
@@ -68,6 +75,9 @@ inline void Log(LogLevel level, Args&&... args) {
       break;
     case LogLevel::LOG_INFO:
       stream << "Info: ";
+      break;
+    case LogLevel::LOG_DEBUG:
+      stream << "Debug: ";
       break;
     case LogLevel::LOG_NONE:
       return;
@@ -105,7 +115,7 @@ inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data, uint32_t len,
     return;
   }
 
-  if (static_cast<uint32_t>(level) < current_level) {
+  if (static_cast<uint32_t>(level) > current_level) {
     return;
   }
 

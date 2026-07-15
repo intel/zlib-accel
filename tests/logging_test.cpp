@@ -153,6 +153,46 @@ TEST_F(LoggingTest, LogErrorLevel) {
 }
 
 /**
+ * @test Verifies that DEBUG-level messages appear when LOG_LEVEL=DEBUG.
+ */
+TEST_F(LoggingTest, LogDebugLevel) {
+  CreateLogFile(test_log_file.c_str());
+  config::SetConfig(config::LOG_LEVEL,
+                    static_cast<uint32_t>(LogLevel::LOG_DEBUG));
+
+  Log(LogLevel::LOG_DEBUG, "debug message");
+  CloseLogFile();
+
+  std::ifstream f(test_log_file);
+  std::string c((std::istreambuf_iterator<char>(f)),
+                std::istreambuf_iterator<char>());
+
+  EXPECT_NE(c.find("Debug:"), std::string::npos);
+  EXPECT_NE(c.find("debug message"), std::string::npos);
+}
+
+/**
+ * @test Verifies that DEBUG-level messages are filtered out when
+ * LOG_LEVEL=INFO.
+ */
+TEST_F(LoggingTest, LogDebugFilteredByInfo) {
+  CreateLogFile(test_log_file.c_str());
+  config::SetConfig(config::LOG_LEVEL,
+                    static_cast<uint32_t>(LogLevel::LOG_INFO));
+
+  Log(LogLevel::LOG_DEBUG, "filtered debug");  // Should NOT appear
+  Log(LogLevel::LOG_INFO, "visible info");     // Should appear
+  CloseLogFile();
+
+  std::ifstream f(test_log_file);
+  std::string c((std::istreambuf_iterator<char>(f)),
+                std::istreambuf_iterator<char>());
+
+  EXPECT_EQ(c.find("filtered debug"), std::string::npos);
+  EXPECT_NE(c.find("visible info"), std::string::npos);
+}
+
+/**
  * @test Verifies that LOG_NONE prevents any message from being logged.
  */
 TEST_F(LoggingTest, LogNoneLevelReturnsEarly) {
@@ -191,7 +231,7 @@ TEST_F(LoggingTest, LogMultipleArguments) {
 
 /**
  * @test Validates that log-level filtering works correctly:
- *       - INFO log should be filtered out under LOG_ERROR
+ *       - DEBUG and INFO logs should be filtered out under LOG_ERROR
  *       - ERROR log should appear.
  */
 TEST_F(LoggingTest, LogLevelFiltering) {
@@ -199,15 +239,17 @@ TEST_F(LoggingTest, LogLevelFiltering) {
   config::SetConfig(config::LOG_LEVEL,
                     static_cast<uint32_t>(LogLevel::LOG_ERROR));
 
-  Log(LogLevel::LOG_INFO, "filtered");  // Should NOT appear
-  Log(LogLevel::LOG_ERROR, "visible");  // Should appear
+  Log(LogLevel::LOG_DEBUG, "filtered debug");  // Should NOT appear
+  Log(LogLevel::LOG_INFO, "filtered info");    // Should NOT appear
+  Log(LogLevel::LOG_ERROR, "visible");         // Should appear
   CloseLogFile();
 
   std::ifstream f(test_log_file);
   std::string c((std::istreambuf_iterator<char>(f)),
                 std::istreambuf_iterator<char>());
 
-  EXPECT_EQ(c.find("filtered"), std::string::npos);
+  EXPECT_EQ(c.find("filtered debug"), std::string::npos);
+  EXPECT_EQ(c.find("filtered info"), std::string::npos);
   EXPECT_NE(c.find("visible"), std::string::npos);
 }
 
