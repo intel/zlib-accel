@@ -262,8 +262,8 @@ int EndCompressIGZIP(struct isal_zstream *isal_strm) {
   return Z_OK;
 }
 
-int deflateSetDictionary(z_streamp strm, unsigned char *dict_data,
-                         unsigned int dict_len) {
+int DeflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
+                              unsigned int dict_len) {
   if (!strm || !strm->state || !dict_data || dict_len == 0)
     return Z_STREAM_ERROR;
 
@@ -498,8 +498,8 @@ int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate) {
   return Z_OK;
 }
 
-int inflateSetDictionary(z_streamp strm, unsigned char *dict_data,
-                         unsigned int dict_len) {
+int InflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
+                              unsigned int dict_len) {
   if (!strm || !strm->state || !dict_data || dict_len == 0)
     return Z_STREAM_ERROR;
 

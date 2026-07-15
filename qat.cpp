@@ -99,8 +99,38 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
     return;
   }
 
+  // Map zlib-accel log level to QATzip log level.
+  // qzSetLogLevel is a QATzip global; call it once per process regardless
+  // of how many QAT sessions are created.
+  static std::once_flag qz_log_level_flag;
+  std::call_once(qz_log_level_flag, []() {
+    QzLogLevel_T qzLogLevel = LOG_NONE;
+#ifdef DEBUG_LOG
+    LogLevel logLevel =
+        static_cast<LogLevel>(config::GetConfig(config::LOG_LEVEL));
+    switch (logLevel) {
+      case LogLevel::LOG_NONE:
+        qzLogLevel = LOG_NONE;
+        break;
+      case LogLevel::LOG_ERROR:
+        qzLogLevel = LOG_ERROR;
+        break;
+      case LogLevel::LOG_INFO:
+        qzLogLevel = LOG_INFO;
+        break;
+      case LogLevel::LOG_DEBUG:
+        qzLogLevel = LOG_DEBUG3;
+        break;
+      default:
+        // Unreachable: all LogLevel values are handled above.
+        qzLogLevel = LOG_NONE;
+        break;
+    }
+#endif
+    qzSetLogLevel(qzLogLevel);
+  });
+
   // Initialize QAT hardware
-  qzSetLogLevel(LOG_NONE);
   int status = qzInit(session.get(), 0);
   if (status != QZ_OK && status != QZ_DUPLICATE) {
     Log(LogLevel::LOG_ERROR, "qzInit() failure  Line ", __LINE__, "  session ",
