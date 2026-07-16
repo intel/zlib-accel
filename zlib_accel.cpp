@@ -839,6 +839,7 @@ int ZEXPORT inflateEnd(z_streamp strm) {
 #ifdef USE_IGZIP
     EndUncompressIGZIP(inflate_settings->isal_strm);
 #endif
+    inflate_settings->isal_strm = nullptr;
   }
   inflate_stream_settings.Unset(strm);
   return orig_inflateEnd(strm);
