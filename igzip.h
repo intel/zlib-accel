@@ -58,9 +58,5 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
                     const unsigned long *total_out, bool *end_of_stream);
 int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate);
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate);
-int DeflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
-                              unsigned int dict_len);
-int InflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
-                              unsigned int dict_len);
 // #define Z_DEFAULT_COMPRESSION 6
 #endif

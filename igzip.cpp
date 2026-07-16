@@ -198,7 +198,7 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
       (uint32_t)isal_strm->avail_out, ", bytes_consumed ", *input_length,
       ", bytes_produced ", *output_length, "\n");
 
-  ret = (comp == COMP_OK) ? 0 : 1;
+  ret = (comp == COMP_OK) ? Z_OK : Z_STREAM_ERROR;
 
   if (ret == Z_OK) {
     Log(LogLevel::LOG_INFO, "CompressIGZIP() Line ", __LINE__,
@@ -260,18 +260,6 @@ int EndCompressIGZIP(struct isal_zstream *isal_strm) {
   Log(LogLevel::LOG_INFO, "EndCompressIGZIP() Line ", __LINE__,
       " deflate end\n");
   return Z_OK;
-}
-
-int DeflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
-                              unsigned int dict_len) {
-  if (!strm || !strm->state || !dict_data || dict_len == 0)
-    return Z_STREAM_ERROR;
-
-  deflate_state *s = (deflate_state *)strm->state;
-
-  if (!s || !s->isal_strm) return Z_STREAM_ERROR;
-
-  return isal_deflate_set_dict(s->isal_strm, dict_data, dict_len);
 }
 
 unsigned long crc32(unsigned long crc, const unsigned char *buf,
@@ -496,18 +484,6 @@ int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate) {
   Log(LogLevel::LOG_INFO, "EndUncompressIGZIP() Line ", __LINE__,
       " inflate end\n");
   return Z_OK;
-}
-
-int InflateSetDictionaryIGZIP(z_streamp strm, unsigned char *dict_data,
-                              unsigned int dict_len) {
-  if (!strm || !strm->state || !dict_data || dict_len == 0)
-    return Z_STREAM_ERROR;
-
-  const inflate_state2 *s = (inflate_state2 *)strm->state;
-
-  if (!s || !s->isal_strm_inflate) return Z_STREAM_ERROR;
-
-  return isal_inflate_set_dict(s->isal_strm_inflate, dict_data, dict_len);
 }
 
 void ResetCompressIGZIP(struct isal_zstream *isal_strm) {

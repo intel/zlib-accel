@@ -508,7 +508,7 @@ int ZEXPORT deflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
-  if (deflate_settings->isal_strm != nullptr) {
+  if (deflate_settings != nullptr && deflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
     EndCompressIGZIP(deflate_settings->isal_strm);
 #endif
@@ -835,7 +835,7 @@ int ZEXPORT inflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
-  if (inflate_settings->isal_strm != nullptr) {
+  if (inflate_settings != nullptr && inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
     EndUncompressIGZIP(inflate_settings->isal_strm);
 #endif
@@ -851,11 +851,11 @@ int ZEXPORT inflateReset(z_streamp strm) {
   int ret = orig_inflateReset(strm);
   if (inflate_settings != nullptr) {
     SetInflatePath(inflate_settings, strm, UNDEFINED, "inflateReset");
-  }
-  if (inflate_settings->isal_strm != nullptr) {
+    if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
-    ResetUncompressIGZIP(inflate_settings->isal_strm);
+      ResetUncompressIGZIP(inflate_settings->isal_strm);
 #endif
+    }
   }
 
   return ret;
