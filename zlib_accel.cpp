@@ -512,6 +512,7 @@ int ZEXPORT deflateEnd(z_streamp strm) {
 #ifdef USE_IGZIP
     EndCompressIGZIP(deflate_settings->isal_strm);
 #endif
+    deflate_settings->isal_strm = nullptr;
   }
   deflate_stream_settings.Unset(strm);
   return orig_deflateEnd(strm);
