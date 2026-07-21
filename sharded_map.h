@@ -20,14 +20,11 @@
 
 #include "config/config.h"
 
-using namespace config;
-
 template <typename Key, typename Value>
 class ShardedMap {
  public:
-  ShardedMap(void) {
-    const auto num_shards = configs[MAP_SHARDS];
-    pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards);
+  ShardedMap(void) : num_shards_(config::configs[config::MAP_SHARDS]) {
+    pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
   }
 
   ~ShardedMap(void) {
@@ -109,12 +106,12 @@ class ShardedMap {
 #endif
   };
   std::unique_ptr<PaddedMapType[]> pd_map_arr_;
+  const unsigned int num_shards_;
 
   // Number of map shards must be a power of 2
   auto GetShard(const Key& key) const -> unsigned int {
-    const auto num_shards = configs[MAP_SHARDS];
-    assert((num_shards & (num_shards - 1)) == 0);
-    const auto shard_bits = __builtin_ctz(num_shards);
+    assert((num_shards_ & (num_shards_ - 1)) == 0);
+    const auto shard_bits = __builtin_ctz(num_shards_);
     const auto hash = static_cast<uint64_t>(std::hash<Key>{}(key));
     const auto dist_hash = hash * FIBONACCI_MULTIPLIER;
     const auto top_bits = 64 - shard_bits;
