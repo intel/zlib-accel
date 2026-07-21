@@ -13,8 +13,6 @@
 #include "config/config.h"
 #include "utils.h"
 
-using namespace config;
-
 // Log verbosity levels. 0 = silent; higher values = more verbose.
 // Matches QATzip's QzLogLevel_T convention.
 enum class LogLevel {

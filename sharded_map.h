@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <cassert>
 #include <functional>
 #include <string>
 #include <utility>
@@ -110,7 +109,6 @@ class ShardedMap {
 
   // Number of map shards must be a power of 2
   auto GetShard(const Key& key) const -> unsigned int {
-    assert((num_shards_ & (num_shards_ - 1)) == 0);
     const auto shard_bits = __builtin_ctz(num_shards_);
     const auto hash = static_cast<uint64_t>(std::hash<Key>{}(key));
     const auto dist_hash = hash * FIBONACCI_MULTIPLIER;
