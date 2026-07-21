@@ -5,10 +5,18 @@
 
 #include <cassert>
 #include <functional>
-#include <memory>
-#include <oneapi/tbb/concurrent_hash_map.h>
 #include <string>
 #include <utility>
+
+#ifdef USE_TBB
+  // tbb::concurrent_hash_map implementation
+  #include <memory>
+  #include <tbb/concurrent_hash_map.h>  // portable: old TBB + oneTBB
+#else
+  // stdlib implementation
+  #include <shared_mutex>
+  #include <unordered_map>
+#endif
 
 #include "config/config.h"
 
@@ -19,37 +27,54 @@ class ShardedMap {
  public:
   ShardedMap(void) {
     const auto num_shards = configs[MAP_SHARDS];
-    pd_map_arr = std::make_unique<PaddedMapType[]>(num_shards);
+    pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards);
   }
 
   ~ShardedMap(void) {
-    pd_map_arr.reset();
+    pd_map_arr_.reset();
   }
 
   auto Get(const Key& key) -> decltype(std::declval<Value>().get()) {
     const auto shard = GetShard(key);
+#ifdef USE_TBB
     typename MapType::const_accessor acc;
-    if (!pd_map_arr[shard].map.find(acc, key)) {
+    if (!pd_map_arr_[shard].map.find(acc, key)) {
       return nullptr;
     }
     return acc->second.get();
+#else
+    std::shared_lock lock(pd_map_arr_[shard].mutex);
+    auto it = pd_map_arr_[shard].map.find(key);
+    if (it == pd_map_arr_[shard].map.end()) {
+      return nullptr;
+    }
+    return it->second.get();
+#endif
   }
 
   void Set(const Key& key, Value&& value) {
     const auto shard = GetShard(key);
+#ifdef USE_TBB
     typename MapType::accessor acc;
-    if (!pd_map_arr[shard].map.find(acc, key)) {
+    if (!pd_map_arr_[shard].map.find(acc, key)) {
       // Key doesn't exist - add entry first
-      pd_map_arr[shard].map.insert(acc, key);
+      pd_map_arr_[shard].map.insert(acc, key);
     }
 
     // Set or update value associated with key
     acc->second = std::move(value);
+#else
+    std::unique_lock lock(pd_map_arr_[shard].mutex);
+    pd_map_arr_[shard].map[key] = std::move(value);
+#endif
   }
 
   void Unset(const Key& key) {
     const auto shard = GetShard(key);
-    pd_map_arr[shard].map.erase(key);
+#ifndef USE_TBB
+    std::unique_lock lock(pd_map_arr_[shard].mutex);
+#endif
+    pd_map_arr_[shard].map.erase(key);
   }
 
  private:
@@ -61,6 +86,7 @@ class ShardedMap {
   // multiplied by hash and then shifted right by top bits to get shard index
   static constexpr std::size_t FIBONACCI_MULTIPLIER = 11400714819323198485ull;
 
+#ifdef USE_TBB
   struct HashCompare {
     static auto hash(const Key& key) -> std::size_t {
       return std::hash<Key>{}(key);
@@ -71,11 +97,18 @@ class ShardedMap {
     }
   };
 
-  using MapType = oneapi::tbb::concurrent_hash_map<Key, Value, HashCompare>;
+  using MapType = tbb::concurrent_hash_map<Key, Value, HashCompare>;
+#else
+  using MapType = std::unordered_map<Key, Value>;
+#endif
+
   struct alignas(CACHE_LINE_SIZE) PaddedMapType {
     MapType map;
+#ifndef USE_TBB
+    mutable std::shared_mutex mutex;
+#endif
   };
-  std::unique_ptr<PaddedMapType[]> pd_map_arr;
+  std::unique_ptr<PaddedMapType[]> pd_map_arr_;
 
   // Number of map shards must be a power of 2
   auto GetShard(const Key& key) const -> unsigned int {

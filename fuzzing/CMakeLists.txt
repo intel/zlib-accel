@@ -14,9 +14,6 @@ link_libraries(zlib-accel)
 
 include(../common.cmake)
 
-find_package(TBB REQUIRED COMPONENTS tbb)
-link_libraries(TBB::tbb)
-
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -fsanitize=address,fuzzer")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fsanitize=address,fuzzer")
 

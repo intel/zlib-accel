@@ -10,9 +10,6 @@ link_libraries(zlib-accel)
 
 include(../common.cmake)
 
-find_package(TBB REQUIRED COMPONENTS tbb)
-link_libraries(TBB::tbb)
-
 find_package(GTest REQUIRED)
 link_libraries(gtest pthread)
 
