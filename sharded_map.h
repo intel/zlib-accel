@@ -13,6 +13,7 @@
 #include <tbb/concurrent_hash_map.h>  // portable: old TBB + oneTBB
 #else
 // stdlib implementation
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #endif
@@ -22,7 +23,9 @@
 template <typename Key, typename Value>
 class ShardedMap {
  public:
-  ShardedMap() : num_shards_(config::configs[config::MAP_SHARDS]) {
+  // Use GetConfig() rather than configs[] directly: configs has hidden
+  // visibility and is not accessible from external translation units under LTO.
+  ShardedMap() : num_shards_(config::GetConfig(config::MAP_SHARDS)) {
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
   }
 
