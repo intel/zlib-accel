@@ -14,7 +14,7 @@ namespace config {
 
 std::string log_file = "";
 
-// default config values initialization
+// default config values at initialization
 uint32_t configs[CONFIG_MAX] = {
     1,    /*use_qat_compress*/
     1,    /*use_qat_uncompress*/
