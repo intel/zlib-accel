@@ -69,13 +69,15 @@ bool IsIGZIPDeflateFinished(const struct isal_zstream *stream) {
 }
 
 struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
-  Log(LogLevel::LOG_INFO, "InitCompressIGZIP() initializing deflate with level ", level, ", windowBits ", windowBits,
-      "\n");
+  Log(LogLevel::LOG_INFO,
+      "InitCompressIGZIP() initializing deflate with level ", level,
+      ", windowBits ", windowBits, "\n");
 
   struct isal_zstream *isal_strm =
       (struct isal_zstream *)malloc(sizeof(struct isal_zstream));
   if (!isal_strm) {
-    Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() memory allocation for isal_zstream failed\n");
+    Log(LogLevel::LOG_ERROR,
+        "InitCompressIGZIP() memory allocation for isal_zstream failed\n");
     return nullptr;
   }
 
@@ -106,7 +108,8 @@ struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
 
   if (!isal_strm->level_buf) {
     free(isal_strm);
-    Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() memory allocation for level_buf failed\n");
+    Log(LogLevel::LOG_ERROR,
+        "InitCompressIGZIP() memory allocation for level_buf failed\n");
     return nullptr;
   }
 
@@ -158,11 +161,11 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
       return -1;
   }
 
-  Log(LogLevel::LOG_INFO, "CompressIGZIP() gzip_flag ",
-      isal_strm->gzip_flag, ", hist_bits ", isal_strm->hist_bits, ", flush ",
-      isal_strm->flush, ", level ", isal_strm->level, ", avail_in ",
-      isal_strm->avail_in, ", avail_out ", (uint32_t)isal_strm->avail_out,
-      ", total_out ", (uint32_t)isal_strm->total_out, ", total_in ",
+  Log(LogLevel::LOG_INFO, "CompressIGZIP() gzip_flag ", isal_strm->gzip_flag,
+      ", hist_bits ", isal_strm->hist_bits, ", flush ", isal_strm->flush,
+      ", level ", isal_strm->level, ", avail_in ", isal_strm->avail_in,
+      ", avail_out ", (uint32_t)isal_strm->avail_out, ", total_out ",
+      (uint32_t)isal_strm->total_out, ", total_in ",
       (uint32_t)isal_strm->total_in, "\n");
 
   // ISA-L always emits sync bytes on SYNC_FLUSH regardless of pending data.
@@ -184,18 +187,22 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
   *output_length = original_avail_out - isal_strm->avail_out;
   *input_length = original_avail_in - isal_strm->avail_in;
 
-  Log(LogLevel::LOG_INFO, "CompressIGZIP() after isal_deflate: avail_in ", isal_strm->avail_in, ", avail_out ",
-      (uint32_t)isal_strm->avail_out, ", bytes_consumed ", *input_length,
-      ", bytes_produced ", *output_length, "\n");
+  Log(LogLevel::LOG_INFO, "CompressIGZIP() after isal_deflate: avail_in ",
+      isal_strm->avail_in, ", avail_out ", (uint32_t)isal_strm->avail_out,
+      ", bytes_consumed ", *input_length, ", bytes_produced ", *output_length,
+      "\n");
 
   ret = (comp == COMP_OK) ? Z_OK : Z_STREAM_ERROR;
 
   if (ret == Z_OK) {
-    Log(LogLevel::LOG_INFO, "CompressIGZIP() deflate finished successfully Z_OK\n");
+    Log(LogLevel::LOG_INFO,
+        "CompressIGZIP() deflate finished successfully Z_OK\n");
   } else if (ret == Z_STREAM_END) {
-    Log(LogLevel::LOG_INFO, "CompressIGZIP() deflate finished successfully Z_STREAM_END\n");
+    Log(LogLevel::LOG_INFO,
+        "CompressIGZIP() deflate finished successfully Z_STREAM_END\n");
   } else {
-    Log(LogLevel::LOG_ERROR, "CompressIGZIP() deflate finished with error code ", ret, "\n");
+    Log(LogLevel::LOG_ERROR,
+        "CompressIGZIP() deflate finished with error code ", ret, "\n");
     switch (comp) {
       case INVALID_FLUSH:
         Log(LogLevel::LOG_ERROR, "CompressIGZIP() invalid flush\n");
@@ -244,11 +251,14 @@ struct inflate_state *InitUncompressIGZIP(int windowBits) {
   struct inflate_state *isal_strm_inflate =
       (struct inflate_state *)malloc(sizeof(struct inflate_state));
   if (!isal_strm_inflate) {
-    Log(LogLevel::LOG_ERROR, "InitUncompressIGZIP() memory allocation for inflate_state failed\n");
+    Log(LogLevel::LOG_ERROR,
+        "InitUncompressIGZIP() memory allocation for inflate_state failed\n");
     return nullptr;
   }
 
-  Log(LogLevel::LOG_INFO, "InitUncompressIGZIP() initializing inflate with windowBits ", windowBits, "\n");
+  Log(LogLevel::LOG_INFO,
+      "InitUncompressIGZIP() initializing inflate with windowBits ", windowBits,
+      "\n");
 
   /* Setup ISA-L decompression context */
   isal_inflate_init(isal_strm_inflate);
@@ -313,7 +323,9 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
   if (*isal_strm_inflate == nullptr) {
     *isal_strm_inflate = InitUncompressIGZIP(window_bits);
     if (*isal_strm_inflate == nullptr) {
-      Log(LogLevel::LOG_ERROR, "IGZIPRunInflateAndSelectPathAction() failed to initialize igzip inflate stream\n");
+      Log(LogLevel::LOG_ERROR,
+          "IGZIPRunInflateAndSelectPathAction() failed to initialize igzip "
+          "inflate stream\n");
       *ret = Z_DATA_ERROR;
       return IGZIP_INFLATE_PATH_NONE;
     }
@@ -366,9 +378,9 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
   if (isal_strm_inflate->avail_in <= original_avail_in) {
     consumed_before_adjust = original_avail_in - isal_strm_inflate->avail_in;
   } else {
-    Log(LogLevel::LOG_ERROR, "UncompressIGZIP() invalid avail_in ", isal_strm_inflate->avail_in,
-        " greater than original_avail_in ", original_avail_in,
-        ", clamping consumed bytes to 0\n");
+    Log(LogLevel::LOG_ERROR, "UncompressIGZIP() invalid avail_in ",
+        isal_strm_inflate->avail_in, " greater than original_avail_in ",
+        original_avail_in, ", clamping consumed bytes to 0\n");
     consumed_before_adjust = 0;
   }
 
@@ -385,7 +397,8 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
     *end_of_stream = (isal_strm_inflate->block_state == ISAL_BLOCK_FINISH);
   }
 
-  int ret = Z_DATA_ERROR;  // default: any unhandled ISA-L error maps to Z_DATA_ERROR
+  int ret =
+      Z_DATA_ERROR;  // default: any unhandled ISA-L error maps to Z_DATA_ERROR
   if (decomp == ISAL_DECOMP_OK || decomp == ISAL_END_INPUT) {
     ret = 0;
   } else if (decomp == ISAL_NEED_DICT) {
@@ -393,32 +406,43 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
   }
 
   if (ret == Z_OK) {
-    Log(LogLevel::LOG_INFO, "UncompressIGZIP() inflate finished successfully Z_OK\n");
+    Log(LogLevel::LOG_INFO,
+        "UncompressIGZIP() inflate finished successfully Z_OK\n");
   } else if (ret == Z_STREAM_END) {
-    Log(LogLevel::LOG_INFO, "UncompressIGZIP() inflate finished with Z_STREAM_END\n");
+    Log(LogLevel::LOG_INFO,
+        "UncompressIGZIP() inflate finished with Z_STREAM_END\n");
   } else {
-    Log(LogLevel::LOG_ERROR, "UncompressIGZIP() inflate finished with error code ", ret, "\n");
+    Log(LogLevel::LOG_ERROR,
+        "UncompressIGZIP() inflate finished with error code ", ret, "\n");
     switch (decomp) {
       case ISAL_INVALID_BLOCK:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - Invalid block\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - Invalid block\n");
         break;
       case ISAL_INVALID_SYMBOL:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - Invalid symbol\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - Invalid symbol\n");
         break;
       case ISAL_INVALID_LOOKBACK:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - Invalid lookback\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - Invalid lookback\n");
         break;
       case ISAL_END_INPUT:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - End of input reached unexpectedly\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - End of input reached "
+            "unexpectedly\n");
         break;
       case ISAL_UNSUPPORTED_METHOD:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - Unsupported method\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - Unsupported method\n");
         break;
       case ISAL_NEED_DICT:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error - Need dictionary\n");
+        Log(LogLevel::LOG_ERROR,
+            "UncompressIGZIP() ISA-L error - Need dictionary\n");
         break;
       default:
-        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error code ", decomp, "\n");
+        Log(LogLevel::LOG_ERROR, "UncompressIGZIP() ISA-L error code ", decomp,
+            "\n");
         break;
     }
   }
@@ -449,7 +473,8 @@ void ResetCompressIGZIP(struct isal_zstream *isal_strm) {
 
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate) {
   if (!isal_strm_inflate) {
-    Log(LogLevel::LOG_ERROR, "ResetUncompressIGZIP() isal_strm_inflate is NULL\n");
+    Log(LogLevel::LOG_ERROR,
+        "ResetUncompressIGZIP() isal_strm_inflate is NULL\n");
     return Z_STREAM_ERROR;
   }
 
