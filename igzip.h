@@ -7,20 +7,6 @@
 #include <igzip_lib.h>
 #include <zlib.h>
 
-typedef struct internal_state2 {
-  z_streamp strm;
-  int level;
-  int w_bits;
-  struct inflate_state *isal_strm_inflate;
-} inflate_state2;
-
-typedef struct internal_state {
-  z_streamp strm;
-  int level;
-  int w_bits;
-  struct isal_zstream *isal_strm;
-} deflate_state;
-
 struct isal_zstream *InitCompressIGZIP(int level, int windowBits);
 int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
                   const uint8_t *input, uint32_t *input_length, uint8_t *output,
@@ -58,5 +44,4 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
                     const unsigned long *total_out, bool *end_of_stream);
 int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate);
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate);
-// #define Z_DEFAULT_COMPRESSION 6
 #endif

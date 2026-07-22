@@ -398,7 +398,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
       if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->method = 0;
         deflate_settings->isal_strm = InitCompressIGZIP(
             deflate_settings->level, deflate_settings->window_bits);
       }
@@ -425,7 +424,6 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       input_len = strm->avail_in;
       output_len = strm->avail_out;
       if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->method = 0;
         deflate_settings->isal_strm = InitCompressIGZIP(
             deflate_settings->level, deflate_settings->window_bits);
       }
@@ -863,6 +861,11 @@ int ZEXPORT inflateReset(z_streamp strm) {
   return ret;
 }
 
+// Note: compress2 / uncompress2 are one-shot stateless paths. They do NOT
+// honor IGZIP_FALLBACK: if the preferred accelerator fails, control falls
+// directly to software zlib, bypassing IGZIP even when IGZIP_FALLBACK=1.
+// This diverges from the streaming deflate()/inflate() paths intentionally —
+// stateless paths have no retry loop and the added complexity is not warranted.
 int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                       uLong sourceLen, int level) {
   Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__, ", sourceLen ",
@@ -924,6 +927,9 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                           &input_len, dest, &output_len, &total_in, &total_out);
       EndCompressIGZIP(isal_strm);
       if (ret == 0 && input_len != sourceLen) {
+        // compress2 is one-shot: if ISA-L consumed less than sourceLen,
+        // the output is incomplete. Use input_len residual as the indicator
+        // (mirrors IAA/QAT stateless behavior).
         ret = 1;
       }
     }
@@ -1026,6 +1032,12 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                             &end_of_stream);
       EndUncompressIGZIP(isal_strm);
       if (ret == 0 && !end_of_stream) {
+        // uncompress2 is one-shot: if ISA-L did not reach end-of-stream,
+        // the output is incomplete. end_of_stream is used instead of
+        // input_len residual because IGZIP may consume all bytes without
+        // seeing the zlib trailer, so checking consumed bytes alone is
+        // insufficient. Both checks test the same class of failure (partial
+        // decompression) by the most reliable indicator for each path.
         ret = 1;
       }
     }
