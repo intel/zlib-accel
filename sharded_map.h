@@ -4,17 +4,17 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 
 #ifdef USE_TBB
-  // tbb::concurrent_hash_map implementation
-  #include <memory>
-  #include <tbb/concurrent_hash_map.h>  // portable: old TBB + oneTBB
+// tbb::concurrent_hash_map implementation
+#include <tbb/concurrent_hash_map.h>  // portable: old TBB + oneTBB
 #else
-  // stdlib implementation
-  #include <shared_mutex>
-  #include <unordered_map>
+// stdlib implementation
+#include <shared_mutex>
+#include <unordered_map>
 #endif
 
 #include "config/config.h"
@@ -22,12 +22,8 @@
 template <typename Key, typename Value>
 class ShardedMap {
  public:
-  ShardedMap(void) : num_shards_(config::configs[config::MAP_SHARDS]) {
+  ShardedMap() : num_shards_(config::configs[config::MAP_SHARDS]) {
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
-  }
-
-  ~ShardedMap(void) {
-    pd_map_arr_.reset();
   }
 
   auto Get(const Key& key) -> decltype(std::declval<Value>().get()) {

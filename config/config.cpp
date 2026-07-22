@@ -7,8 +7,8 @@
 #include <filesystem>
 #include <string>
 
-#include "config_reader.h"
 #include "../logging.h"
+#include "config_reader.h"
 
 namespace config {
 
