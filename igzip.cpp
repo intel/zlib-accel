@@ -197,9 +197,6 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
   if (ret == Z_OK) {
     Log(LogLevel::LOG_INFO,
         "CompressIGZIP() deflate finished successfully Z_OK\n");
-  } else if (ret == Z_STREAM_END) {
-    Log(LogLevel::LOG_INFO,
-        "CompressIGZIP() deflate finished successfully Z_STREAM_END\n");
   } else {
     Log(LogLevel::LOG_ERROR,
         "CompressIGZIP() deflate finished with error code ", ret, "\n");
@@ -271,11 +268,12 @@ struct inflate_state *InitUncompressIGZIP(int windowBits) {
   return isal_strm_inflate;
 }
 
-IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
-    z_streamp strm, struct inflate_state *isal_strm_inflate, int *ret) {
+void IGZIPHandleActiveStreamNoInput(z_streamp strm,
+                                    struct inflate_state *isal_strm_inflate,
+                                    int *ret) {
   // Caller guarantees strm->avail_in == 0 before calling this function.
   if (strm == nullptr || isal_strm_inflate == nullptr || ret == nullptr) {
-    return IGZIP_NO_INPUT_NOT_HANDLED;
+    return;
   }
 
   uint32_t input_len = 0;
@@ -290,7 +288,7 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
     strm->next_out += output_len;
     strm->avail_out -= output_len;
     // This is the only site that updates total_out for the avail_in==0 path.
-    // The caller returns immediately on IGZIP_NO_INPUT_RETURN, so the main
+    // The caller returns immediately after this call, so the main
     // inflate() update block is never reached — no double-counting.
     strm->total_out += output_len;
     if (end_of_stream) {
@@ -300,11 +298,10 @@ IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
     } else {
       *ret = Z_BUF_ERROR;
     }
-    return IGZIP_NO_INPUT_RETURN;
+    return;
   }
 
   *ret = Z_BUF_ERROR;
-  return IGZIP_NO_INPUT_RETURN;
 }
 
 IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
@@ -408,9 +405,6 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
   if (ret == Z_OK) {
     Log(LogLevel::LOG_INFO,
         "UncompressIGZIP() inflate finished successfully Z_OK\n");
-  } else if (ret == Z_STREAM_END) {
-    Log(LogLevel::LOG_INFO,
-        "UncompressIGZIP() inflate finished with Z_STREAM_END\n");
   } else {
     Log(LogLevel::LOG_ERROR,
         "UncompressIGZIP() inflate finished with error code ", ret, "\n");

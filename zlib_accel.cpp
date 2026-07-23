@@ -401,16 +401,18 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         deflate_settings->isal_strm = InitCompressIGZIP(
             deflate_settings->level, deflate_settings->window_bits);
       }
-      in_call = true;
-      ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                          &input_len, strm->next_out, &output_len,
-                          &strm->total_in, &strm->total_out);
-      SetDeflatePath(deflate_settings, strm, IGZIP,
-                     "selected IGZIP accelerator");
-      in_call = false;
+      if (deflate_settings->isal_strm != nullptr) {
+        in_call = true;
+        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
+                            &input_len, strm->next_out, &output_len,
+                            &strm->total_in, &strm->total_out);
+        SetDeflatePath(deflate_settings, strm, IGZIP,
+                       "selected IGZIP accelerator");
+        in_call = false;
 
-      INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-      INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+      }
 #endif
     }
 
@@ -427,17 +429,19 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         deflate_settings->isal_strm = InitCompressIGZIP(
             deflate_settings->level, deflate_settings->window_bits);
       }
-      in_call = true;
-      ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                          &input_len, strm->next_out, &output_len,
-                          &strm->total_in, &strm->total_out);
-      SetDeflatePath(deflate_settings, strm, IGZIP,
-                     path_selected == QAT ? "QAT failed, IGZIP fallback"
-                                          : "IAA failed, IGZIP fallback");
-      in_call = false;
-      path_selected = IGZIP;  // use IGZIP return-code semantics below
-      INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-      INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+      if (deflate_settings->isal_strm != nullptr) {
+        in_call = true;
+        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
+                            &input_len, strm->next_out, &output_len,
+                            &strm->total_in, &strm->total_out);
+        SetDeflatePath(deflate_settings, strm, IGZIP,
+                       path_selected == QAT ? "QAT failed, IGZIP fallback"
+                                            : "IAA failed, IGZIP fallback");
+        in_call = false;
+        path_selected = IGZIP;  // use IGZIP return-code semantics below
+        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+      }
     }
 #endif  // USE_IGZIP accelerator fallback
 
@@ -603,13 +607,9 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // state before reporting Z_BUF_ERROR.
   if (!in_call && igzip_stream_active && strm->avail_in == 0) {
     in_call = true;
-    IGZIPNoInputAction action =
-        IGZIPHandleActiveStreamNoInput(strm, inflate_settings->isal_strm, &ret);
+    IGZIPHandleActiveStreamNoInput(strm, inflate_settings->isal_strm, &ret);
     in_call = false;
-
-    if (action == IGZIP_NO_INPUT_RETURN) {
-      return ret;
-    }
+    return ret;
   }
 #endif
 
@@ -925,13 +925,14 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
       unsigned long total_out = 0;
       ret = CompressIGZIP(isal_strm, Z_FINISH, const_cast<uint8_t*>(source),
                           &input_len, dest, &output_len, &total_in, &total_out);
-      EndCompressIGZIP(isal_strm);
-      if (ret == 0 && input_len != sourceLen) {
-        // compress2 is one-shot: if ISA-L consumed less than sourceLen,
-        // the output is incomplete. Use input_len residual as the indicator
-        // (mirrors IAA/QAT stateless behavior).
+      if (ret == 0 && !IsIGZIPDeflateFinished(isal_strm)) {
+        // compress2 is one-shot: if the stream did not reach terminal state
+        // (ZSTATE_END), the output is incomplete (e.g. trailer truncated by a
+        // too-small destLen, or not all input consumed). Mirrors the
+        // !end_of_stream check in the uncompress2 IGZIP path.
         ret = 1;
       }
+      EndCompressIGZIP(isal_strm);
     }
     in_call = false;
 #endif
@@ -1334,8 +1335,8 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
       ret = CompressIGZIP(isal_strm, Z_FINISH, input, input_length, output,
                           output_length, &total_in, &total_out);
       EndCompressIGZIP(isal_strm);
+      gz->path = IGZIP;
     }
-    gz->path = IGZIP;
     in_call = false;
 #endif
   }
@@ -1409,8 +1410,8 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
           UncompressIGZIP(isal_strm, input, input_length, output, output_length,
                           &total_in, &total_out, end_of_stream);
       EndUncompressIGZIP(isal_strm);
+      gz->path = IGZIP;
     }
-    gz->path = IGZIP;
     in_call = false;
 #endif
   }

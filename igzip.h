@@ -13,10 +13,6 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
                   uint32_t *output_length, const unsigned long *total_in,
                   const unsigned long *total_out);
 bool IsIGZIPDeflateFinished(const struct isal_zstream *stream);
-enum IGZIPNoInputAction {
-  IGZIP_NO_INPUT_NOT_HANDLED,
-  IGZIP_NO_INPUT_RETURN,
-};
 
 enum IGZIPInflatePathAction {
   IGZIP_INFLATE_PATH_NONE,
@@ -25,8 +21,9 @@ enum IGZIPInflatePathAction {
   IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR,
 };
 
-IGZIPNoInputAction IGZIPHandleActiveStreamNoInput(
-    z_streamp strm, struct inflate_state *isal_strm_inflate, int *ret);
+void IGZIPHandleActiveStreamNoInput(z_streamp strm,
+                                    struct inflate_state *isal_strm_inflate,
+                                    int *ret);
 
 IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
     z_streamp strm, struct inflate_state **isal_strm_inflate, int window_bits,

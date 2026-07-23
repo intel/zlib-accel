@@ -2425,6 +2425,33 @@ TEST(IGZIPDeflateRegressionTest, SyncFlushWithInputMustStayOnIGZIPPath) {
   inflateEnd(&dstream);
 }
 
+#ifdef USE_IGZIP
+TEST(IGZIPDeflateRegressionTest, Compress2MustDetectTruncatedOutput) {
+  // Regression: compress2() returned Z_OK on a truncated stream when destLen
+  // was too small to hold the ISA-L trailer.  ISA-L consumes all input
+  // (COMP_OK) but leaves the stream in a non-terminal state; the old
+  // input_len != sourceLen check missed this case.
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+
+  const std::vector<unsigned char> source(64, 'A');
+
+  // Determine the true compressed size with an adequately sized buffer.
+  uLongf correct_destLen = compressBound(source.size());
+  std::vector<unsigned char> correct_dest(correct_destLen);
+  ASSERT_EQ(compress2(correct_dest.data(), &correct_destLen, source.data(),
+                      source.size(), Z_DEFAULT_COMPRESSION),
+            Z_OK);
+
+  // Call again with a buffer one byte too small for the complete output.
+  uLongf small_destLen = correct_destLen - 1;
+  std::vector<unsigned char> small_dest(small_destLen);
+  int ret = compress2(small_dest.data(), &small_destLen, source.data(),
+                      source.size(), Z_DEFAULT_COMPRESSION);
+  // Must NOT silently succeed on truncated output.
+  EXPECT_NE(ret, Z_OK);
+}
+#endif  // USE_IGZIP
+
 TEST(IGZIPInflateRegressionTest,
      NeedDictFromIGZIPMustFallbackToZlibOnFirstInflateCall) {
   SetCompressPath(ZLIB, false, false, false);
