@@ -227,8 +227,8 @@ log_file
 - If specified, store log messages in the file. If not specified, log messages are printed to stdout.
 
 map_shards
-- Values: 1-65536. Default 64
-- Sets the size of every thread safe concurrent hash map array used by different streams.
+- Values: 2-65536. Default 64
+- Sets the number of shards in the thread-safe concurrent hash map. Each shard holds an independent map instance.
 - It must be a power of two, so Fibonacci hashing can be used to calculate uniformly distributed shard indexes.
 
 ## Tested Applications/Use Cases

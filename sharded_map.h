@@ -25,7 +25,17 @@ class ShardedMap {
  public:
   // Use GetConfig() rather than configs[] directly: configs has hidden
   // visibility and is not accessible from external translation units under LTO.
+  //
+  // For the three global registry instances, LTO causes the constructor to run
+  // before init_zlib_accel loads the config file, so num_shards_ is
+  // initialised with the default value. InitStreamRegistries() calls Init()
+  // afterwards to re-allocate with the configured shard count.
   ShardedMap() : num_shards_(config::GetConfig(config::MAP_SHARDS)) {
+    pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
+  }
+
+  void Init() {
+    num_shards_ = config::GetConfig(config::MAP_SHARDS);
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
   }
 
@@ -99,7 +109,7 @@ class ShardedMap {
 #endif
   };
   std::unique_ptr<PaddedMapType[]> pd_map_arr_;
-  const unsigned int num_shards_;
+  unsigned int num_shards_;
 
   // Number of map shards must be a power of 2
   auto GetShard(const Key& key) const -> unsigned int {
