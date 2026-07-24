@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <string>
 
-#include "../logging.h"
 #include "config_reader.h"
 
 namespace config {
@@ -68,9 +67,10 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   ConfigReader config_reader;
   config_reader.ParseFile(file_path);
 
-  auto trySetConfig = [&](ConfigOption opt, uint32_t max, uint32_t min) {
+  auto trySetConfig = [&](ConfigOption opt, uint32_t max, uint32_t min,
+                          std::function<bool(uint32_t)> validator = nullptr) {
     uint32_t value;
-    if (config_reader.GetValue(config_names[opt], value, max, min)) {
+    if (config_reader.GetValue(config_names[opt], value, max, min, validator)) {
       configs[opt] = value;
     }
   };
@@ -90,13 +90,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(IGNORE_ZLIB_DICTIONARY, 1, 0);
   trySetConfig(LOG_LEVEL, 3, 0);
   trySetConfig(LOG_STATS_SAMPLES, UINT32_MAX, 0);
-  trySetConfig(MAP_SHARDS, 65536, 1);
-  if (configs[MAP_SHARDS] & (configs[MAP_SHARDS] - 1)) {
-    Log(LogLevel::LOG_ERROR, "config::LoadConfigFile Line ", __LINE__,
-        ", map_shards must be a power of 2, ignoring value ",
-        configs[MAP_SHARDS], ", will not proceed further\n");
-    return false;
-  }
+  trySetConfig(MAP_SHARDS, 65536, 2,
+               [](uint32_t v) { return (v & (v - 1)) == 0; });
   config_reader.GetValue("log_file", log_file);
   file_content.append(config_reader.DumpValues());
 

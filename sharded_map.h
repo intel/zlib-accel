@@ -51,12 +51,7 @@ class ShardedMap {
     const auto shard = GetShard(key);
 #ifdef USE_TBB
     typename MapType::accessor acc;
-    if (!pd_map_arr_[shard].map.find(acc, key)) {
-      // Key doesn't exist - add entry first
-      pd_map_arr_[shard].map.insert(acc, key);
-    }
-
-    // Set or update value associated with key
+    pd_map_arr_[shard].map.insert(acc, key);
     acc->second = std::move(value);
 #else
     std::unique_lock lock(pd_map_arr_[shard].mutex);
@@ -79,7 +74,7 @@ class ShardedMap {
   // Fibonacci hash constant: value is (2^64 / phi) to spread bits uniformly,
   // where phi is golden ratio and 64 is machine word length - constant is
   // multiplied by hash and then shifted right by top bits to get shard index
-  static constexpr std::size_t FIBONACCI_MULTIPLIER = 11400714819323198485ull;
+  static constexpr uint64_t FIBONACCI_MULTIPLIER = 11400714819323198485ull;
 
 #ifdef USE_TBB
   struct HashCompare {

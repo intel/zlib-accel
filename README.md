@@ -14,7 +14,7 @@ This shim is not a general-purpose replacement for zlib, and it is able to offlo
 
 In general, the shim is able to offload zlib calls that complete compression/decompression of one deflate stream in one call. "Streaming" compression/decompression (where compression/decompression is done incrementally) are not currently supported. If the shim is not able to offload a job to an accelerator, it will fall back to zlib, ensuring the application still works correctly.
 
-The shim has only been tested on Linux. Additionally, the [Intel® oneTBB](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onetbb.html) performance library is required and can be acquired by installing the [Intel® oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit-download.html).
+The shim has only been tested on Linux. When building with hardware acceleration enabled (`USE_QAT`, `USE_IAA`, or `USE_IGZIP`), the [Intel® oneTBB](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onetbb.html) performance library is required and can be acquired by installing the [Intel® oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit-download.html).
 
 
 ### Hardware Acceleration
