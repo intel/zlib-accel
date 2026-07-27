@@ -1292,6 +1292,33 @@ TEST_F(ConfigLoaderTest, SymbolicLinkTest) {
   std::filesystem::remove(target_path);
 }
 
+TEST_F(ConfigLoaderTest, MapShardsValidPowerOfTwo) {
+  std::string file_content;
+  const char* config_path = "/tmp/map_shards_valid_config";
+  std::ofstream config_file(config_path);
+  config_file << "map_shards=128\n";
+  config_file.close();
+  EXPECT_TRUE(LoadConfigFile(file_content, config_path));
+  EXPECT_EQ(GetConfig(MAP_SHARDS), 128u);
+  std::remove(config_path);
+  LoadConfigFile(file_content);
+}
+
+TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
+  std::string file_content;
+  const char* config_path = "/tmp/map_shards_invalid_config";
+  uint32_t default_shards = GetConfig(MAP_SHARDS);
+  std::ofstream config_file(config_path);
+  config_file << "map_shards=100\n";
+  config_file.close();
+  // File is valid; invalid value is rejected by the power-of-2 validator and
+  // the setting stays at its default.
+  EXPECT_TRUE(LoadConfigFile(file_content, config_path));
+  EXPECT_EQ(GetConfig(MAP_SHARDS), default_shards);
+  std::remove(config_path);
+  LoadConfigFile(file_content);
+}
+
 class ShardedMapTest : public ::testing::Test {};
 
 TEST_F(ShardedMapTest, BasicSetAndGet) {

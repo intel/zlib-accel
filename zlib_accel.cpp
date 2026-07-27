@@ -159,7 +159,8 @@ static int init_zlib_accel(void) {
   std::string config_file_content;
   const bool config_loaded = config::LoadConfigFile(config_file_content);
   if (!config_loaded) {
-    Log(LogLevel::LOG_ERROR, "Error: Failed to load configuration file\n");
+    Log(LogLevel::LOG_ERROR,
+        "Failed to load configuration file, continuing with defaults\n");
   }
 
   InitStreamRegistries();
