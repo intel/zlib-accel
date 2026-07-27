@@ -68,8 +68,8 @@ static int (*orig_gzread)(gzFile file, voidp buf, unsigned len);
 static int (*orig_gzclose)(gzFile file);
 static int (*orig_gzeof)(gzFile file);
 
-// Forward declaration — defined after DeflateStreamSettings, InflateStreamSettings,
-// and GzipFiles class definitions below
+// Forward declaration — defined after DeflateStreamSettings,
+// InflateStreamSettings, and GzipFiles class definitions below
 static void InitStreamRegistries();
 
 // Initialize/cleanup functions when library is loaded
