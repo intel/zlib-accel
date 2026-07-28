@@ -6,6 +6,7 @@
 #include "iaa.h"
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <thread>
@@ -90,8 +91,8 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
 
   uint32_t output_shift = 0;
   if (gzip_ext) {
-    job->next_out_ptr += GZIP_EXT_XHDR_SIZE;
     if (job->available_out >= GZIP_EXT_XHDR_SIZE) {
+      job->next_out_ptr += GZIP_EXT_XHDR_SIZE;
       job->available_out -= GZIP_EXT_XHDR_SIZE;
     } else {
       return 1;
@@ -158,10 +159,11 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
       output[pos++] = 8;    // LEN
       output[pos++] = 0;
 
-      *(uint32_t*)(output + pos) = *input_length;
+      uint32_t tmp_val = *input_length;
+      std::memcpy(output + pos, &tmp_val, sizeof(uint32_t));
       pos += 4;
-      *(uint32_t*)(output + pos) =
-          *output_length - header_length - GetTrailerLength(format);
+      tmp_val = *output_length - header_length - GetTrailerLength(format);
+      std::memcpy(output + pos, &tmp_val, sizeof(uint32_t));
       pos += 4;
 
       *output_length += GZIP_EXT_XHDR_SIZE;

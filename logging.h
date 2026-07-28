@@ -51,7 +51,7 @@ inline std::ostream& GetLogStream() {
 
 #ifdef DEBUG_LOG
 
-static std::mutex log_mutex;
+inline std::mutex log_mutex;
 template <typename... Args>
 inline void Log(LogLevel level, Args&&... args) {
   std::lock_guard<std::mutex> lock(log_mutex);
