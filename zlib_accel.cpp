@@ -76,7 +76,11 @@ static void InitStreamRegistries();
 static int init_zlib_accel(void) __attribute__((constructor));
 static void cleanup_zlib_accel(void) __attribute__((destructor));
 
-// Macro that load symbols with error checking
+// When true, all wrappers fall through to orig_* without acceleration.
+static bool shim_disabled = false;
+
+// Macro that loads symbols — logs errors but continues loading remaining
+// symbols so that as many orig_* pointers as possible are resolved.
 #define LOAD_SYMBOL(fptr, type, name)                                          \
   do {                                                                         \
     dlerror();                                                                 \
@@ -85,12 +89,11 @@ static void cleanup_zlib_accel(void) __attribute__((destructor));
     if (error != nullptr) {                                                    \
       Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,              \
           "Failed to load symbol '", name, "': ", error, "\n");                \
-      return 1;                                                                \
-    }                                                                          \
-    if (fptr == nullptr) {                                                     \
+      shim_disabled = true;                                                    \
+    } else if (fptr == nullptr) {                                              \
       Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " Symbol '", \
           name, "' resolved to NULL\n");                                       \
-      return 1;                                                                \
+      shim_disabled = true;                                                    \
     }                                                                          \
   } while (0)
 
@@ -275,7 +278,9 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
     auto deflate_settings = deflate_stream_settings.Get(strm);
-    deflate_settings->path = ZLIB;
+    if (deflate_settings != nullptr) {
+      deflate_settings->path = ZLIB;
+    }
     return orig_deflateSetDictionary(strm, dictionary, dictLength);
   }
   Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__,
@@ -288,6 +293,10 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
+
+  if (deflate_settings == nullptr || shim_disabled) {
+    return orig_deflate(strm, flush);
+  }
 
   Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
@@ -448,6 +457,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   auto inflate_settings = inflate_stream_settings.Get(strm);
   INCREMENT_STAT(INFLATE_COUNT);
   PrintStats();
+
+  if (inflate_settings == nullptr || shim_disabled) {
+    return orig_inflate(strm, flush);
+  }
 
   Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
@@ -742,11 +755,17 @@ int ZEXPORT uncompress(Bytef* dest, uLongf* destLen, const Bytef* source,
 
 ExecutionPath GetDeflateExecutionPath(z_streamp strm) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
+  if (deflate_settings == nullptr) {
+    return ZLIB;
+  }
   return deflate_settings->path;
 }
 
 ExecutionPath GetInflateExecutionPath(z_streamp strm) {
   auto inflate_settings = inflate_stream_settings.Get(strm);
+  if (inflate_settings == nullptr) {
+    return ZLIB;
+  }
   return inflate_settings->path;
 }
 
@@ -1127,6 +1146,9 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 
 int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr || shim_disabled) {
+    return orig_gzwrite(file, buf, len);
+  }
   Log(LogLevel::LOG_INFO, "gzwrite Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
 
@@ -1184,6 +1206,9 @@ gzwrite_end:
 
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr || shim_disabled) {
+    return orig_gzread(file, buf, len);
+  }
 
   Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
@@ -1328,6 +1353,9 @@ gzread_end:
 
 int ZEXPORT gzclose(gzFile file) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr || shim_disabled) {
+    return orig_gzclose(file);
+  }
 
   // Unregister up front, before orig_gzclose frees the gzFile. Unsetting after
   // the free would erase the entry of whatever file has since been allocated at
@@ -1389,6 +1417,9 @@ int ZEXPORT gzclose(gzFile file) {
 
 int ZEXPORT gzeof(gzFile file) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr || shim_disabled) {
+    return orig_gzeof(file);
+  }
   return gz->reached_eof;
 }
 #if defined(__clang__)
