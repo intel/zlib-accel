@@ -923,8 +923,14 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   FileMode file_mode = FileMode::NONE;
   int oflag = GetOpenFlags(mode, &file_mode);
   int fd = open((const char*)path, oflag, 0666);
+  if (fd < 0) {
+    return nullptr;
+  }
   gzFile file = orig_gzdopen(fd, mode);
-  // TODO in case of error fall back to zlib and set execution path.
+  if (file == nullptr) {
+    close(fd);
+    return nullptr;
+  }
 
   Log(LogLevel::LOG_INFO, "gzopen Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", path ", path, ", mode ", mode, "\n");
@@ -1337,7 +1343,7 @@ int ZEXPORT gzclose(gzFile file) {
     }
 
     // Capture file size and name before gzclose
-    int file_size = lseek(gz->fd, 0, SEEK_CUR);
+    off_t file_size = lseek(gz->fd, 0, SEEK_CUR);
     char file_path[MAXPATHLEN];
     ssize_t readlink_ret =
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
