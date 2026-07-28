@@ -212,37 +212,37 @@ class DeflateStreamSettings {
  public:
   void Set(z_streamp strm, int level, int method, int window_bits,
            int mem_level, int strategy) {
-    auto settings = std::make_unique<DeflateSettings>(
+    auto settings = std::make_shared<DeflateSettings>(
         level, method, window_bits, mem_level, strategy);
     map.Set(strm, std::move(settings));
   }
 
   void Unset(z_streamp strm) { map.Unset(strm); }
 
-  DeflateSettings* Get(z_streamp strm) { return map.Get(strm); }
+  std::shared_ptr<DeflateSettings> Get(z_streamp strm) { return map.Get(strm); }
 
   void Init() { map.Init(); }
 
  private:
-  ShardedMap<z_streamp, std::unique_ptr<DeflateSettings>> map;
+  ShardedMap<z_streamp, std::shared_ptr<DeflateSettings>> map;
 };
 DeflateStreamSettings deflate_stream_settings;
 
 class InflateStreamSettings {
  public:
   void Set(z_streamp strm, int window_bits) {
-    auto settings = std::make_unique<InflateSettings>(window_bits);
+    auto settings = std::make_shared<InflateSettings>(window_bits);
     map.Set(strm, std::move(settings));
   }
 
   void Unset(z_streamp strm) { map.Unset(strm); }
 
-  InflateSettings* Get(z_streamp strm) { return map.Get(strm); }
+  std::shared_ptr<InflateSettings> Get(z_streamp strm) { return map.Get(strm); }
 
   void Init() { map.Init(); }
 
  private:
-  ShardedMap<z_streamp, std::unique_ptr<InflateSettings>> map;
+  ShardedMap<z_streamp, std::shared_ptr<InflateSettings>> map;
 };
 InflateStreamSettings inflate_stream_settings;
 
@@ -274,7 +274,7 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
   if (!configs[IGNORE_ZLIB_DICTIONARY]) {
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
-    DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+    auto deflate_settings = deflate_stream_settings.Get(strm);
     deflate_settings->path = ZLIB;
     return orig_deflateSetDictionary(strm, dictionary, dictLength);
   }
@@ -285,7 +285,7 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
 }
 
 int ZEXPORT deflate(z_streamp strm, int flush) {
-  DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+  auto deflate_settings = deflate_stream_settings.Get(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
 
@@ -404,7 +404,7 @@ int ZEXPORT deflateEnd(z_streamp strm) {
 int ZEXPORT deflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+  auto deflate_settings = deflate_stream_settings.Get(strm);
   if (deflate_settings != nullptr) {
     deflate_settings->path = UNDEFINED;
   }
@@ -434,7 +434,7 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
   if (!configs[IGNORE_ZLIB_DICTIONARY]) {
     Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), "dictLength ", dictLength, "\n");
-    InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
+    auto inflate_settings = inflate_stream_settings.Get(strm);
     inflate_settings->path = ZLIB;
     return orig_inflateSetDictionary(strm, dictionary, dictLength);
   }
@@ -445,7 +445,7 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
 }
 
 int ZEXPORT inflate(z_streamp strm, int flush) {
-  InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
+  auto inflate_settings = inflate_stream_settings.Get(strm);
   INCREMENT_STAT(INFLATE_COUNT);
   PrintStats();
 
@@ -583,7 +583,7 @@ int ZEXPORT inflateEnd(z_streamp strm) {
 int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
+  auto inflate_settings = inflate_stream_settings.Get(strm);
   if (inflate_settings != nullptr) {
     inflate_settings->path = UNDEFINED;
   }
@@ -741,12 +741,12 @@ int ZEXPORT uncompress(Bytef* dest, uLongf* destLen, const Bytef* source,
 }
 
 ExecutionPath GetDeflateExecutionPath(z_streamp strm) {
-  DeflateSettings* deflate_settings = deflate_stream_settings.Get(strm);
+  auto deflate_settings = deflate_stream_settings.Get(strm);
   return deflate_settings->path;
 }
 
 ExecutionPath GetInflateExecutionPath(z_streamp strm) {
-  InflateSettings* inflate_settings = inflate_stream_settings.Get(strm);
+  auto inflate_settings = inflate_stream_settings.Get(strm);
   return inflate_settings->path;
 }
 
@@ -839,18 +839,18 @@ struct GzipFile {
 class GzipFiles {
  public:
   void Set(gzFile file, int fd, FileMode file_mode) {
-    auto f = std::make_unique<GzipFile>(fd, file_mode);
+    auto f = std::make_shared<GzipFile>(fd, file_mode);
     map.Set(file, std::move(f));
   }
 
   void Unset(gzFile file) { map.Unset(file); }
 
-  GzipFile* Get(gzFile file) { return map.Get(file); }
+  std::shared_ptr<GzipFile> Get(gzFile file) { return map.Get(file); }
 
   void Init() { map.Init(); }
 
  private:
-  ShardedMap<gzFile, std::unique_ptr<GzipFile>> map;
+  ShardedMap<gzFile, std::shared_ptr<GzipFile>> map;
 };
 GzipFiles gzip_files;
 
@@ -1120,7 +1120,7 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 }
 
 int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
-  GzipFile* gz = gzip_files.Get(file);
+  auto gz = gzip_files.Get(file);
   Log(LogLevel::LOG_INFO, "gzwrite Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
 
@@ -1149,7 +1149,7 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
 
       // Compress and write the buffer
       if (written_bytes < len) {
-        int ret = CompressAndWrite(file, gz);
+        int ret = CompressAndWrite(file, gz.get());
         if (ret != 0) {
           written_bytes = 0;
           goto gzwrite_end;
@@ -1177,7 +1177,7 @@ gzwrite_end:
 }
 
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
-  GzipFile* gz = gzip_files.Get(file);
+  auto gz = gzip_files.Get(file);
 
   Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
@@ -1248,8 +1248,9 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
           uint8_t* output = reinterpret_cast<uint8_t*>(gz->data_buf);
           if (!gz->use_zlib_for_decompression) {
             bool end_of_stream = false;
-            ret = GzreadAcceleratorUncompress(gz, input, &input_len, output,
-                                              &output_len, &end_of_stream);
+            ret =
+                GzreadAcceleratorUncompress(gz.get(), input, &input_len, output,
+                                            &output_len, &end_of_stream);
             Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
                 static_cast<void*>(file), ", accelerator return code ", ret,
                 ", input ", input_len, ", output ", output_len, "\n");
@@ -1320,7 +1321,7 @@ gzread_end:
 }
 
 int ZEXPORT gzclose(gzFile file) {
-  GzipFile* gz = gzip_files.Get(file);
+  auto gz = gzip_files.Get(file);
 
   Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buffered ", gz->data_buf_content, ", path ",
@@ -1332,7 +1333,7 @@ int ZEXPORT gzclose(gzFile file) {
     // Compress any remaining buffered data
     int write_ret = 0;
     if (gz->data_buf_content > 0) {
-      write_ret = CompressAndWrite(file, gz);
+      write_ret = CompressAndWrite(file, gz.get());
     }
 
     // Capture file size and name before gzclose
@@ -1377,7 +1378,7 @@ int ZEXPORT gzclose(gzFile file) {
 }
 
 int ZEXPORT gzeof(gzFile file) {
-  GzipFile* gz = gzip_files.Get(file);
+  auto gz = gzip_files.Get(file);
   return gz->reached_eof;
 }
 #if defined(__clang__)
