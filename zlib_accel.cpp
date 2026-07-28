@@ -186,7 +186,9 @@ static thread_local bool in_call = false;
 
 constexpr uint8_t ZLIB_FDICT_MASK = 0x20;
 
-// Readable name for the numeric path in log output.
+#ifdef DEBUG_LOG
+// Readable name for the numeric path in log output. Only referenced from Log(),
+// which compiles away entirely when DEBUG_LOG is off.
 static const char* ExecutionPathName(ExecutionPath path) {
   switch (path) {
     case UNDEFINED:
@@ -202,6 +204,7 @@ static const char* ExecutionPathName(ExecutionPath path) {
   }
   return "UNKNOWN";
 }
+#endif  // DEBUG_LOG
 
 struct DeflateSettings {
   DeflateSettings(int _level, int _method, int _window_bits, int _mem_level,
