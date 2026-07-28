@@ -68,6 +68,10 @@ static int (*orig_gzread)(gzFile file, voidp buf, unsigned len);
 static int (*orig_gzclose)(gzFile file);
 static int (*orig_gzeof)(gzFile file);
 
+// Forward declaration — defined after DeflateStreamSettings,
+// InflateStreamSettings, and GzipFiles class definitions below
+static void InitStreamRegistries();
+
 // Initialize/cleanup functions when library is loaded
 static int init_zlib_accel(void) __attribute__((constructor));
 static void cleanup_zlib_accel(void) __attribute__((destructor));
@@ -150,15 +154,19 @@ static int init_zlib_accel(void) {
 
   LOAD_SYMBOL(orig_gzeof, int (*)(gzFile), "gzeof");
 
-  // Load configuration file
+  // Load configuration file; on failure (file absent or is a symlink) continue
+  // with compiled-in defaults — a missing config is not fatal.
   std::string config_file_content;
-  if (!config::LoadConfigFile(config_file_content)) {
-    Log(LogLevel::LOG_ERROR, "Error: Failed to load configuration file\n");
-    return 1;
+  const bool config_loaded = config::LoadConfigFile(config_file_content);
+  if (!config_loaded) {
+    Log(LogLevel::LOG_ERROR,
+        "Failed to load configuration file, continuing with defaults\n");
   }
 
+  InitStreamRegistries();
+
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
-  if (!config::log_file.empty()) {
+  if (config_loaded && !config::log_file.empty()) {
     CreateLogFile(config::log_file.c_str());
   }
 #endif
@@ -213,6 +221,8 @@ class DeflateStreamSettings {
 
   DeflateSettings* Get(z_streamp strm) { return map.Get(strm); }
 
+  void Init() { map.Init(); }
+
  private:
   ShardedMap<z_streamp, std::unique_ptr<DeflateSettings>> map;
 };
@@ -228,6 +238,8 @@ class InflateStreamSettings {
   void Unset(z_streamp strm) { map.Unset(strm); }
 
   InflateSettings* Get(z_streamp strm) { return map.Get(strm); }
+
+  void Init() { map.Init(); }
 
  private:
   ShardedMap<z_streamp, std::unique_ptr<InflateSettings>> map;
@@ -835,10 +847,18 @@ class GzipFiles {
 
   GzipFile* Get(gzFile file) { return map.Get(file); }
 
+  void Init() { map.Init(); }
+
  private:
   ShardedMap<gzFile, std::unique_ptr<GzipFile>> map;
 };
 GzipFiles gzip_files;
+
+static void InitStreamRegistries() {
+  deflate_stream_settings.Init();
+  inflate_stream_settings.Init();
+  gzip_files.Init();
+}
 
 // Inspired by gz_open in gzlib.c
 int GetOpenFlags(const char* mode, FileMode* file_mode) {
