@@ -13,6 +13,7 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
                   uint32_t *output_length, const unsigned long *total_in,
                   const unsigned long *total_out);
 bool IsIGZIPDeflateFinished(const struct isal_zstream *stream);
+bool SupportedOptionsIGZIPInflate(int window_bits);
 
 enum IGZIPInflatePathAction {
   IGZIP_INFLATE_PATH_NONE,

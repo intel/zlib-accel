@@ -2523,6 +2523,93 @@ TEST(IGZIPInflateRegressionTest,
   inflateEnd(&dstream);
 }
 
+// windowBits 16..31 requests gzip-only decoding. 16 used to fall through to
+// the IGZIP_ZLIB branch of ConfigureInflateWindow, so IGZIP decoded
+// zlib-format data that zlib itself rejects with Z_DATA_ERROR -- the shim was
+// more permissive than the library it replaces.
+TEST(IGZIPInflateRegressionTest, GzipOnlyWindowBitsMustRejectZlibData) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, false, false);
+
+  const size_t input_length = 16384;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  // zlib-format (not gzip) stream.
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath execution_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &execution_path),
+            Z_STREAM_END);
+  ASSERT_EQ(execution_path, ZLIB);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 16), Z_OK);
+
+  std::vector<char> output(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  stream.avail_in = static_cast<unsigned int>(compressed.size());
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<unsigned int>(output.size());
+
+  // Gzip-only was requested, so a zlib header must be an error, not output.
+  EXPECT_EQ(inflate(&stream, Z_FINISH), Z_DATA_ERROR);
+  EXPECT_EQ(stream.total_out, 0u);
+
+  inflateEnd(&stream);
+  DestroyBlock(input);
+}
+
+// windowBits >= 32 asks for automatic zlib/gzip header detection, which ISA-L
+// cannot express. SupportedOptionsIGZIPInflate() keeps the range off the IGZIP
+// path so zlib handles it; both wrapper formats must still decode.
+TEST(IGZIPInflateRegressionTest, AutoDetectWindowBitsDecodesBothFormats) {
+  SetCompressPath(ZLIB, false, false, false);
+  // zlib_fallback must be on: the range is gated off IGZIP, so zlib has to be
+  // available to take the stream.
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/true, false);
+
+  const size_t input_length = 16384;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  // 15 == zlib wrapper, 31 == gzip wrapper. Auto-detect must accept both.
+  for (const int compress_window_bits : {15, 31}) {
+    std::string compressed;
+    size_t output_upper_bound;
+    ExecutionPath execution_path = UNDEFINED;
+    ASSERT_EQ(
+        ZlibCompress(input, input_length, &compressed, compress_window_bits,
+                     Z_FINISH, &output_upper_bound, &execution_path),
+        Z_STREAM_END)
+        << "compress window_bits " << compress_window_bits;
+    ASSERT_EQ(execution_path, ZLIB);
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(z_stream));
+    ASSERT_EQ(inflateInit2(&stream, 47), Z_OK);
+
+    std::vector<char> output(input_length + 1024);
+    stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+    stream.avail_in = static_cast<unsigned int>(compressed.size());
+    stream.next_out = reinterpret_cast<Bytef*>(output.data());
+    stream.avail_out = static_cast<unsigned int>(output.size());
+
+    EXPECT_EQ(inflate(&stream, Z_FINISH), Z_STREAM_END)
+        << "compress window_bits " << compress_window_bits;
+    EXPECT_EQ(stream.total_out, input_length);
+    EXPECT_EQ(memcmp(output.data(), input, input_length), 0);
+    // Auto-detect is gated off IGZIP; zlib owns the stream.
+    EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+    inflateEnd(&stream);
+  }
+
+  DestroyBlock(input);
+}
+
 #ifdef USE_IAA
 // IAA->IGZIP fallback tests.
 // On machines without IAA hardware, CompressIAA/UncompressIAA return non-zero,

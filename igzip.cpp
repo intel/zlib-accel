@@ -46,16 +46,37 @@ static void ConfigureInflateWindow(struct inflate_state *isal_strm_inflate,
     return;
   }
 
-  if ((windowBits >= 24 && windowBits <= 31) ||
-      (windowBits >= 40 && windowBits <= 47)) {
+  // zlib adds 16 to windowBits to request gzip-only decoding, so 16..31 is
+  // gzip with a window of (windowBits - 16), where 0 means the maximum
+  // window. inflateInit2 rejects 17..23, so in practice this is 16 and
+  // 24..31. Values >= 32 request zlib/gzip auto-detection and are kept off
+  // this path by SupportedOptionsIGZIPInflate().
+  if (windowBits >= 16 && windowBits <= 31) {
     isal_strm_inflate->crc_flag = IGZIP_GZIP;
-    isal_strm_inflate->hist_bits =
-        ClampHistBits(windowBits > 31 ? windowBits - 32 : windowBits - 16);
+    isal_strm_inflate->hist_bits = ClampHistBits(windowBits - 16);
     return;
   }
 
+  // windowBits == 0 means "take the window size from the zlib header"; ISA-L
+  // spells that as hist_bits == 0 (maximum history).
   isal_strm_inflate->crc_flag = IGZIP_ZLIB;
   isal_strm_inflate->hist_bits = ClampHistBits(windowBits);
+}
+
+bool SupportedOptionsIGZIPInflate(int window_bits) {
+  // zlib adds 32 to windowBits to request automatic zlib/gzip header
+  // detection (32, and 40..47). ISA-L has no auto-detect mode -- crc_flag
+  // commits to one wrapper format at init -- so leave this range to zlib.
+  // Sniffing the first header bytes would also have to reproduce zlib's
+  // window-size validation to stay transparent (windowBits 40 means a
+  // 256-byte window, which zlib rejects for data compressed with a larger
+  // one).
+  if (window_bits >= 32) {
+    Log(LogLevel::LOG_INFO, "SupportedOptionsIGZIPInflate() window_bits ",
+        window_bits, " requests auto-detection, unsupported by ISA-L\n");
+    return false;
+  }
+  return true;
 }
 
 bool IsIGZIPDeflateFinished(const struct isal_zstream *stream) {
@@ -354,6 +375,10 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
                     uint8_t *output, uint32_t *output_length,
                     const unsigned long *total_in,
                     const unsigned long *total_out, bool *end_of_stream) {
+  // ISA-L's inflate_state has no total_in counterpart to isal_zstream::total_in
+  // (only total_out), so the caller's total_in cannot be propagated. The caller
+  // tracks consumed input from *input_length instead. Kept in the signature to
+  // stay symmetric with CompressIGZIP.
   (void)total_in;
 
   if (!isal_strm_inflate) {

@@ -5,7 +5,6 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <sys/param.h>
 #include <unistd.h>
 
@@ -187,6 +186,23 @@ static thread_local bool in_call = false;
 
 constexpr uint8_t ZLIB_FDICT_MASK = 0x20;
 
+// Readable name for the numeric path in log output.
+static const char* ExecutionPathName(ExecutionPath path) {
+  switch (path) {
+    case UNDEFINED:
+      return "UNDEFINED";
+    case ZLIB:
+      return "ZLIB";
+    case QAT:
+      return "QAT";
+    case IAA:
+      return "IAA";
+    case IGZIP:
+      return "IGZIP";
+  }
+  return "UNKNOWN";
+}
+
 struct DeflateSettings {
   DeflateSettings(int _level, int _method, int _window_bits, int _mem_level,
                   int _strategy)
@@ -318,7 +334,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(deflate_settings->path), ", path_name ",
-      static_cast<int>(deflate_settings->path), ", window_bits ",
+      ExecutionPathName(deflate_settings->path), ", window_bits ",
       deflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
 
@@ -474,7 +490,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
           ", bytes_in ", input_len, ", bytes_out ", output_len, ", avail_in ",
           strm->avail_in, ", avail_out ", strm->avail_out, ", path ",
           static_cast<int>(deflate_settings->path), ", path_name ",
-          static_cast<int>(deflate_settings->path), "\n");
+          ExecutionPathName(deflate_settings->path), "\n");
       return ret;
     }
   }
@@ -493,7 +509,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", zlib return code ", ret, ", avail_in ",
       strm->avail_in, ", avail_out ", strm->avail_out, ", path ",
       static_cast<int>(deflate_settings->path), ", path_name ",
-      static_cast<int>(deflate_settings->path), "\n");
+      ExecutionPathName(deflate_settings->path), "\n");
 
   INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
   return ret;
@@ -574,7 +590,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
       strm->avail_out, ", flush ", flush, ", in_call ", in_call, ", path ",
       static_cast<int>(inflate_settings->path), ", path_name ",
-      static_cast<int>(inflate_settings->path), ", window_bits ",
+      ExecutionPathName(inflate_settings->path), ", window_bits ",
       inflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
 
@@ -592,7 +608,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 
 #ifdef USE_IGZIP
   const bool igzip_supported_options =
-      !in_call && configs[USE_IGZIP_UNCOMPRESS];
+      !in_call && configs[USE_IGZIP_UNCOMPRESS] &&
+      SupportedOptionsIGZIPInflate(inflate_settings->window_bits);
 
   // Keep stateful IGZIP stream handling on the same engine.
   // For avail_in==0, let IGZIP process any buffered bits in its internal
@@ -775,7 +792,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
           ", bytes_in ", input_len, ", bytes_out ", output_len, ", avail_in ",
           strm->avail_in, ", avail_out ", strm->avail_out, ", end_of_stream ",
           end_of_stream, ", path ", static_cast<int>(inflate_settings->path),
-          ", path_name ", static_cast<int>(inflate_settings->path),
+          ", path_name ", ExecutionPathName(inflate_settings->path),
           ", window_bits ", inflate_settings->window_bits, "\n");
       return ret;
     }
@@ -801,7 +818,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       static_cast<void*>(strm), ", zlib return code ", ret, ", avail_in ",
       strm->avail_in, ", avail_out ", strm->avail_out, ", path ",
       static_cast<int>(inflate_settings->path), ", path_name ",
-      static_cast<int>(inflate_settings->path), ", window_bits ",
+      ExecutionPathName(inflate_settings->path), ", window_bits ",
       inflate_settings->window_bits, "\n");
 
   INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
@@ -1315,6 +1332,17 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
       unsigned long total_out = 0;
       ret = CompressIGZIP(isal_strm, Z_FINISH, input, input_length, output,
                           output_length, &total_in, &total_out);
+      if (ret == 0 && !IsIGZIPDeflateFinished(isal_strm)) {
+        // This call site uses IGZIP one-shot: the stream is ended below, so a
+        // gzip member left mid-emit can never be completed. isal_deflate
+        // reports COMP_OK for "made progress", so the terminal state has to be
+        // checked explicitly (the stateless API would report this as
+        // STATELESS_OVERFLOW instead). Not expected to trigger, since io_buf
+        // is twice the size of data_buf; failing here makes CompressAndWrite
+        // recompress the whole buffer with zlib rather than write a truncated
+        // member.
+        ret = 1;
+      }
       EndCompressIGZIP(isal_strm);
       gz->path = IGZIP;
     }
