@@ -16,7 +16,8 @@
 constexpr int CUSTOM_PATH_MAX = 4096;
 
 bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
-                            uint32_t max_value, uint32_t min_value) {
+                            uint32_t max_value, uint32_t min_value,
+                            std::function<bool(uint32_t)> validator) {
   auto it = config_settings_map.find(tag);
   if (it == config_settings_map.end()) {
     return false;
@@ -41,6 +42,14 @@ bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
     }
 
     value = static_cast<uint32_t>(temp);
+
+    if (validator && !validator(value)) {
+      Log(LogLevel::LOG_ERROR, "ConfigReader::GetValue Line ", __LINE__,
+          " invalid input value for tag ", tag.c_str(), "\n");
+      value = 0;
+      return false;
+    }
+
     return true;
 
   } catch (const std::exception&) {

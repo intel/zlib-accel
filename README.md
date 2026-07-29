@@ -4,17 +4,17 @@ zlib-accel is a software shim that intercepts zlib calls and offloads compressio
 The shim allows applications to leverage hardware accelerators transparently without code changes. The only requirement is to preload the shim's shared library (e.g., using LD_PRELOAD).
 
 Two accelerators are supported
-- Intel(R) QuickAssist Technology (QAT)
-- Intel(R) In-Memory Analytics Accelerator (IAA)
+- Intel® QuickAssist Technology (QAT)
+- Intel® In-Memory Analytics Accelerator (IAA)
 
 
 ## Scope/Constraints
 
-This shim is not a general-purpose replacement for zlib, and it is able to offload compression/decompression jobs in certain conditions. Therefore, not all applications can take advantage of the transparent offload, depending on how they use zlib.  It is important to test thoroughly with your specific application and configuration. The use cases we have tested so far are listed in a section below.
+This shim is not a general-purpose replacement for zlib, and it is able to offload compression/decompression jobs in certain conditions. Therefore, not all applications can take advantage of the transparent offload, depending on how they use zlib. It is important to test thoroughly with your specific application and configuration. The use cases we have tested so far are listed in a section below.
 
 In general, the shim is able to offload zlib calls that complete compression/decompression of one deflate stream in one call. "Streaming" compression/decompression (where compression/decompression is done incrementally) are not currently supported. If the shim is not able to offload a job to an accelerator, it will fall back to zlib, ensuring the application still works correctly.
 
-The shim has only been tested on Linux.
+The shim has only been tested on Linux. When building with hardware acceleration enabled (`USE_QAT`, `USE_IAA`, or `USE_IGZIP`), the [Intel® oneTBB](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onetbb.html) performance library is required and can be acquired by installing the [Intel® oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit-download.html).
 
 
 ### Hardware Acceleration
@@ -233,6 +233,10 @@ log_file
 - This option applies only if the shim is built with DEBUG_LOG=ON or ENABLE_STATISTICS=ON.
 - If specified, store log messages in the file. If not specified, log messages are printed to stdout.
 
+map_shards
+- Values: 2-65536. Default 64
+- Sets the number of shards in the thread-safe concurrent hash map. Each shard holds an independent map instance.
+- It must be a power of two, so Fibonacci hashing can be used to calculate uniformly distributed shard indexes.
 
 ## Tested Applications/Use Cases
 

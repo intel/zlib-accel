@@ -169,4 +169,10 @@ if(USE_QAT)
   link_libraries(qatzip)
 endif()
 
+if(USE_QAT OR USE_IAA OR USE_IGZIP)
+  find_package(TBB REQUIRED COMPONENTS tbb)
+  link_libraries(TBB::tbb)
+  add_compile_definitions(USE_TBB)
+endif()
+
 link_libraries(z)

@@ -28,6 +28,7 @@ enum ConfigOption {
   IGZIP_FALLBACK,
   LOG_LEVEL,
   LOG_STATS_SAMPLES,
+  MAP_SHARDS,
   CONFIG_MAX
 };
 
