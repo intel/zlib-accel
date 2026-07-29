@@ -47,11 +47,14 @@ inline std::ostream& GetLogStream() {
   return std::cout;
 }
 
+// Serializes writes to the stream returned by GetLogStream(). Shared by Log()
+// and LogStats(), which may write to the same stream from different threads.
+inline std::mutex log_mutex;
+
 #endif  // DEBUG_LOG || ENABLE_STATISTICS
 
 #ifdef DEBUG_LOG
 
-static std::mutex log_mutex;
 template <typename... Args>
 inline void Log(LogLevel level, Args&&... args) {
   std::lock_guard<std::mutex> lock(log_mutex);
@@ -92,6 +95,7 @@ inline void Log(LogLevel level, Args&&... args) {
 
 template <typename... Args>
 inline void LogStats(Args&&... args) {
+  std::lock_guard<std::mutex> lock(log_mutex);
   std::ostream& stream = GetLogStream();
   stream << "Stats:\n";
   (..., (stream << args));

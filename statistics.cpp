@@ -25,6 +25,9 @@ const std::array<const char*, STATS_COUNT> stat_names{
 thread_local std::array<uint64_t, STATS_COUNT> stats{};
 
 void PrintStats() {
+  if (configs[LOG_STATS_SAMPLES] == 0) {
+    return;
+  }
   auto total_operations = stats[static_cast<size_t>(Statistic::DEFLATE_COUNT)] +
                           stats[static_cast<size_t>(Statistic::INFLATE_COUNT)];
   if (total_operations % configs[LOG_STATS_SAMPLES] != 0) {

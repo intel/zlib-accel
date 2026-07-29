@@ -4,6 +4,7 @@
 #include "utils.h"
 
 #include <cstdint>
+#include <cstring>
 
 CompressedFormat GetCompressedFormat(int window_bits) {
   if (window_bits >= -15 && window_bits <= -8) {
@@ -86,7 +87,7 @@ bool DetectGzipExt(uint8_t* data, uint32_t len, uint32_t* src_size,
   }
 
   // Extract sizes from extended header
-  *src_size = *(reinterpret_cast<uint32_t*>(data + 16));
-  *dest_size = *(reinterpret_cast<uint32_t*>(data + 20));
+  std::memcpy(src_size, data + 16, sizeof(uint32_t));
+  std::memcpy(dest_size, data + 20, sizeof(uint32_t));
   return true;
 }
