@@ -13,4 +13,5 @@ qat_compression_allow_chunking = 0
 ignore_zlib_dictionary = 0
 map_shards = 64
 log_level = 1
+log_stats_samples = 1000
 log_file = /tmp/zlib-accel.log

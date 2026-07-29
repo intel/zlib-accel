@@ -219,7 +219,9 @@ log_level
 
 log_stats_samples
 - Values: 0-INT_MAX. Default 1000
-- Append statistics to log every N samples (this option specifies N).
+- This option applies only if the shim is built with ENABLE_STATISTICS=ON.
+- Append statistics to log every N samples (this option specifies N). A sample is one deflate() or inflate() call.
+- If set to 0, statistics are not appended to the log.
 
 log_file
 - Values: path. Default: /tmp/zlib-accel.log
