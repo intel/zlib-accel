@@ -39,21 +39,21 @@ class ShardedMap {
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
   }
 
-  auto Get(const Key& key) -> decltype(std::declval<Value>().get()) {
+  auto Get(const Key& key) -> std::shared_ptr<typename Value::element_type> {
     const auto shard = GetShard(key);
 #ifdef USE_TBB
     typename MapType::const_accessor acc;
     if (!pd_map_arr_[shard].map.find(acc, key)) {
       return nullptr;
     }
-    return acc->second.get();
+    return acc->second;
 #else
     std::shared_lock lock(pd_map_arr_[shard].mutex);
     auto it = pd_map_arr_[shard].map.find(key);
     if (it == pd_map_arr_[shard].map.end()) {
       return nullptr;
     }
-    return it->second.get();
+    return it->second;
 #endif
   }
 

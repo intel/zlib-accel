@@ -89,5 +89,11 @@ bool DetectGzipExt(uint8_t* data, uint32_t len, uint32_t* src_size,
   // Extract sizes from extended header
   std::memcpy(src_size, data + 16, sizeof(uint32_t));
   std::memcpy(dest_size, data + 20, sizeof(uint32_t));
+
+  // Validate that the claimed dest_size + header/footer fits within the input
+  // buffer. Reject if the addition would overflow or exceed the buffer length.
+  if (len < GZIP_EXT_HDRFTR_SIZE || *dest_size > len - GZIP_EXT_HDRFTR_SIZE) {
+    return false;
+  }
   return true;
 }
