@@ -923,8 +923,14 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   FileMode file_mode = FileMode::NONE;
   int oflag = GetOpenFlags(mode, &file_mode);
   int fd = open((const char*)path, oflag, 0666);
+  if (fd < 0) {
+    return nullptr;
+  }
   gzFile file = orig_gzdopen(fd, mode);
-  // TODO in case of error fall back to zlib and set execution path.
+  if (file == nullptr) {
+    close(fd);
+    return nullptr;
+  }
 
   Log(LogLevel::LOG_INFO, "gzopen Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", path ", path, ", mode ", mode, "\n");
@@ -1323,6 +1329,12 @@ gzread_end:
 int ZEXPORT gzclose(gzFile file) {
   auto gz = gzip_files.Get(file);
 
+  // Unregister up front, before orig_gzclose frees the gzFile. Unsetting after
+  // the free would erase the entry of whatever file has since been allocated at
+  // the same address, so do it once here rather than on each exit path. Holding
+  // gz (a shared_ptr) keeps this file's state alive until we return.
+  gzip_files.Unset(file);
+
   Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buffered ", gz->data_buf_content, ", path ",
       static_cast<int>(gz->path), "\n");
@@ -1337,14 +1349,13 @@ int ZEXPORT gzclose(gzFile file) {
     }
 
     // Capture file size and name before gzclose
-    int file_size = lseek(gz->fd, 0, SEEK_CUR);
+    off_t file_size = lseek(gz->fd, 0, SEEK_CUR);
     char file_path[MAXPATHLEN];
     ssize_t readlink_ret =
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
                  MAXPATHLEN - 1);
     if (readlink_ret == -1) {
       ret = orig_gzclose(file);
-      gzip_files.Unset(file);
       Log(LogLevel::LOG_ERROR, "gzclose Line ", __LINE__,
           ", readlink_ret return error \n");
       return ret;
@@ -1373,7 +1384,6 @@ int ZEXPORT gzclose(gzFile file) {
   Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", return code ", ret, ", buffered processed ",
       gz->data_buf_pos, "\n");
-  gzip_files.Unset(file);
   return ret;
 }
 
