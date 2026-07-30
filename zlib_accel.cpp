@@ -444,7 +444,9 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), "dictLength ", dictLength, "\n");
     auto inflate_settings = inflate_stream_settings.Get(strm);
-    inflate_settings->path = ZLIB;
+    if (inflate_settings != nullptr) {
+      inflate_settings->path = ZLIB;
+    }
     return orig_inflateSetDictionary(strm, dictionary, dictLength);
   }
   Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__,
