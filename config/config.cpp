@@ -21,6 +21,8 @@ uint32_t configs[CONFIG_MAX] = {
     0,    /*use_iaa_uncompress*/
     1,    /*use_zlib_compress*/
     1,    /*use_zlib_uncompress*/
+    0,    /*use_igzip_compress*/
+    0,    /*use_igzip_uncompress*/
     50,   /*iaa_compress_percentage*/
     50,   /*iaa_uncompress_percentage*/
     0,    /*iaa_prepend_empty_block*/
@@ -28,6 +30,7 @@ uint32_t configs[CONFIG_MAX] = {
     1,    /*qat_compression_level*/
     0,    /*qat_compression_allow_chunking*/
     0,    /*ignore_zlib_dictionary*/
+    1,    /*igzip_fallback*/
     1,    /*log_level*/
     1000, /*log_stats_samples*/
     64    /*map_shards*/
@@ -46,6 +49,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
     "use_iaa_uncompress",
     "use_zlib_compress",
     "use_zlib_uncompress",
+    "use_igzip_compress",
+    "use_igzip_uncompress",
     "iaa_compress_percentage",
     "iaa_uncompress_percentage",
     "iaa_prepend_empty_block",
@@ -53,6 +58,7 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
     "qat_compression_level",
     "qat_compression_allow_chunking",
     "ignore_zlib_dictionary",
+    "igzip_fallback",
     "log_level",
     "log_stats_samples",
     "map_shards"
@@ -81,6 +87,8 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(USE_IAA_UNCOMPRESS, 1, 0);
   trySetConfig(USE_ZLIB_COMPRESS, 1, 0);
   trySetConfig(USE_ZLIB_UNCOMPRESS, 1, 0);
+  trySetConfig(USE_IGZIP_COMPRESS, 1, 0);
+  trySetConfig(USE_IGZIP_UNCOMPRESS, 1, 0);
   trySetConfig(IAA_COMPRESS_PERCENTAGE, 100, 0);
   trySetConfig(IAA_UNCOMPRESS_PERCENTAGE, 100, 0);
   trySetConfig(IAA_PREPEND_EMPTY_BLOCK, 1, 0);
@@ -88,6 +96,7 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(QAT_COMPRESSION_LEVEL, 9, 1);
   trySetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, 1, 0);
   trySetConfig(IGNORE_ZLIB_DICTIONARY, 1, 0);
+  trySetConfig(IGZIP_FALLBACK, 1, 0);
   trySetConfig(LOG_LEVEL, 3, 0);
   trySetConfig(LOG_STATS_SAMPLES, UINT32_MAX, 0);
   trySetConfig(MAP_SHARDS, 65536, 2,
