@@ -1320,6 +1320,145 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
   SetConfig(MAP_SHARDS, saved_shards);
 }
 
+// The shim keeps per-stream state in maps keyed by z_streamp, and every entry
+// point that consumes that state has to cope with the entry being absent. That
+// happens whenever an init call did not register anything: an app that ignores
+// a failed *Init return code and keeps using the stream, a stream that was
+// never initialized at all, or a gzFile the shim never saw. Before these
+// guards existed each of those cases dereferenced a null shared_ptr.
+class UnregisteredStreamTest : public ::testing::Test {};
+
+TEST_F(UnregisteredStreamTest, DeflateAfterFailedInitDoesNotCrash) {
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+
+  // window_bits is invalid, so zlib rejects the stream and the shim registers
+  // no settings for it.
+  ASSERT_EQ(deflateInit2(&strm, 6, Z_DEFLATED, 99, 8, Z_DEFAULT_STRATEGY),
+            Z_STREAM_ERROR);
+
+  std::vector<uint8_t> input(1024, 'a');
+  std::vector<uint8_t> output(4096, 0);
+  strm.next_in = input.data();
+  strm.avail_in = static_cast<uInt>(input.size());
+  strm.next_out = output.data();
+  strm.avail_out = static_cast<uInt>(output.size());
+
+  // An app that ignores the failed init and calls deflate anyway must get
+  // zlib's error back rather than a segfault.
+  EXPECT_EQ(deflate(&strm, Z_FINISH), Z_STREAM_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&strm), ZLIB);
+}
+
+TEST_F(UnregisteredStreamTest, InflateAfterFailedInitDoesNotCrash) {
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+
+  ASSERT_EQ(inflateInit2(&strm, 99), Z_STREAM_ERROR);
+
+  std::vector<uint8_t> input(1024, 0);
+  std::vector<uint8_t> output(4096, 0);
+  strm.next_in = input.data();
+  strm.avail_in = static_cast<uInt>(input.size());
+  strm.next_out = output.data();
+  strm.avail_out = static_cast<uInt>(output.size());
+
+  EXPECT_EQ(inflate(&strm, Z_FINISH), Z_STREAM_ERROR);
+  EXPECT_EQ(GetInflateExecutionPath(&strm), ZLIB);
+}
+
+// A stream the shim has never seen at all. Reset/SetDictionary/End have to
+// tolerate the missing entry too, not just deflate/inflate.
+TEST_F(UnregisteredStreamTest, UnknownStreamIsReportedAsZlibPath) {
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+
+  EXPECT_EQ(GetDeflateExecutionPath(&strm), ZLIB);
+  EXPECT_EQ(GetInflateExecutionPath(&strm), ZLIB);
+}
+
+TEST_F(UnregisteredStreamTest, ResetAndEndOnUnregisteredStream) {
+  z_stream deflate_strm;
+  memset(&deflate_strm, 0, sizeof(deflate_strm));
+  EXPECT_EQ(deflateReset(&deflate_strm), Z_STREAM_ERROR);
+  EXPECT_EQ(deflateEnd(&deflate_strm), Z_STREAM_ERROR);
+
+  z_stream inflate_strm;
+  memset(&inflate_strm, 0, sizeof(inflate_strm));
+  EXPECT_EQ(inflateReset(&inflate_strm), Z_STREAM_ERROR);
+  EXPECT_EQ(inflateEnd(&inflate_strm), Z_STREAM_ERROR);
+}
+
+TEST_F(UnregisteredStreamTest, SetDictionaryOnUnregisteredStream) {
+  const uint32_t saved = GetConfig(IGNORE_ZLIB_DICTIONARY);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
+
+  std::vector<uint8_t> dict(64, 'd');
+
+  z_stream deflate_strm;
+  memset(&deflate_strm, 0, sizeof(deflate_strm));
+  EXPECT_EQ(deflateSetDictionary(&deflate_strm, dict.data(),
+                                 static_cast<uInt>(dict.size())),
+            Z_STREAM_ERROR);
+
+  z_stream inflate_strm;
+  memset(&inflate_strm, 0, sizeof(inflate_strm));
+  EXPECT_EQ(inflateSetDictionary(&inflate_strm, dict.data(),
+                                 static_cast<uInt>(dict.size())),
+            Z_STREAM_ERROR);
+
+  SetConfig(IGNORE_ZLIB_DICTIONARY, saved);
+}
+
+// A stream that fails to init, is then successfully re-initialized, must end up
+// registered and usable — the failed attempt must not leave the shim confused
+// about the stream.
+TEST_F(UnregisteredStreamTest, ReinitAfterFailedInitWorks) {
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+
+  ASSERT_EQ(deflateInit2(&strm, 6, Z_DEFLATED, 99, 8, Z_DEFAULT_STRATEGY),
+            Z_STREAM_ERROR);
+  ASSERT_EQ(deflateInit2(&strm, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<uint8_t> input(4096, 'a');
+  std::vector<uint8_t> compressed(8192, 0);
+  strm.next_in = input.data();
+  strm.avail_in = static_cast<uInt>(input.size());
+  strm.next_out = compressed.data();
+  strm.avail_out = static_cast<uInt>(compressed.size());
+  ASSERT_EQ(deflate(&strm, Z_FINISH), Z_STREAM_END);
+  const size_t compressed_size = compressed.size() - strm.avail_out;
+  ASSERT_EQ(deflateEnd(&strm), Z_OK);
+
+  // Round-trip to confirm the stream really was functional, not just non-fatal.
+  z_stream d;
+  memset(&d, 0, sizeof(d));
+  ASSERT_EQ(inflateInit2(&d, 31), Z_OK);
+  std::vector<uint8_t> decompressed(input.size(), 0);
+  d.next_in = compressed.data();
+  d.avail_in = static_cast<uInt>(compressed_size);
+  d.next_out = decompressed.data();
+  d.avail_out = static_cast<uInt>(decompressed.size());
+  EXPECT_EQ(inflate(&d, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(inflateEnd(&d), Z_OK);
+  EXPECT_EQ(decompressed, input);
+}
+
+// gzFile entry points on a handle the shim never registered. nullptr is the
+// simplest such handle and is what gzopen returns on failure, so an app that
+// ignores that failure reaches exactly this path.
+TEST_F(UnregisteredStreamTest, GzFunctionsOnUnregisteredFile) {
+  std::vector<uint8_t> buf(64, 0);
+
+  // These match what plain zlib returns for a file it cannot act on.
+  EXPECT_EQ(gzeof(nullptr), 0);
+  EXPECT_EQ(gzread(nullptr, buf.data(), static_cast<unsigned>(buf.size())), -1);
+  EXPECT_EQ(gzwrite(nullptr, buf.data(), static_cast<unsigned>(buf.size())), 0);
+  EXPECT_EQ(gzclose(nullptr), Z_STREAM_ERROR);
+}
+
 class ShardedMapTest : public ::testing::Test {};
 
 TEST_F(ShardedMapTest, BasicSetAndGet) {
