@@ -274,9 +274,16 @@ int ZEXPORT deflateInit_(z_streamp strm, int level, const char* version,
     return Z_VERSION_ERROR;
   }
 
-  deflate_stream_settings.Set(strm, level, Z_DEFLATED, 15, 8,
-                              Z_DEFAULT_STRATEGY);
-  return orig_deflateInit_(strm, level, version, stream_size);
+  // Register only once zlib has accepted the stream. On failure the app never
+  // calls deflateEnd, so an entry made here would outlive the z_streamp; and
+  // zlib leaves an already-initialized stream untouched when it rejects new
+  // parameters, so the previous settings must stay in place.
+  int ret = orig_deflateInit_(strm, level, version, stream_size);
+  if (ret == Z_OK) {
+    deflate_stream_settings.Set(strm, level, Z_DEFLATED, 15, 8,
+                                Z_DEFAULT_STRATEGY);
+  }
+  return ret;
 }
 
 int ZEXPORT deflateInit2_(z_streamp strm, int level, int method,
@@ -290,10 +297,13 @@ int ZEXPORT deflateInit2_(z_streamp strm, int level, int method,
     return Z_VERSION_ERROR;
   }
 
-  deflate_stream_settings.Set(strm, level, method, window_bits, mem_level,
-                              strategy);
-  return orig_deflateInit2_(strm, level, method, window_bits, mem_level,
-                            strategy, version, stream_size);
+  int ret = orig_deflateInit2_(strm, level, method, window_bits, mem_level,
+                               strategy, version, stream_size);
+  if (ret == Z_OK) {
+    deflate_stream_settings.Set(strm, level, method, window_bits, mem_level,
+                                strategy);
+  }
+  return ret;
 }
 
 int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
@@ -465,8 +475,11 @@ int ZEXPORT inflateInit_(z_streamp strm, const char* version, int stream_size) {
     return Z_VERSION_ERROR;
   }
 
-  inflate_stream_settings.Set(strm, 15);
-  return orig_inflateInit_(strm, version, stream_size);
+  int ret = orig_inflateInit_(strm, version, stream_size);
+  if (ret == Z_OK) {
+    inflate_stream_settings.Set(strm, 15);
+  }
+  return ret;
 }
 
 int ZEXPORT inflateInit2_(z_streamp strm, int window_bits, const char* version,
@@ -478,8 +491,11 @@ int ZEXPORT inflateInit2_(z_streamp strm, int window_bits, const char* version,
     return Z_VERSION_ERROR;
   }
 
-  inflate_stream_settings.Set(strm, window_bits);
-  return orig_inflateInit2_(strm, window_bits, version, stream_size);
+  int ret = orig_inflateInit2_(strm, window_bits, version, stream_size);
+  if (ret == Z_OK) {
+    inflate_stream_settings.Set(strm, window_bits);
+  }
+  return ret;
 }
 
 int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
@@ -1540,10 +1556,20 @@ int ZEXPORT gzclose(gzFile file) {
 
 int ZEXPORT gzeof(gzFile file) {
   auto gz = gzip_files.Get(file);
-  if (gz == nullptr) {
+  // reached_eof is only maintained by the accelerator read path in gzread. Once
+  // a file is on the zlib path, zlib owns its end-of-file state, so ask zlib
+  // rather than reporting a flag that will never be set.
+  if (gz == nullptr || gz->path == ZLIB) {
     return orig_gzeof != nullptr ? orig_gzeof(file) : 0;
   }
-  return gz->reached_eof;
+  // reached_eof only records that a read of the file came up short; the buffers
+  // may still hold data gzread has not handed back yet. Reporting EOF here
+  // would silently truncate a "while (!gzeof(file)) gzread(...)" loop, so match
+  // gzread's own view of whether more data is available (see the
+  // file_data_remaining/data_remaining checks in its loop above).
+  bool data_remaining = (gz->data_buf_content - gz->data_buf_pos) > 0 ||
+                        (gz->io_buf_content - gz->io_buf_pos) > 0;
+  return gz->reached_eof && !data_remaining;
 }
 #if defined(__clang__)
 #pragma clang attribute pop
