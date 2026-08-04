@@ -1331,10 +1331,9 @@ TEST_F(UnregisteredStreamTest, DeflateAfterFailedInitDoesNotCrash) {
   z_stream strm;
   memset(&strm, 0, sizeof(strm));
 
-  // window_bits is invalid, so zlib rejects the stream. The shim registers
-  // settings before delegating, so an entry does exist here — what matters is
-  // that deflate() on a stream zlib never initialized still reports zlib's
-  // error instead of trusting that state.
+  // window_bits is invalid, so zlib rejects the stream and the shim registers
+  // nothing for it. deflate() therefore finds no entry and has to hand the call
+  // to zlib, which reports its own error, rather than dereferencing the miss.
   ASSERT_EQ(deflateInit2(&strm, 6, Z_DEFLATED, 99, 8, Z_DEFAULT_STRATEGY),
             Z_STREAM_ERROR);
 
@@ -1458,6 +1457,131 @@ TEST_F(UnregisteredStreamTest, GzFunctionsOnUnregisteredFile) {
   EXPECT_EQ(gzread(nullptr, buf.data(), static_cast<unsigned>(buf.size())), -1);
   EXPECT_EQ(gzwrite(nullptr, buf.data(), static_cast<unsigned>(buf.size())), 0);
   EXPECT_EQ(gzclose(nullptr), Z_STREAM_ERROR);
+}
+
+// These tests mutate the global path configuration, so restore it in TearDown
+// rather than at the end of the test body: ASSERT_* returns from the function,
+// which would skip an inline restore and leak the setting into later tests.
+class GzipFileTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+  }
+
+  void TearDown() override {
+    SetConfig(USE_IAA_COMPRESS, saved_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_qat_compress_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_zlib_compress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_qat_uncompress_);
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_zlib_uncompress_);
+    remove("file.gz");
+  }
+
+ private:
+  uint32_t saved_iaa_compress_ = 0;
+  uint32_t saved_qat_compress_ = 0;
+  uint32_t saved_zlib_compress_ = 0;
+  uint32_t saved_iaa_uncompress_ = 0;
+  uint32_t saved_qat_uncompress_ = 0;
+  uint32_t saved_zlib_uncompress_ = 0;
+};
+
+// gzeof has to answer for files the shim handed to zlib as well as the ones it
+// decompressed itself. gz->reached_eof is only ever set by the accelerator read
+// loop, so on the zlib path it stays false forever and gzeof must defer to
+// orig_gzeof. Assert on the return value rather than looping until gzeof is
+// true: without the fix the loop form hangs instead of failing.
+TEST_F(GzipFileTest, GzeofReportsEofOnZlibPath) {
+  // No accelerator enabled means gzwrite/gzread both delegate to zlib, so the
+  // file ends up on the ZLIB path.
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  std::vector<char> input(8192, 'a');
+  ASSERT_EQ(ZlibCompressGzipFile(input.data(), input.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  // Room to spare, so the loop ends on a zero-length read rather than on a full
+  // buffer — zlib only sets its end-of-file indicator once a read runs off the
+  // end of the compressed data.
+  std::vector<char> output(input.size() + 512, 0);
+  size_t read_total = 0;
+  int read_ret = 0;
+  do {
+    read_ret = gzread(fp, output.data() + read_total,
+                      static_cast<unsigned>(output.size() - read_total));
+    ASSERT_GE(read_ret, 0);
+    read_total += static_cast<size_t>(read_ret);
+    ASSERT_LE(read_total, output.size());
+  } while (read_ret > 0);
+
+  ASSERT_EQ(read_total, input.size());
+  output.resize(read_total);
+  EXPECT_EQ(output, input);
+
+  // zlib has consumed the whole member, so gzeof must say so.
+  EXPECT_NE(gzeof(fp), 0);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// On the accelerator path reached_eof only records that a read of the file came
+// up short, which happens while data_buf/io_buf still hold bytes gzread has not
+// returned yet. gzeof reporting EOF there truncates the common
+// "while (!gzeof(file)) gzread(...)" loop, so it has to account for the
+// buffered data too.
+TEST_F(GzipFileTest, GzeofDoesNotReportEofWithBufferedData) {
+  // Write with zlib so the file is a plain gzip member, and read back with an
+  // accelerator enabled so gzread takes its own buffered path. Which
+  // accelerator does not matter; if neither is available the read falls back to
+  // zlib and the loop below still has to deliver every byte.
+  SetCompressPath(ZLIB, false, false, false);
+#if defined(USE_IAA)
+  SetUncompressPath(IAA, true, false);
+#elif defined(USE_QAT)
+  SetUncompressPath(QAT, true, false);
+#else
+  SetUncompressPath(ZLIB, false, false);
+#endif
+
+  std::vector<char> input(8192, 'a');
+  ASSERT_EQ(ZlibCompressGzipFile(input.data(), input.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  // Read in chunks smaller than the file so a chunk boundary lands after the
+  // file has been fully read but before all of it has been handed back. This is
+  // the loop shape the bug breaks: gzeof gates the next read.
+  std::vector<char> output;
+  std::vector<char> chunk(4096, 0);
+  int iterations = 0;
+  while (gzeof(fp) == 0) {
+    int read_ret =
+        gzread(fp, chunk.data(), static_cast<unsigned>(chunk.size()));
+    ASSERT_GE(read_ret, 0);
+    output.insert(output.end(), chunk.begin(), chunk.begin() + read_ret);
+    // The loop must terminate through gzeof, not run away.
+    ASSERT_LT(++iterations, 64);
+    if (read_ret == 0) {
+      break;
+    }
+  }
+
+  EXPECT_EQ(output.size(), input.size());
+  EXPECT_EQ(output, input);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
 }
 
 class ShardedMapTest : public ::testing::Test {};
