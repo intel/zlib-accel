@@ -76,7 +76,15 @@ static void InitStreamRegistries();
 static int init_zlib_accel(void) __attribute__((constructor));
 static void cleanup_zlib_accel(void) __attribute__((destructor));
 
-// Macro that load symbols with error checking
+// Number of orig_* symbols that failed to resolve. Only used for the summary
+// log below: each wrapper checks the specific pointer it needs, so one missing
+// symbol degrades only the paths that actually call it.
+static int missing_symbol_count = 0;
+
+// Macro that loads symbols. A failure is logged but does not stop the sequence:
+// returning early from the constructor would leave every later orig_* pointer
+// null (and the return value of a constructor is ignored anyway), so keep going
+// and resolve as many as possible.
 #define LOAD_SYMBOL(fptr, type, name)                                          \
   do {                                                                         \
     dlerror();                                                                 \
@@ -85,12 +93,12 @@ static void cleanup_zlib_accel(void) __attribute__((destructor));
     if (error != nullptr) {                                                    \
       Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,              \
           "Failed to load symbol '", name, "': ", error, "\n");                \
-      return 1;                                                                \
-    }                                                                          \
-    if (fptr == nullptr) {                                                     \
+      fptr = nullptr;                                                          \
+      missing_symbol_count++;                                                  \
+    } else if (fptr == nullptr) {                                              \
       Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " Symbol '", \
           name, "' resolved to NULL\n");                                       \
-      return 1;                                                                \
+      missing_symbol_count++;                                                  \
     }                                                                          \
   } while (0)
 
@@ -153,6 +161,13 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_gzclose, int (*)(gzFile), "gzclose");
 
   LOAD_SYMBOL(orig_gzeof, int (*)(gzFile), "gzeof");
+
+  if (missing_symbol_count > 0) {
+    Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " ",
+        missing_symbol_count,
+        " zlib symbol(s) could not be resolved; the affected entry points fall "
+        "back to zlib where possible and return Z_VERSION_ERROR where not\n");
+  }
 
   // Load configuration file; on failure (file absent or is a symlink) continue
   // with compiled-in defaults — a missing config is not fatal.
@@ -251,6 +266,14 @@ int ZEXPORT deflateInit_(z_streamp strm, int level, const char* version,
   Log(LogLevel::LOG_INFO, "deflateInit_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", level ", level, "\n");
 
+  // The shim has no deflate implementation of its own, so a missing symbol is
+  // unrecoverable for this entry point. Report it the way zlib reports an
+  // unusable library and register nothing, which keeps deflate() off this
+  // stream.
+  if (orig_deflateInit_ == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
   deflate_stream_settings.Set(strm, level, Z_DEFLATED, 15, 8,
                               Z_DEFAULT_STRATEGY);
   return orig_deflateInit_(strm, level, version, stream_size);
@@ -262,6 +285,10 @@ int ZEXPORT deflateInit2_(z_streamp strm, int level, int method,
   Log(LogLevel::LOG_INFO, "deflateInit2_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", level ", level, ", window_bits ",
       window_bits, " \n");
+
+  if (orig_deflateInit2_ == nullptr) {
+    return Z_VERSION_ERROR;
+  }
 
   deflate_stream_settings.Set(strm, level, method, window_bits, mem_level,
                               strategy);
@@ -275,8 +302,12 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", dictLength ", dictLength, "\n");
     auto deflate_settings = deflate_stream_settings.Get(strm);
-    deflate_settings->path = ZLIB;
-    return orig_deflateSetDictionary(strm, dictionary, dictLength);
+    if (deflate_settings != nullptr) {
+      deflate_settings->path = ZLIB;
+    }
+    return orig_deflateSetDictionary != nullptr
+               ? orig_deflateSetDictionary(strm, dictionary, dictLength)
+               : Z_VERSION_ERROR;
   }
   Log(LogLevel::LOG_INFO, "deflateSetDictionary Line ", __LINE__,
       " ignored because ignore_zlib_dictionary is set to ",
@@ -288,6 +319,13 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
   PrintStats();
+
+  // Without per-stream settings there is nothing to base a path decision on, so
+  // hand the call straight to zlib.
+  if (deflate_settings == nullptr) {
+    return orig_deflate != nullptr ? orig_deflate(strm, flush)
+                                   : Z_VERSION_ERROR;
+  }
 
   Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
@@ -376,10 +414,16 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   }
 
   if (in_call || configs[USE_ZLIB_COMPRESS]) {
-    ret = orig_deflate(strm, flush);
-    INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
-    if (!in_call) {
-      deflate_settings->path = ZLIB;
+    // Distinguish "no zlib to delegate to" from "zlib rejected the data": the
+    // former is an unusable library, not a data problem.
+    if (orig_deflate == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      ret = orig_deflate(strm, flush);
+      INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
+      if (!in_call) {
+        deflate_settings->path = ZLIB;
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -398,7 +442,7 @@ int ZEXPORT deflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   deflate_stream_settings.Unset(strm);
-  return orig_deflateEnd(strm);
+  return orig_deflateEnd != nullptr ? orig_deflateEnd(strm) : Z_VERSION_ERROR;
 }
 
 int ZEXPORT deflateReset(z_streamp strm) {
@@ -409,23 +453,32 @@ int ZEXPORT deflateReset(z_streamp strm) {
     deflate_settings->path = UNDEFINED;
   }
 
-  return orig_deflateReset(strm);
+  return orig_deflateReset != nullptr ? orig_deflateReset(strm)
+                                      : Z_VERSION_ERROR;
 }
 
 int ZEXPORT inflateInit_(z_streamp strm, const char* version, int stream_size) {
-  inflate_stream_settings.Set(strm, 15);
   Log(LogLevel::LOG_INFO, "inflateInit_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
 
+  if (orig_inflateInit_ == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  inflate_stream_settings.Set(strm, 15);
   return orig_inflateInit_(strm, version, stream_size);
 }
 
 int ZEXPORT inflateInit2_(z_streamp strm, int window_bits, const char* version,
                           int stream_size) {
-  inflate_stream_settings.Set(strm, window_bits);
   Log(LogLevel::LOG_INFO, "inflateInit2_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", window_bits ", window_bits, "\n");
 
+  if (orig_inflateInit2_ == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  inflate_stream_settings.Set(strm, window_bits);
   return orig_inflateInit2_(strm, window_bits, version, stream_size);
 }
 
@@ -435,8 +488,12 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
     Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), "dictLength ", dictLength, "\n");
     auto inflate_settings = inflate_stream_settings.Get(strm);
-    inflate_settings->path = ZLIB;
-    return orig_inflateSetDictionary(strm, dictionary, dictLength);
+    if (inflate_settings != nullptr) {
+      inflate_settings->path = ZLIB;
+    }
+    return orig_inflateSetDictionary != nullptr
+               ? orig_inflateSetDictionary(strm, dictionary, dictLength)
+               : Z_VERSION_ERROR;
   }
   Log(LogLevel::LOG_INFO, "inflateSetDictionary Line ", __LINE__,
       " ignored because ignore_zlib_dictionary is set to ",
@@ -448,6 +505,13 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   auto inflate_settings = inflate_stream_settings.Get(strm);
   INCREMENT_STAT(INFLATE_COUNT);
   PrintStats();
+
+  // Without per-stream settings there is nothing to base a path decision on, so
+  // hand the call straight to zlib.
+  if (inflate_settings == nullptr) {
+    return orig_inflate != nullptr ? orig_inflate(strm, flush)
+                                   : Z_VERSION_ERROR;
+  }
 
   Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", avail_in ", strm->avail_in, ", avail_out ",
@@ -555,10 +619,15 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   }
 
   if (in_call || configs[USE_ZLIB_UNCOMPRESS]) {
-    ret = orig_inflate(strm, flush);
-    INCREMENT_STAT(INFLATE_ZLIB_COUNT);
-    if (!in_call) {
-      inflate_settings->path = ZLIB;
+    // refer to comment in deflate
+    if (orig_inflate == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      ret = orig_inflate(strm, flush);
+      INCREMENT_STAT(INFLATE_ZLIB_COUNT);
+      if (!in_call) {
+        inflate_settings->path = ZLIB;
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -577,7 +646,7 @@ int ZEXPORT inflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   inflate_stream_settings.Unset(strm);
-  return orig_inflateEnd(strm);
+  return orig_inflateEnd != nullptr ? orig_inflateEnd(strm) : Z_VERSION_ERROR;
 }
 
 int ZEXPORT inflateReset(z_streamp strm) {
@@ -588,7 +657,8 @@ int ZEXPORT inflateReset(z_streamp strm) {
     inflate_settings->path = UNDEFINED;
   }
 
-  return orig_inflateReset(strm);
+  return orig_inflateReset != nullptr ? orig_inflateReset(strm)
+                                      : Z_VERSION_ERROR;
 }
 
 int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
@@ -643,14 +713,20 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
         ", accelerator return code ", ret, ", sourceLen ", sourceLen,
         ", destLen ", *destLen, "\n");
   } else if (configs[USE_ZLIB_COMPRESS]) {
-    // compress2 in zlib calls deflate. It was observed that deflate is
-    // sometimes intercepted by the shim. in_call prevents deflate from using
-    // accelerators.
-    in_call = true;
-    ret = orig_compress2(dest, destLen, source, sourceLen, level);
-    in_call = false;
-    Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__, ", zlib return code ",
-        ret, ", sourceLen ", sourceLen, ", destLen ", *destLen, "\n");
+    // refer to comment in deflate
+    if (orig_compress2 == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      // compress2 in zlib calls deflate. It was observed that deflate is
+      // sometimes intercepted by the shim. in_call prevents deflate from using
+      // accelerators.
+      in_call = true;
+      ret = orig_compress2(dest, destLen, source, sourceLen, level);
+      in_call = false;
+      Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__,
+          ", zlib return code ", ret, ", sourceLen ", sourceLen, ", destLen ",
+          *destLen, "\n");
+    }
   } else {
     ret = Z_DATA_ERROR;
   }
@@ -721,13 +797,18 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
         ", accelerator return code ", ret, ", sourceLen ", *sourceLen,
         ", destLen ", *destLen, "\n");
   } else if (configs[USE_ZLIB_UNCOMPRESS]) {
-    // refer to comment in compress2
-    in_call = true;
-    ret = orig_uncompress2(dest, destLen, source, sourceLen);
-    in_call = false;
-    Log(LogLevel::LOG_INFO, "uncompress2 Line ", __LINE__,
-        ", zlib return code ", ret, ", sourceLen ", *sourceLen, ", destLen ",
-        *destLen, "\n");
+    // refer to comment in deflate
+    if (orig_uncompress2 == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      // refer to comment in compress2
+      in_call = true;
+      ret = orig_uncompress2(dest, destLen, source, sourceLen);
+      in_call = false;
+      Log(LogLevel::LOG_INFO, "uncompress2 Line ", __LINE__,
+          ", zlib return code ", ret, ", sourceLen ", *sourceLen, ", destLen ",
+          *destLen, "\n");
+    }
   } else {
     ret = Z_DATA_ERROR;
   }
@@ -742,11 +823,17 @@ int ZEXPORT uncompress(Bytef* dest, uLongf* destLen, const Bytef* source,
 
 ExecutionPath GetDeflateExecutionPath(z_streamp strm) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
+  if (deflate_settings == nullptr) {
+    return ZLIB;
+  }
   return deflate_settings->path;
 }
 
 ExecutionPath GetInflateExecutionPath(z_streamp strm) {
   auto inflate_settings = inflate_stream_settings.Get(strm);
+  if (inflate_settings == nullptr) {
+    return ZLIB;
+  }
   return inflate_settings->path;
 }
 
@@ -764,8 +851,12 @@ struct GzipFile {
     if (io_buf != nullptr) {
       delete[] io_buf;
     }
-    orig_deflateEnd(&deflate_stream);
-    orig_inflateEnd(&inflate_stream);
+    if (orig_deflateEnd != nullptr) {
+      orig_deflateEnd(&deflate_stream);
+    }
+    if (orig_inflateEnd != nullptr) {
+      orig_inflateEnd(&inflate_stream);
+    }
   }
 
   void Reset() {
@@ -779,11 +870,16 @@ struct GzipFile {
     io_buf_content = 0;
 
     memset(&deflate_stream, 0, sizeof(z_stream));
-    orig_deflateInit2_(&deflate_stream, -1, Z_DEFLATED, 31, 8,
-                       Z_DEFAULT_STRATEGY, ZLIB_VERSION, (int)sizeof(z_stream));
+    if (orig_deflateInit2_ != nullptr) {
+      orig_deflateInit2_(&deflate_stream, -1, Z_DEFLATED, 31, 8,
+                         Z_DEFAULT_STRATEGY, ZLIB_VERSION,
+                         (int)sizeof(z_stream));
+    }
     memset(&inflate_stream, 0, sizeof(z_stream));
-    orig_inflateInit2_(&inflate_stream, 31, ZLIB_VERSION,
-                       (int)sizeof(z_stream));
+    if (orig_inflateInit2_ != nullptr) {
+      orig_inflateInit2_(&inflate_stream, 31, ZLIB_VERSION,
+                         (int)sizeof(z_stream));
+    }
   }
 
   void AllocateBuffers() {
@@ -920,6 +1016,9 @@ int GetOpenFlags(const char* mode, FileMode* file_mode) {
 gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   // We need to store the file descriptor for use in other functions.
   // Open the file here and then call gzdopen
+  if (orig_gzdopen == nullptr) {
+    return nullptr;
+  }
   FileMode file_mode = FileMode::NONE;
   int oflag = GetOpenFlags(mode, &file_mode);
   int fd = open((const char*)path, oflag, 0666);
@@ -940,6 +1039,9 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
 }
 
 gzFile ZEXPORT gzdopen(int fd, const char* mode) {
+  if (orig_gzdopen == nullptr) {
+    return nullptr;
+  }
   gzFile file = orig_gzdopen(fd, mode);
 
   Log(LogLevel::LOG_INFO, "gzdopen Line ", __LINE__, ", file ", fd, ", fd ",
@@ -1054,7 +1156,7 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
 
 static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len) {
   int ret = 0;
-  if (configs[USE_ZLIB_COMPRESS]) {
+  if (configs[USE_ZLIB_COMPRESS] && orig_gzwrite != nullptr) {
     ret = orig_gzwrite(file, buf, len);
   } else {
     ret = 0;
@@ -1064,7 +1166,7 @@ static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len) {
 
 static int GzreadZlibUncompress(gzFile file, voidp buf, unsigned len) {
   int ret = 0;
-  if (configs[USE_ZLIB_UNCOMPRESS]) {
+  if (configs[USE_ZLIB_UNCOMPRESS] && orig_gzread != nullptr) {
     ret = orig_gzread(file, buf, len);
   } else {
     ret = -1;
@@ -1127,6 +1229,21 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 
 int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr) {
+    return orig_gzwrite != nullptr ? orig_gzwrite(file, buf, len) : 0;
+  }
+
+  // Same reasoning as gzread: validate the whole set up front rather than
+  // partway through CompressAndWrite, which by then may have buffered data
+  // that has to be either written or dropped. 0 is what zlib returns for a
+  // write it could not perform.
+  if (orig_gzwrite == nullptr || orig_deflate == nullptr ||
+      orig_deflateReset == nullptr || orig_deflateInit2_ == nullptr) {
+    Log(LogLevel::LOG_ERROR, "gzwrite Line ", __LINE__,
+        " a required zlib symbol is unresolved, cannot write\n");
+    return 0;
+  }
+
   Log(LogLevel::LOG_INFO, "gzwrite Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
 
@@ -1184,6 +1301,24 @@ gzwrite_end:
 
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr) {
+    return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
+  }
+
+  // Check every symbol this function may need before touching any state. The
+  // accelerator path can hand the rest of the file to zlib at any point, and a
+  // concatenated stream needs a reset between members, so a check made partway
+  // through would have to either abandon bytes already copied into the
+  // caller's buffer or continue without making progress. Fail fast instead.
+  // orig_inflateInit2_ matters because GzipFile::Reset only initializes
+  // inflate_stream when it resolved; without it the fallback would inflate on
+  // a zeroed stream.
+  if (orig_gzread == nullptr || orig_inflate == nullptr ||
+      orig_inflateReset == nullptr || orig_inflateInit2_ == nullptr) {
+    Log(LogLevel::LOG_ERROR, "gzread Line ", __LINE__,
+        " a required zlib symbol is unresolved, cannot read\n");
+    return -1;
+  }
 
   Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
@@ -1328,6 +1463,13 @@ gzread_end:
 
 int ZEXPORT gzclose(gzFile file) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr || orig_gzclose == nullptr) {
+    // Every path below ends in orig_gzclose, so without it there is nothing
+    // useful to do; leave the entry in place rather than losing the state of a
+    // file that stays open. Z_STREAM_ERROR matches what zlib's own gzclose
+    // returns for a file it cannot act on.
+    return orig_gzclose != nullptr ? orig_gzclose(file) : Z_STREAM_ERROR;
+  }
 
   // Unregister up front, before orig_gzclose frees the gzFile. Unsetting after
   // the free would erase the entry of whatever file has since been allocated at
@@ -1342,10 +1484,19 @@ int ZEXPORT gzclose(gzFile file) {
   int ret = 0;
   if (gz->path != ZLIB &&
       (gz->mode == FileMode::WRITE || gz->mode == FileMode::APPEND)) {
-    // Compress any remaining buffered data
+    // Compress any remaining buffered data. CompressAndWrite may fall back to
+    // zlib, so it needs the same symbols gzwrite checks for; without them the
+    // buffered data cannot be flushed and the file would be silently
+    // truncated, so report the failure.
     int write_ret = 0;
     if (gz->data_buf_content > 0) {
-      write_ret = CompressAndWrite(file, gz.get());
+      if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
+        Log(LogLevel::LOG_ERROR, "gzclose Line ", __LINE__,
+            " a required zlib symbol is unresolved, cannot flush\n");
+        write_ret = 1;
+      } else {
+        write_ret = CompressAndWrite(file, gz.get());
+      }
     }
 
     // Capture file size and name before gzclose
@@ -1389,6 +1540,9 @@ int ZEXPORT gzclose(gzFile file) {
 
 int ZEXPORT gzeof(gzFile file) {
   auto gz = gzip_files.Get(file);
+  if (gz == nullptr) {
+    return orig_gzeof != nullptr ? orig_gzeof(file) : 0;
+  }
   return gz->reached_eof;
 }
 #if defined(__clang__)
