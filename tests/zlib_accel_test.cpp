@@ -1321,19 +1321,20 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
 }
 
 // The shim keeps per-stream state in maps keyed by z_streamp, and every entry
-// point that consumes that state has to cope with the entry being absent. That
-// happens whenever an init call did not register anything: an app that ignores
-// a failed *Init return code and keeps using the stream, a stream that was
-// never initialized at all, or a gzFile the shim never saw. Before these
-// guards existed each of those cases dereferenced a null shared_ptr.
+// point that consumes that state has to cope with the entry being absent: a
+// stream that was never initialized at all, one whose *Init failed, or a
+// gzFile the shim never saw. Before these guards existed each of those cases
+// dereferenced a null shared_ptr.
 class UnregisteredStreamTest : public ::testing::Test {};
 
 TEST_F(UnregisteredStreamTest, DeflateAfterFailedInitDoesNotCrash) {
   z_stream strm;
   memset(&strm, 0, sizeof(strm));
 
-  // window_bits is invalid, so zlib rejects the stream and the shim registers
-  // no settings for it.
+  // window_bits is invalid, so zlib rejects the stream. The shim registers
+  // settings before delegating, so an entry does exist here — what matters is
+  // that deflate() on a stream zlib never initialized still reports zlib's
+  // error instead of trusting that state.
   ASSERT_EQ(deflateInit2(&strm, 6, Z_DEFLATED, 99, 8, Z_DEFAULT_STRATEGY),
             Z_STREAM_ERROR);
 

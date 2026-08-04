@@ -413,11 +413,17 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     }
   }
 
-  if ((in_call || configs[USE_ZLIB_COMPRESS]) && orig_deflate != nullptr) {
-    ret = orig_deflate(strm, flush);
-    INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
-    if (!in_call) {
-      deflate_settings->path = ZLIB;
+  if (in_call || configs[USE_ZLIB_COMPRESS]) {
+    // Distinguish "no zlib to delegate to" from "zlib rejected the data": the
+    // former is an unusable library, not a data problem.
+    if (orig_deflate == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      ret = orig_deflate(strm, flush);
+      INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
+      if (!in_call) {
+        deflate_settings->path = ZLIB;
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -612,11 +618,16 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     }
   }
 
-  if ((in_call || configs[USE_ZLIB_UNCOMPRESS]) && orig_inflate != nullptr) {
-    ret = orig_inflate(strm, flush);
-    INCREMENT_STAT(INFLATE_ZLIB_COUNT);
-    if (!in_call) {
-      inflate_settings->path = ZLIB;
+  if (in_call || configs[USE_ZLIB_UNCOMPRESS]) {
+    // refer to comment in deflate
+    if (orig_inflate == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      ret = orig_inflate(strm, flush);
+      INCREMENT_STAT(INFLATE_ZLIB_COUNT);
+      if (!in_call) {
+        inflate_settings->path = ZLIB;
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -701,15 +712,21 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__,
         ", accelerator return code ", ret, ", sourceLen ", sourceLen,
         ", destLen ", *destLen, "\n");
-  } else if (configs[USE_ZLIB_COMPRESS] && orig_compress2 != nullptr) {
-    // compress2 in zlib calls deflate. It was observed that deflate is
-    // sometimes intercepted by the shim. in_call prevents deflate from using
-    // accelerators.
-    in_call = true;
-    ret = orig_compress2(dest, destLen, source, sourceLen, level);
-    in_call = false;
-    Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__, ", zlib return code ",
-        ret, ", sourceLen ", sourceLen, ", destLen ", *destLen, "\n");
+  } else if (configs[USE_ZLIB_COMPRESS]) {
+    // refer to comment in deflate
+    if (orig_compress2 == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      // compress2 in zlib calls deflate. It was observed that deflate is
+      // sometimes intercepted by the shim. in_call prevents deflate from using
+      // accelerators.
+      in_call = true;
+      ret = orig_compress2(dest, destLen, source, sourceLen, level);
+      in_call = false;
+      Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__,
+          ", zlib return code ", ret, ", sourceLen ", sourceLen, ", destLen ",
+          *destLen, "\n");
+    }
   } else {
     ret = Z_DATA_ERROR;
   }
@@ -779,14 +796,19 @@ int ZEXPORT uncompress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     Log(LogLevel::LOG_INFO, "uncompress2 Line ", __LINE__,
         ", accelerator return code ", ret, ", sourceLen ", *sourceLen,
         ", destLen ", *destLen, "\n");
-  } else if (configs[USE_ZLIB_UNCOMPRESS] && orig_uncompress2 != nullptr) {
-    // refer to comment in compress2
-    in_call = true;
-    ret = orig_uncompress2(dest, destLen, source, sourceLen);
-    in_call = false;
-    Log(LogLevel::LOG_INFO, "uncompress2 Line ", __LINE__,
-        ", zlib return code ", ret, ", sourceLen ", *sourceLen, ", destLen ",
-        *destLen, "\n");
+  } else if (configs[USE_ZLIB_UNCOMPRESS]) {
+    // refer to comment in deflate
+    if (orig_uncompress2 == nullptr) {
+      ret = Z_VERSION_ERROR;
+    } else {
+      // refer to comment in compress2
+      in_call = true;
+      ret = orig_uncompress2(dest, destLen, source, sourceLen);
+      in_call = false;
+      Log(LogLevel::LOG_INFO, "uncompress2 Line ", __LINE__,
+          ", zlib return code ", ret, ", sourceLen ", *sourceLen, ", destLen ",
+          *destLen, "\n");
+    }
   } else {
     ret = Z_DATA_ERROR;
   }
@@ -1167,9 +1189,6 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 
   if (ret == 0) {
     gz->data_buf_pos = input_len;
-  } else if (orig_deflate == nullptr) {
-    // No accelerator result and no zlib to fall back to.
-    return 1;
   } else {
     gz->deflate_stream.next_in = (Bytef*)(gz->data_buf);
     gz->deflate_stream.avail_in =
@@ -1185,9 +1204,7 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
     if (ret == Z_STREAM_END) {
       gz->data_buf_pos = gz->data_buf_content - gz->deflate_stream.avail_in;
       output_len = gz->io_buf_size - gz->deflate_stream.avail_out;
-      if (orig_deflateReset != nullptr) {
-        orig_deflateReset(&gz->deflate_stream);
-      }
+      orig_deflateReset(&gz->deflate_stream);
     } else {
       return 1;
     }
@@ -1215,6 +1232,18 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
   if (gz == nullptr) {
     return orig_gzwrite != nullptr ? orig_gzwrite(file, buf, len) : 0;
   }
+
+  // Same reasoning as gzread: validate the whole set up front rather than
+  // partway through CompressAndWrite, which by then may have buffered data
+  // that has to be either written or dropped. 0 is what zlib returns for a
+  // write it could not perform.
+  if (orig_gzwrite == nullptr || orig_deflate == nullptr ||
+      orig_deflateReset == nullptr || orig_deflateInit2_ == nullptr) {
+    Log(LogLevel::LOG_ERROR, "gzwrite Line ", __LINE__,
+        " a required zlib symbol is unresolved, cannot write\n");
+    return 0;
+  }
+
   Log(LogLevel::LOG_INFO, "gzwrite Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
 
@@ -1274,6 +1303,21 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   auto gz = gzip_files.Get(file);
   if (gz == nullptr) {
     return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
+  }
+
+  // Check every symbol this function may need before touching any state. The
+  // accelerator path can hand the rest of the file to zlib at any point, and a
+  // concatenated stream needs a reset between members, so a check made partway
+  // through would have to either abandon bytes already copied into the
+  // caller's buffer or continue without making progress. Fail fast instead.
+  // orig_inflateInit2_ matters because GzipFile::Reset only initializes
+  // inflate_stream when it resolved; without it the fallback would inflate on
+  // a zeroed stream.
+  if (orig_gzread == nullptr || orig_inflate == nullptr ||
+      orig_inflateReset == nullptr || orig_inflateInit2_ == nullptr) {
+    Log(LogLevel::LOG_ERROR, "gzread Line ", __LINE__,
+        " a required zlib symbol is unresolved, cannot read\n");
+    return -1;
   }
 
   Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
@@ -1365,11 +1409,6 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
             }
           }
 
-          if (gz->use_zlib_for_decompression && orig_inflate == nullptr) {
-            read_bytes = -1;
-            goto gzread_end;
-          }
-
           if (gz->use_zlib_for_decompression) {
             gz->inflate_stream.next_in = (Bytef*)(gz->io_buf);
             gz->inflate_stream.avail_in =
@@ -1388,7 +1427,7 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
                   (gz->io_buf_content - gz->inflate_stream.avail_in);
               gz->data_buf_content +=
                   (gz->data_buf_size - gz->inflate_stream.avail_out);
-              if (ret == Z_STREAM_END && orig_inflateReset != nullptr) {
+              if (ret == Z_STREAM_END) {
                 orig_inflateReset(&gz->inflate_stream);
               }
             } else if (ret != Z_OK) {
@@ -1445,10 +1484,19 @@ int ZEXPORT gzclose(gzFile file) {
   int ret = 0;
   if (gz->path != ZLIB &&
       (gz->mode == FileMode::WRITE || gz->mode == FileMode::APPEND)) {
-    // Compress any remaining buffered data
+    // Compress any remaining buffered data. CompressAndWrite may fall back to
+    // zlib, so it needs the same symbols gzwrite checks for; without them the
+    // buffered data cannot be flushed and the file would be silently
+    // truncated, so report the failure.
     int write_ret = 0;
     if (gz->data_buf_content > 0) {
-      write_ret = CompressAndWrite(file, gz.get());
+      if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
+        Log(LogLevel::LOG_ERROR, "gzclose Line ", __LINE__,
+            " a required zlib symbol is unresolved, cannot flush\n");
+        write_ret = 1;
+      } else {
+        write_ret = CompressAndWrite(file, gz.get());
+      }
     }
 
     // Capture file size and name before gzclose
