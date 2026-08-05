@@ -2610,6 +2610,228 @@ TEST(IGZIPInflateRegressionTest, AutoDetectWindowBitsDecodesBothFormats) {
   DestroyBlock(input);
 }
 
+// Returns true if the buffer contains a 00 00 FF FF deflate sync marker.
+bool ContainsSyncMarker(const char* data, size_t length) {
+  for (size_t i = 0; i + 3 < length; i++) {
+    if (static_cast<unsigned char>(data[i]) == 0x00 &&
+        static_cast<unsigned char>(data[i + 1]) == 0x00 &&
+        static_cast<unsigned char>(data[i + 2]) == 0xff &&
+        static_cast<unsigned char>(data[i + 3]) == 0xff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Z_BLOCK ends a deflate block without byte-aligning and without emitting the
+// 00 00 FF FF sync marker. ISA-L's only flushing modes (SYNC_FLUSH,
+// FULL_FLUSH) always do both, so SupportedOptionsIGZIPDeflate() keeps a
+// Z_BLOCK stream off the IGZIP path and zlib produces the framing.
+TEST(IGZIPDeflateRegressionTest, ZBlockStaysOnZlibAndEmitsNoSyncMarker) {
+  // zlib_fallback must be on: the flush value is gated off IGZIP, so zlib has
+  // to be available to take the stream.
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length));
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  EXPECT_EQ(deflate(&stream, Z_BLOCK), Z_OK);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_GT(produced, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+  EXPECT_FALSE(ContainsSyncMarker(reinterpret_cast<const char*>(output.data()),
+                                  produced))
+      << "Z_BLOCK must not emit a 00 00 FF FF sync marker";
+
+  deflateEnd(&stream);
+  DestroyBlock(input);
+}
+
+// The predicate only gates path *selection*. A stream that lands on IGZIP
+// under an allowed flush value and then switches to Z_BLOCK mid-stream stays
+// on IGZIP by stickiness -- ISA-L holds unflushed state, so it cannot be
+// migrated to zlib without corrupting the output. Z_BLOCK is then treated as
+// Z_SYNC_FLUSH: an extra sync marker, but still valid deflate that
+// round-trips. This documents the accepted residual behavior.
+TEST(IGZIPDeflateRegressionTest, ZBlockMidStreamStaysOnIGZIPAndRoundTrips) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> buffer(deflateBound(&stream, input_length) + 4096);
+  std::string compressed;
+
+  // Land the stream on IGZIP with a flush value the predicate allows.
+  const size_t first_half = input_length / 2;
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(first_half);
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+  ASSERT_EQ(deflate(&stream, Z_SYNC_FLUSH), Z_OK);
+  ASSERT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  compressed.append(reinterpret_cast<const char*>(buffer.data()),
+                    buffer.size() - stream.avail_out);
+
+  // Now switch to Z_BLOCK mid-stream: stickiness keeps it on IGZIP.
+  stream.next_in = reinterpret_cast<Bytef*>(input) + first_half;
+  stream.avail_in = static_cast<uInt>(input_length - first_half);
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+  EXPECT_EQ(deflate(&stream, Z_BLOCK), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  compressed.append(reinterpret_cast<const char*>(buffer.data()),
+                    buffer.size() - stream.avail_out);
+
+  // Finish the stream.
+  int ret = Z_OK;
+  for (int i = 0; i < 64 && ret != Z_STREAM_END; i++) {
+    stream.next_out = buffer.data();
+    stream.avail_out = static_cast<uInt>(buffer.size());
+    ret = deflate(&stream, Z_FINISH);
+    ASSERT_GE(ret, Z_OK);
+    compressed.append(reinterpret_cast<const char*>(buffer.data()),
+                      buffer.size() - stream.avail_out);
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+  deflateEnd(&stream);
+
+  // The extra sync marker is harmless: the stream must still decode exactly.
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(ZlibUncompress(compressed.data(), compressed.size(), input_length,
+                           &uncompressed, &uncompressed_length, &input_consumed,
+                           15, Z_FINISH, 1, &uncompress_path),
+            Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+
+  DestroyBlock(uncompressed);
+  DestroyBlock(input);
+}
+
+// No backend honors deflateInit2's strategy argument (zlib defines it as
+// affecting compression ratio, not correctness). Output must still be valid
+// and round-trip exactly. Compressed size is deliberately not asserted -- it
+// is an ISA-L implementation detail that changes between versions.
+TEST(IGZIPDeflateRegressionTest, NonDefaultStrategiesStillRoundTrip) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  for (const int strategy :
+       {Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED}) {
+    z_stream stream;
+    memset(&stream, 0, sizeof(z_stream));
+    ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                           strategy),
+              Z_OK)
+        << "strategy " << strategy;
+
+    std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+    stream.next_in = reinterpret_cast<Bytef*>(input);
+    stream.avail_in = static_cast<uInt>(input_length);
+    stream.next_out = output.data();
+    stream.avail_out = static_cast<uInt>(output.size());
+
+    ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END)
+        << "strategy " << strategy;
+    const size_t produced = output.size() - stream.avail_out;
+    EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP)
+        << "strategy " << strategy << " must not change path selection";
+    deflateEnd(&stream);
+
+    char* uncompressed = nullptr;
+    size_t uncompressed_length = 0;
+    size_t input_consumed = 0;
+    ExecutionPath uncompress_path = UNDEFINED;
+    ASSERT_EQ(
+        ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                       input_length, &uncompressed, &uncompressed_length,
+                       &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+        Z_STREAM_END)
+        << "strategy " << strategy;
+    EXPECT_EQ(uncompressed_length, input_length) << "strategy " << strategy;
+    EXPECT_EQ(memcmp(uncompressed, input, input_length), 0)
+        << "strategy " << strategy;
+    DestroyBlock(uncompressed);
+  }
+
+  DestroyBlock(input);
+}
+
+// An application may call inflate() with avail_in == 0 and next_in == nullptr
+// on an active IGZIP stream. next_in is never dereferenced at length 0, but it
+// must not be handed to ISA-L as NULL either.
+TEST(IGZIPInflateRegressionTest, ActiveStreamHandlesNullNextInWithZeroAvailIn) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 16384;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<char> output(input_length + 1024);
+
+  // First call: feed only part of the input so the IGZIP stream stays active.
+  const size_t partial = compressed.size() / 2;
+  stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  stream.avail_in = static_cast<unsigned int>(partial);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<unsigned int>(output.size());
+  ASSERT_GE(inflate(&stream, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+
+  // Second call: no input at all, and next_in explicitly NULL.
+  stream.next_in = nullptr;
+  stream.avail_in = 0;
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<unsigned int>(output.size());
+  const int ret = inflate(&stream, Z_NO_FLUSH);
+  EXPECT_TRUE(ret == Z_BUF_ERROR || ret == Z_OK)
+      << "expected Z_BUF_ERROR or Z_OK, got " << ret;
+
+  inflateEnd(&stream);
+  DestroyBlock(input);
+}
+
 #ifdef USE_IAA
 // IAA->IGZIP fallback tests.
 // On machines without IAA hardware, CompressIAA/UncompressIAA return non-zero,

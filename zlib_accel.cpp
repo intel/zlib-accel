@@ -425,7 +425,8 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #ifdef USE_IGZIP
     igzip_stream_active = (deflate_settings->path == IGZIP &&
                            deflate_settings->isal_strm != nullptr);
-    igzip_available = configs[USE_IGZIP_COMPRESS];
+    igzip_available =
+        configs[USE_IGZIP_COMPRESS] && SupportedOptionsIGZIPDeflate(flush);
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
@@ -983,7 +984,9 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
                   SupportedOptionsQAT(kWindowBitsZlib, input_len);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS];
+  // compress2 is one-shot, i.e. equivalent to a single deflate(Z_FINISH).
+  igzip_available =
+      configs[USE_IGZIP_COMPRESS] && SupportedOptionsIGZIPDeflate(Z_FINISH);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1438,7 +1441,9 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
                   SupportedOptionsQAT(kWindowBitsGzip, *input_length);
 #endif
 #ifdef USE_IGZIP
-  igzip_available = configs[USE_IGZIP_COMPRESS];
+  // gzwrite compresses each buffer as a complete stream, i.e. Z_FINISH.
+  igzip_available =
+      configs[USE_IGZIP_COMPRESS] && SupportedOptionsIGZIPDeflate(Z_FINISH);
 #endif
 
   ExecutionPath path_selected = ZLIB;

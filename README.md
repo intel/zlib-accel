@@ -37,6 +37,15 @@ IAA
   - If the input data contains more than one stream, decompression stops at the first end-of-stream (same as zlib).
   - Data compressed with a history window > 4kB is in general not decompressible with IAA (zlib default window is 32kB).
 
+IGZIP
+- ISA-L software SIMD deflate; no hardware accelerator required. Unlike QAT and IAA, it supports genuine streaming (stateful) compression and decompression, so it is also usable as a fallback for the two hardware backends (see the igzip_fallback option).
+- Compression:
+  - `Z_BLOCK` is not offloadable. It ends a deflate block without byte-aligning the output and without emitting the `00 00 FF FF` sync marker, which ISA-L cannot express — its only two flushing modes, `SYNC_FLUSH` and `FULL_FLUSH`, both always byte-align and always emit the marker. A stream that uses `Z_BLOCK` is therefore handled by zlib. The one exception is a stream that has already started on IGZIP under a different flush value and then switches to `Z_BLOCK` mid-stream: ISA-L holds unflushed stream state at that point and the stream cannot be moved to zlib without corrupting the output, so `Z_BLOCK` is treated as `Z_SYNC_FLUSH` (byte-aligned, with the extra sync marker). The result is still valid deflate that any decompressor accepts; only an application parsing block boundaries itself can observe the difference.
+  - `Z_PARTIAL_FLUSH` is treated as `Z_SYNC_FLUSH`, which zlib permits.
+
+All backends
+- The `strategy` argument of `deflateInit2`/`deflateParams` is not honored by any backend (QAT, IAA, or IGZIP). Compressed output remains valid and round-trips correctly — zlib defines strategy as affecting "the compression ratio but not the correctness of the compressed output" — but the ratio tuning requested by `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`, or `Z_FILTERED` is silently ignored. Applications that depend on a specific strategy for output size or entropy characteristics should disable offload for those streams.
+
 CI for HW offload tests is in development (tests are currently run internally).
 
 
@@ -62,7 +71,7 @@ CMake supports the following options:
 - USE_IGZIP (ON/OFF): include IGZIP acceleration (requires ISA-L)
 - QPL_PATH: path to QPL for IAA acceleration (if not in a standard directory)
 - QATZIP_PATH: path to QATzip for QAT acceleration (if not in a standard directory)
-- ISAL_PATH: path to ISA-L for IGZIP acceleration (if not in a standard directory)
+- ISAL_PATH: path to ISA-L for IGZIP acceleration (if not in a standard directory). May be either an ISA-L build tree or an install prefix.
 - DEBUG_LOG (ON/OFF): enable logging
 - ENABLE_STATISTICS (ON/OFF): enable statistics
 - COVERAGE (ON/OFF): enable test coverage (more details in a later section)

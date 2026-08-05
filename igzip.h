@@ -7,12 +7,15 @@
 #include <igzip_lib.h>
 #include <zlib.h>
 
+#define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
+
 struct isal_zstream *InitCompressIGZIP(int level, int windowBits);
 int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
                   const uint8_t *input, uint32_t *input_length, uint8_t *output,
                   uint32_t *output_length, const unsigned long *total_in,
                   const unsigned long *total_out);
 bool IsIGZIPDeflateFinished(const struct isal_zstream *stream);
+VISIBLE_FOR_TESTING bool SupportedOptionsIGZIPDeflate(int flush);
 bool SupportedOptionsIGZIPInflate(int window_bits);
 
 enum IGZIPInflatePathAction {

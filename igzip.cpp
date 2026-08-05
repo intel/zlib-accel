@@ -63,6 +63,25 @@ static void ConfigureInflateWindow(struct inflate_state *isal_strm_inflate,
   isal_strm_inflate->hist_bits = ClampHistBits(windowBits);
 }
 
+bool SupportedOptionsIGZIPDeflate(int flush) {
+  // Z_BLOCK ends the current deflate block *without* byte-aligning the output
+  // and without emitting the 00 00 FF FF sync marker; up to seven bits of the
+  // block are held back for the next call. ISA-L cannot express that: its only
+  // two flushing modes, SYNC_FLUSH and FULL_FLUSH, both always byte-align and
+  // always emit the marker. (Neither can QAT or IAA -- QATzip has no flush
+  // concept and QPL submits one-shot FIRST|LAST jobs -- but those two only
+  // offload on Z_FINISH, so IGZIP is the sole backend that can reach Z_BLOCK.)
+  // Leave these streams on zlib, the same way SupportedOptionsIGZIPInflate()
+  // leaves auto-detect window bits to zlib.
+  if (flush == Z_BLOCK) {
+    Log(LogLevel::LOG_INFO,
+        "SupportedOptionsIGZIPDeflate() Z_BLOCK framing cannot be expressed "
+        "by ISA-L\n");
+    return false;
+  }
+  return true;
+}
+
 bool SupportedOptionsIGZIPInflate(int window_bits) {
   // zlib adds 32 to windowBits to request automatic zlib/gzip header
   // detection (32, and 40..47). ISA-L has no auto-detect mode -- crc_flag
@@ -167,6 +186,15 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
       break;
     case Z_SYNC_FLUSH:
     case Z_PARTIAL_FLUSH:
+    // Z_BLOCK only reaches here when the stream already landed on IGZIP under
+    // a different flush value: SupportedOptionsIGZIPDeflate() keeps a stream
+    // that uses Z_BLOCK from the start off this path entirely. Once ISA-L
+    // holds unflushed stream state the stream cannot be handed back to zlib
+    // without corrupting the output, so the honest remaining choice is to
+    // treat it as Z_SYNC_FLUSH: byte-aligned with an extra 00 00 FF FF marker,
+    // which is still valid deflate that any decompressor accepts. Only an
+    // application parsing block boundaries itself can observe the difference.
+    // Documented as a known limitation in the README.
     case Z_BLOCK:
       isal_strm->flush = SYNC_FLUSH;
       break;
@@ -301,9 +329,16 @@ void IGZIPHandleActiveStreamNoInput(z_streamp strm,
   uint32_t output_len = strm->avail_out;
   bool end_of_stream = true;
 
-  *ret = UncompressIGZIP(isal_strm_inflate, strm->next_in, &input_len,
-                         strm->next_out, &output_len, &strm->total_in,
-                         &strm->total_out, &end_of_stream);
+  // avail_in is 0 here, so next_in is never dereferenced -- but a caller is
+  // free to leave it NULL, and passing NULL on to ISA-L is undefined behavior
+  // regardless of the length. Substitute a valid address.
+  static uint8_t dummy_input = 0;
+  const uint8_t *next_in =
+      strm->next_in != nullptr ? strm->next_in : &dummy_input;
+
+  *ret = UncompressIGZIP(isal_strm_inflate, next_in, &input_len, strm->next_out,
+                         &output_len, &strm->total_in, &strm->total_out,
+                         &end_of_stream);
 
   if (*ret == 0) {
     strm->next_out += output_len;
@@ -446,11 +481,9 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
         Log(LogLevel::LOG_ERROR,
             "UncompressIGZIP() ISA-L error - Invalid lookback\n");
         break;
-      case ISAL_END_INPUT:
-        Log(LogLevel::LOG_ERROR,
-            "UncompressIGZIP() ISA-L error - End of input reached "
-            "unexpectedly\n");
-        break;
+      // ISAL_END_INPUT is deliberately absent here: it is treated as success
+      // above (ret == 0) because a truncated-looking read is normal for
+      // streaming input, so it can never reach this error switch.
       case ISAL_UNSUPPORTED_METHOD:
         Log(LogLevel::LOG_ERROR,
             "UncompressIGZIP() ISA-L error - Unsupported method\n");

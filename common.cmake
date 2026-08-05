@@ -24,9 +24,15 @@ if(USE_IGZIP)
   #   - gzip_flag mutated by isal_deflate when writing wrapper header
   # Earlier versions require defensive workarounds that have been removed.
   if(ISAL_PATH)
-    set(_isal_api_header "${ISAL_PATH}/include/isal_api.h")
+    # A build tree keeps headers in include/; an install prefix puts them in
+    # include/isa-l/.
+    if(EXISTS "${ISAL_PATH}/include/isal_api.h")
+      set(_isal_api_header "${ISAL_PATH}/include/isal_api.h")
+    elseif(EXISTS "${ISAL_PATH}/include/isa-l/isal_api.h")
+      set(_isal_api_header "${ISAL_PATH}/include/isa-l/isal_api.h")
+    endif()
   else()
-    find_path(_isal_api_include isal_api.h PATH_SUFFIXES include)
+    find_path(_isal_api_include isal_api.h PATH_SUFFIXES include include/isa-l isa-l)
     if(_isal_api_include)
       set(_isal_api_header "${_isal_api_include}/isal_api.h")
     endif()
@@ -154,8 +160,11 @@ if(USE_IGZIP)
     endif()
   else()
     message(STATUS "Using ISAL_PATH: ${ISAL_PATH}")
-    include_directories(${ISAL_PATH}/include)
-    link_directories(${ISAL_PATH}/.libs)
+    # ISAL_PATH may point at either an ISA-L build tree (headers in include/,
+    # library in .libs/) or an install prefix (headers in include/isa-l/,
+    # library in lib64/ or lib/). Search all of them.
+    include_directories(${ISAL_PATH}/include ${ISAL_PATH}/include/isa-l)
+    link_directories(${ISAL_PATH}/.libs ${ISAL_PATH}/lib64 ${ISAL_PATH}/lib)
     link_libraries(isal)
   endif()
 endif()
