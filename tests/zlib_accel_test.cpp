@@ -1953,6 +1953,93 @@ TEST(IGZIPInflateRegressionTest,
   inflateEnd(&dstream);
 }
 
+// inflateReset() reuses the already-allocated ISA-L stream, so ConfigureInflate
+// Window() is not called again for the second stream.  That is only correct
+// because isal_inflate_reset() leaves crc_flag (the wrapper format) and
+// hist_bits alone -- isal_inflate_init() zeroes both, reset deliberately does
+// not touch them.  igzip_lib.h documents no guarantee either way, so guard the
+// behavior here: with zlib_fallback off, a regression surfaces directly as
+// Z_DATA_ERROR on the second stream instead of being masked by zlib taking
+// over.
+TEST(IGZIPInflateRegressionTest, ResetMustPreserveWrapperFormatAcrossStreams) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  // 31 = gzip wrapper, -15 = raw deflate.  A cleared crc_flag would decode the
+  // gzip case as raw deflate; a cleared hist_bits would corrupt long matches.
+  for (const int window_bits : {31, -15}) {
+    const size_t input_length = 16384;
+    char* first = GenerateBlock(input_length, compressible_block);
+    ASSERT_NE(first, nullptr) << "window_bits " << window_bits;
+    char* second = GenerateBlock(input_length, incompressible_block);
+    ASSERT_NE(second, nullptr) << "window_bits " << window_bits;
+
+    std::string first_compressed;
+    std::string second_compressed;
+    size_t output_upper_bound = 0;
+    ExecutionPath compress_path = UNDEFINED;
+    ASSERT_EQ(ZlibCompress(first, input_length, &first_compressed, window_bits,
+                           Z_FINISH, &output_upper_bound, &compress_path),
+              Z_STREAM_END)
+        << "window_bits " << window_bits;
+    ASSERT_EQ(
+        ZlibCompress(second, input_length, &second_compressed, window_bits,
+                     Z_FINISH, &output_upper_bound, &compress_path),
+        Z_STREAM_END)
+        << "window_bits " << window_bits;
+
+    z_stream dstream;
+    memset(&dstream, 0, sizeof(dstream));
+    ASSERT_EQ(inflateInit2(&dstream, window_bits), Z_OK)
+        << "window_bits " << window_bits;
+
+    // Both streams are decompressed on the same z_stream, with only an
+    // inflateReset() in between.
+    const std::string* compressed[2] = {&first_compressed, &second_compressed};
+    const char* expected[2] = {first, second};
+    for (int stream_index = 0; stream_index < 2; ++stream_index) {
+      if (stream_index == 1) {
+        ASSERT_EQ(inflateReset(&dstream), Z_OK)
+            << "window_bits " << window_bits;
+      }
+
+      std::vector<unsigned char> output(input_length + 1024);
+      dstream.next_in = reinterpret_cast<Bytef*>(
+          const_cast<char*>(compressed[stream_index]->data()));
+      dstream.avail_in = static_cast<uInt>(compressed[stream_index]->size());
+      dstream.next_out = output.data();
+      dstream.avail_out = static_cast<uInt>(output.size());
+
+      int ret = Z_OK;
+      for (int iter = 0; iter < 1024; ++iter) {
+        ret = inflate(&dstream, Z_NO_FLUSH);
+        ASSERT_NE(ret, Z_DATA_ERROR)
+            << "window_bits " << window_bits << ", stream " << stream_index;
+        if (ret == Z_STREAM_END) {
+          break;
+        }
+        if (ret == Z_BUF_ERROR && dstream.avail_in == 0) {
+          break;
+        }
+      }
+      ASSERT_EQ(ret, Z_STREAM_END)
+          << "window_bits " << window_bits << ", stream " << stream_index;
+      EXPECT_EQ(GetInflateExecutionPath(&dstream), IGZIP)
+          << "window_bits " << window_bits << ", stream " << stream_index;
+
+      const size_t produced = output.size() - dstream.avail_out;
+      ASSERT_EQ(produced, input_length)
+          << "window_bits " << window_bits << ", stream " << stream_index;
+      EXPECT_EQ(memcmp(output.data(), expected[stream_index], input_length), 0)
+          << "window_bits " << window_bits << ", stream " << stream_index;
+    }
+
+    inflateEnd(&dstream);
+    DestroyBlock(first);
+    DestroyBlock(second);
+  }
+}
+
 TEST(IGZIPDeflateRegressionTest, DictionaryStreamMustStayOnZlibAcrossReset) {
   SetCompressPath(IGZIP, false, false, false);
   SetUncompressPath(ZLIB, false, false);
@@ -2425,7 +2512,6 @@ TEST(IGZIPDeflateRegressionTest, SyncFlushWithInputMustStayOnIGZIPPath) {
   inflateEnd(&dstream);
 }
 
-#ifdef USE_IGZIP
 TEST(IGZIPDeflateRegressionTest, Compress2MustDetectTruncatedOutput) {
   // Regression: compress2() returned Z_OK on a truncated stream when destLen
   // was too small to hold the ISA-L trailer.  ISA-L consumes all input
@@ -2450,7 +2536,6 @@ TEST(IGZIPDeflateRegressionTest, Compress2MustDetectTruncatedOutput) {
   // Must NOT silently succeed on truncated output.
   EXPECT_NE(ret, Z_OK);
 }
-#endif  // USE_IGZIP
 
 TEST(IGZIPInflateRegressionTest,
      NeedDictFromIGZIPMustFallbackToZlibOnFirstInflateCall) {
@@ -2786,6 +2871,89 @@ TEST(IGZIPDeflateRegressionTest, NonDefaultStrategiesStillRoundTrip) {
   DestroyBlock(input);
 }
 
+// Z_NO_COMPRESSION (level 0) asks for stored, uncompressed deflate blocks,
+// which no backend can produce.  Such a stream must be pinned to zlib at path
+// selection: before the fix InitCompressIGZIP() rejected the level per call and
+// deflate() returned Z_DATA_ERROR forever whenever use_zlib_compress was 0,
+// because deflate_settings->path was still UNDEFINED at the zlib fall-through.
+TEST(IGZIPDeflateRegressionTest, NoCompressionLevelStaysOnZlibAndStoresInput) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_NO_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+  deflateEnd(&stream);
+
+  // Stored blocks are slightly larger than the input (5 bytes of block header
+  // per 65535, plus wrapper).  Any real compression of a compressible block
+  // would be far smaller, so this is what proves level 0 was actually honored
+  // rather than silently compressed by a backend.
+  EXPECT_GT(produced, input_length);
+  EXPECT_LT(produced, input_length + 1024);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+
+// Same contract on the one-shot path.  compress2() has no per-stream path to
+// pin, so it carries the decision in a local and must reach zlib even with
+// use_zlib_compress == 0 -- the request was never an offload candidate.
+TEST(IGZIPDeflateRegressionTest, Compress2NoCompressionLevelStoresInput) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  uLong destLen = compressBound(static_cast<uLong>(input_length));
+  std::vector<Bytef> dest(destLen);
+
+  ASSERT_EQ(
+      compress2(dest.data(), &destLen, reinterpret_cast<const Bytef*>(input),
+                static_cast<uLong>(input_length), Z_NO_COMPRESSION),
+      Z_OK);
+  EXPECT_GT(destLen, static_cast<uLong>(input_length));
+
+  std::vector<Bytef> round_trip(input_length);
+  uLong round_trip_len = static_cast<uLong>(round_trip.size());
+  ASSERT_EQ(
+      uncompress(round_trip.data(), &round_trip_len, dest.data(), destLen),
+      Z_OK);
+  EXPECT_EQ(round_trip_len, static_cast<uLong>(input_length));
+  EXPECT_EQ(memcmp(round_trip.data(), input, input_length), 0);
+
+  DestroyBlock(input);
+}
+
 // An application may call inflate() with avail_in == 0 and next_in == nullptr
 // on an active IGZIP stream. next_in is never dereferenced at length 0, but it
 // must not be handed to ISA-L as NULL either.
@@ -2907,6 +3075,43 @@ TEST(IAAFallbackIGZIPTest, DeflateDoesNotUseIGZIPWhenFallbackDisabled) {
   // stream; it should fall through to zlib.
   const ExecutionPath path = GetDeflateExecutionPath(&stream);
   EXPECT_NE(path, IGZIP) << "IGZIP must not be used when igzip_fallback=0";
+
+  deflateEnd(&stream);
+  SetConfig(IGZIP_FALLBACK, 0);
+  DestroyBlock(input);
+}
+
+// A level-0 stream is pinned to zlib before any backend is consulted, so the
+// accelerator->IGZIP fallback block must be unreachable for it even with
+// igzip_fallback=1.  Hardware-independent: IAA is never attempted either way,
+// so the expected path is strictly ZLIB on any machine.
+TEST(IAAFallbackIGZIPTest, NoCompressionLevelMustNotFallBackToIGZIP) {
+  SetCompressPath(IAA, /*zlib_fallback=*/false,
+                  /*iaa_prepend_empty_block=*/false,
+                  /*qat_compression_allow_chunking=*/false);
+  SetConfig(USE_IGZIP_COMPRESS, 1);
+  SetConfig(IGZIP_FALLBACK, 1);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_NO_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+  EXPECT_GT(produced, input_length);
 
   deflateEnd(&stream);
   SetConfig(IGZIP_FALLBACK, 0);
@@ -3169,7 +3374,7 @@ TEST(QATFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
 }
 #endif  // USE_QAT && USE_IGZIP
 
-#endif
+#endif  // USE_IGZIP
 
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibPartialAndMultiStreamTest,

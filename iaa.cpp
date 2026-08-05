@@ -17,6 +17,10 @@
 
 using namespace config;
 
+// Java's ZipInputStream feeds inflate() from a fixed 512-byte buffer; see the
+// rationale in IsIAADecompressible().
+static constexpr uint32_t kZipInputStreamBufferSize = 512;
+
 void IAAJob::InitJob(qpl_path_t execution_path) {
   uint32_t size;
   qpl_status status = qpl_get_job_size(execution_path, &size);
@@ -291,7 +295,6 @@ bool IsIAADecompressible(uint8_t* input, uint32_t input_length,
   // guaranteed not to be a ZipInputStream-chunked read. Lucene stored-field
   // entries are typically much larger than 512 bytes; the few that are smaller
   // fall back to IGZIP which is also correct.
-  static constexpr uint32_t kZipInputStreamBufferSize = 512;
   return input_length > kZipInputStreamBufferSize;
 }
 

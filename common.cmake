@@ -152,12 +152,27 @@ if(USE_IAA)
 endif()
 
 if(USE_IGZIP)
-  if(NOT DEFINED ISAL_PATH)
-    find_package(isal REQUIRED)
-    if(isal_FOUND)
-      message(STATUS "Found ISA-L: ${isal_DIR}")
-      link_libraries(isal)
+  # Same predicate as the version check above: if(ISAL_PATH) rather than
+  # if(DEFINED ISAL_PATH), so a defined-but-empty -DISAL_PATH= does not send the
+  # two blocks down different branches.
+  if(NOT ISAL_PATH)
+    # find_package would need an ISALConfig.cmake, which autotools installs of
+    # ISA-L (including Ubuntu's libisal-dev) do not ship, and whose exported
+    # target is namespaced ISAL::isal rather than plain isal. Locate the library
+    # and headers directly instead, so any system install works.
+    find_library(ISAL_LIB NAMES isal)
+    if(NOT ISAL_LIB)
+      message(FATAL_ERROR
+        "ISA-L library (libisal) not found. Install ISA-L or set -DISAL_PATH=<path>.")
     endif()
+    find_path(ISAL_INCLUDE_DIR igzip_lib.h PATH_SUFFIXES include include/isa-l isa-l)
+    if(NOT ISAL_INCLUDE_DIR)
+      message(FATAL_ERROR
+        "ISA-L headers not found. Install ISA-L or set -DISAL_PATH=<path>.")
+    endif()
+    message(STATUS "Found ISA-L: ${ISAL_LIB} (headers: ${ISAL_INCLUDE_DIR})")
+    include_directories(${ISAL_INCLUDE_DIR})
+    link_libraries(${ISAL_LIB})
   else()
     message(STATUS "Using ISAL_PATH: ${ISAL_PATH}")
     # ISAL_PATH may point at either an ISA-L build tree (headers in include/,

@@ -308,6 +308,16 @@ static void SetInflatePath(const std::shared_ptr<InflateSettings>& settings,
   settings->path = new_path;
 }
 
+// zlib's Z_NO_COMPRESSION (0) asks for stored, uncompressed deflate blocks. No
+// backend can produce those: ISA-L's level 0 is still LZ77+Huffman ("fastest"),
+// and QAT and IAA take no level argument at all -- all three would silently
+// compress data the caller asked to be stored. Levels outside zlib's -1..9
+// range are rejected by zlib itself, so leave those for zlib to report too.
+// Everything else maps onto an ISA-L level in InitCompressIGZIP().
+static bool IsOffloadableCompressionLevel(int level) {
+  return level == Z_DEFAULT_COMPRESSION || (level >= 1 && level <= 9);
+}
+
 int ZEXPORT deflateInit_(z_streamp strm, int level, const char* version,
                          int stream_size) {
   Log(LogLevel::LOG_INFO, "deflateInit_ Line ", __LINE__, ", strm ",
@@ -401,6 +411,17 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       ExecutionPathName(deflate_settings->path), ", window_bits ",
       deflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
+
+  // The compression level is a property of the whole stream, not of one call,
+  // so decide it here rather than discovering it when InitCompressIGZIP()
+  // rejects the level. Pinning the path (rather than only clearing
+  // igzip_available) is what lets the stream reach orig_deflate even when
+  // use_zlib_compress=0: the request was never an offload candidate, so this is
+  // not a fallback -- the same reasoning that pins a dictionary stream to ZLIB.
+  // deflateReset() clears the path, so this has to run per call, not at init.
+  if (!IsOffloadableCompressionLevel(deflate_settings->level)) {
+    SetDeflatePath(deflate_settings, ZLIB);
+  }
 
   int ret = 1;
   bool iaa_available = false;
@@ -894,6 +915,12 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     }
   }
 
+  // The "path == ZLIB" term is also how an IGZIP stream that hit Z_NEED_DICT or
+  // Z_DATA_ERROR reaches zlib: those path actions set the path to ZLIB and
+  // leave ret non-zero, so the update block above is skipped and control
+  // arrives here with strm->next_in never advanced.  zlib therefore re-reads
+  // the original, untouched input.  The fall-through is deliberate, not
+  // accidental.
   if (in_call || configs[USE_ZLIB_UNCOMPRESS] ||
       inflate_settings->path == ZLIB) {
     // refer to comment in deflate
@@ -972,21 +999,25 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
   (void)input_len;
   uint32_t output_len = *destLen;
 
+  // One-shot call: there is no per-stream path to pin, so carry the same
+  // decision deflate() makes in a local. See IsOffloadableCompressionLevel().
+  const bool level_offloadable = IsOffloadableCompressionLevel(level);
+
   bool iaa_available = false;
   bool qat_available = false;
   bool igzip_available = false;
 #ifdef USE_IAA
-  iaa_available = configs[USE_IAA_COMPRESS] &&
+  iaa_available = level_offloadable && configs[USE_IAA_COMPRESS] &&
                   SupportedOptionsIAA(kWindowBitsZlib, input_len, output_len);
 #endif
 #ifdef USE_QAT
-  qat_available = configs[USE_QAT_COMPRESS] &&
+  qat_available = level_offloadable && configs[USE_QAT_COMPRESS] &&
                   SupportedOptionsQAT(kWindowBitsZlib, input_len);
 #endif
 #ifdef USE_IGZIP
   // compress2 is one-shot, i.e. equivalent to a single deflate(Z_FINISH).
-  igzip_available =
-      configs[USE_IGZIP_COMPRESS] && SupportedOptionsIGZIPDeflate(Z_FINISH);
+  igzip_available = level_offloadable && configs[USE_IGZIP_COMPRESS] &&
+                    SupportedOptionsIGZIPDeflate(Z_FINISH);
 #endif
 
   ExecutionPath path_selected = ZLIB;
@@ -1043,8 +1074,13 @@ int ZEXPORT compress2(Bytef* dest, uLongf* destLen, const Bytef* source,
     Log(LogLevel::LOG_INFO, "compress2 Line ", __LINE__,
         ", accelerator return code ", ret, ", sourceLen ", sourceLen,
         ", destLen ", *destLen, "\n");
-  } else if (configs[USE_ZLIB_COMPRESS]) {
-    // refer to comment in deflate
+  } else if (configs[USE_ZLIB_COMPRESS] || !level_offloadable) {
+    // refer to comment in deflate.
+    //
+    // The !level_offloadable term: a level no backend can honor was never an
+    // offload candidate, so reaching zlib here is not a fallback and must not
+    // be gated by use_zlib_compress. One-shot analogue of the
+    // "deflate_settings->path == ZLIB" term in deflate().
     if (orig_compress2 == nullptr) {
       ret = Z_VERSION_ERROR;
     } else {

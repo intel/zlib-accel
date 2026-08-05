@@ -113,6 +113,22 @@ struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
       "InitCompressIGZIP() initializing deflate with level ", level,
       ", windowBits ", windowBits, "\n");
 
+  // Level 0 means stored (uncompressed) blocks in zlib. ISA-L does have a
+  // level 0 (ISAL_DEF_MIN_LEVEL, needing no level_buf), but it is still
+  // LZ77+Huffman "fastest" compression, so mapping zlib level 0 onto it would
+  // round-trip while silently breaking zlib's contract. Callers keep level 0
+  // off this path -- deflate() pins such streams to ZLIB and compress2()
+  // refuses the offload -- so this branch is defence in depth against a new
+  // caller reintroducing the mismapping. It also keeps the "invalid
+  // compression level" message below accurate: level 0 is valid zlib, it just
+  // cannot be offloaded.
+  if (level == Z_NO_COMPRESSION) {
+    Log(LogLevel::LOG_ERROR,
+        "InitCompressIGZIP() level 0 (Z_NO_COMPRESSION) requires stored "
+        "blocks, which ISA-L cannot produce\n");
+    return nullptr;
+  }
+
   struct isal_zstream *isal_strm =
       (struct isal_zstream *)malloc(sizeof(struct isal_zstream));
   if (!isal_strm) {
@@ -141,7 +157,8 @@ struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
     isal_strm->level_buf = (uint8_t *)malloc(ISAL_DEF_LVL3_DEFAULT);
     isal_strm->level_buf_size = ISAL_DEF_LVL3_DEFAULT;
   } else {
-    Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() invalid compression level\n");
+    Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() invalid compression level ",
+        level, "\n");
     free(isal_strm);
     return nullptr;
   }
@@ -213,9 +230,8 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
   Log(LogLevel::LOG_INFO, "CompressIGZIP() gzip_flag ", isal_strm->gzip_flag,
       ", hist_bits ", isal_strm->hist_bits, ", flush ", isal_strm->flush,
       ", level ", isal_strm->level, ", avail_in ", isal_strm->avail_in,
-      ", avail_out ", (uint32_t)isal_strm->avail_out, ", total_out ",
-      (uint32_t)isal_strm->total_out, ", total_in ",
-      (uint32_t)isal_strm->total_in, "\n");
+      ", avail_out ", isal_strm->avail_out, ", total_out ",
+      isal_strm->total_out, ", total_in ", isal_strm->total_in, "\n");
 
   // ISA-L always emits sync bytes on SYNC_FLUSH regardless of pending data.
   // When the stream is already byte-aligned (ZSTATE_NEW_HDR) and there is no
@@ -530,6 +546,14 @@ int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate) {
     return Z_STREAM_ERROR;
   }
 
+  // isal_inflate_reset() deliberately omits crc_flag and hist_bits from the
+  // fields it clears (isal_inflate_init() sets both to 0, reset does not touch
+  // them), so the wrapper format and window this stream was configured with in
+  // ConfigureInflateWindow() survive the reset and no re-configuration is
+  // needed here.  Same situation as ResetCompressIGZIP() above.  igzip_lib.h
+  // documents no guarantee either way, so
+  // IGZIPInflateRegressionTest.ResetMustPreserveWrapperFormatAcrossStreams
+  // guards the behavior for gzip and raw-deflate streams.
   isal_inflate_reset(isal_strm_inflate);
 
   return Z_OK;
