@@ -3376,6 +3376,409 @@ TEST(QATFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
 
 #endif  // USE_IGZIP
 
+// ---------------------------------------------------------------------------
+// inflate() flush gate: Z_BLOCK / Z_TREES
+//
+// Both flush values ask inflate() to stop at a deflate block boundary (Z_TREES
+// also at the end of each block header) and to report the bit position reached
+// in data_type. No backend can do either, so such a stream is pinned to zlib.
+// These tests are all-backend by design -- the gate is in zlib_accel.cpp, not
+// in a backend wrapper.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One inflate() return, recorded so a shimmed run can be compared to a
+// plain-zlib control run of the same bytes. Block boundaries are a zlib
+// implementation detail, so nothing here is hardcoded.
+struct InflateStep {
+  int ret;
+  unsigned long total_in;
+  unsigned long total_out;
+  int data_type;
+};
+
+// Builds a raw-deflate buffer holding several blocks. Z_FULL_FLUSH between
+// thirds guarantees more than one block boundary exists, which is what makes an
+// early Z_BLOCK return observable at all. Raw (windowBits -15) is deliberate:
+// with a zlib/gzip wrapper, Z_BLOCK's first return comes after the header
+// rather than after a block, which is a weaker signal.
+std::string BuildMultiBlockRawDeflate(const char* input, size_t input_length) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  EXPECT_EQ(deflateInit2(&stream, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> buffer(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input));
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+
+  const size_t third = input_length / 3;
+  stream.avail_in = static_cast<uInt>(third);
+  EXPECT_EQ(deflate(&stream, Z_FULL_FLUSH), Z_OK);
+  stream.avail_in = static_cast<uInt>(third);
+  EXPECT_EQ(deflate(&stream, Z_FULL_FLUSH), Z_OK);
+
+  stream.avail_in = static_cast<uInt>(input_length - 2 * third);
+  int ret = Z_OK;
+  for (int i = 0; i < 64 && ret != Z_STREAM_END; i++) {
+    ret = deflate(&stream, Z_FINISH);
+    EXPECT_GE(ret, Z_OK);
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+
+  const size_t produced = buffer.size() - stream.avail_out;
+  deflateEnd(&stream);
+  return std::string(reinterpret_cast<const char*>(buffer.data()), produced);
+}
+
+// Drives a full raw inflate with one flush value, recording every return.
+// Z_BUF_ERROR is not fatal here: with Z_TREES zlib legitimately returns it at a
+// boundary where no progress was possible, and the caller simply calls again.
+std::vector<InflateStep> RunInflateSteps(const std::string& compressed,
+                                         int flush, size_t expected_length,
+                                         std::string* output,
+                                         ExecutionPath* path_after_first) {
+  std::vector<InflateStep> steps;
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  EXPECT_EQ(inflateInit2(&stream, -15), Z_OK);
+
+  std::vector<Bytef> buffer(expected_length + 4096);
+  stream.next_in =
+      reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+
+  for (int i = 0; i < 64; i++) {
+    const int ret = inflate(&stream, flush);
+    steps.push_back({ret, stream.total_in, stream.total_out, stream.data_type});
+    if (i == 0 && path_after_first != nullptr) {
+      *path_after_first = GetInflateExecutionPath(&stream);
+    }
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+    if (ret < 0 && ret != Z_BUF_ERROR) {
+      break;
+    }
+    if (ret == Z_BUF_ERROR && stream.avail_in == 0) {
+      break;
+    }
+  }
+
+  if (output != nullptr) {
+    output->assign(reinterpret_cast<const char*>(buffer.data()),
+                   stream.total_out);
+  }
+  inflateEnd(&stream);
+  return steps;
+}
+
+// The accelerator paths this build was configured with. ZLIB is excluded: it is
+// the control, not a case under test.
+std::vector<ExecutionPath> ConfiguredAcceleratorPaths() {
+  std::vector<ExecutionPath> paths;
+#ifdef USE_QAT
+  paths.push_back(QAT);
+#endif
+#ifdef USE_IAA
+  paths.push_back(IAA);
+#endif
+#ifdef USE_IGZIP
+  paths.push_back(IGZIP);
+#endif
+  return paths;
+}
+
+std::string PathLabel(ExecutionPath path) {
+  switch (path) {
+    case QAT:
+      return "QAT";
+    case IAA:
+      return "IAA";
+    case IGZIP:
+      return "IGZIP";
+    case ZLIB:
+      return "ZLIB";
+    default:
+      return "UNDEFINED";
+  }
+}
+
+constexpr size_t kFlushGateInputLength = 96 * 1024;
+
+}  // namespace
+
+class InflateFlushGateTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+
+    input_ = GenerateBlock(kFlushGateInputLength, compressible_block);
+    ASSERT_NE(input_, nullptr);
+    compressed_ = BuildMultiBlockRawDeflate(input_, kFlushGateInputLength);
+    ASSERT_GT(compressed_.size(), 0u);
+  }
+
+  void TearDown() override {
+    DestroyBlock(input_);
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+  }
+
+  // Runs `flush` once with every accelerator enabled in turn and once on zlib,
+  // asserting the accelerator run is indistinguishable from the zlib control.
+  void ExpectMatchesZlibControl(int flush) {
+    SetUncompressPath(ZLIB, false, false);
+    std::string control_output;
+    const std::vector<InflateStep> control = RunInflateSteps(
+        compressed_, flush, kFlushGateInputLength, &control_output, nullptr);
+    ASSERT_EQ(control_output.size(), kFlushGateInputLength);
+    ASSERT_GT(control.size(), 1u)
+        << "control must return more than once, or the early return this test "
+           "checks for is not observable";
+
+    for (const ExecutionPath path : ConfiguredAcceleratorPaths()) {
+      SetUncompressPath(path, /*zlib_fallback=*/true, false);
+      std::string output;
+      ExecutionPath path_after_first = UNDEFINED;
+      const std::vector<InflateStep> steps =
+          RunInflateSteps(compressed_, flush, kFlushGateInputLength, &output,
+                          &path_after_first);
+
+      EXPECT_EQ(path_after_first, ZLIB)
+          << PathLabel(path) << ": flush " << flush
+          << " must pin the stream to zlib";
+      // Deliberately not ASSERT_*: that would return from this helper and leave
+      // the remaining paths unchecked, so one failing backend would mask the
+      // others. Skip only the indexed comparison below, which needs the sizes
+      // to agree to stay in bounds.
+      if (steps.size() != control.size()) {
+        ADD_FAILURE() << PathLabel(path) << ": call count must match plain zlib"
+                      << " (got " << steps.size() << ", expected "
+                      << control.size() << ")";
+        continue;
+      }
+      for (size_t i = 0; i < steps.size(); i++) {
+        EXPECT_EQ(steps[i].ret, control[i].ret)
+            << PathLabel(path) << ": return code differs at call " << i;
+        EXPECT_EQ(steps[i].total_in, control[i].total_in)
+            << PathLabel(path) << ": total_in differs at call " << i;
+        EXPECT_EQ(steps[i].total_out, control[i].total_out)
+            << PathLabel(path) << ": total_out differs at call " << i;
+        EXPECT_EQ(steps[i].data_type, control[i].data_type)
+            << PathLabel(path) << ": data_type differs at call " << i;
+      }
+      EXPECT_EQ(output, control_output)
+          << PathLabel(path) << ": decompressed bytes differ";
+    }
+  }
+
+  // With every backend compiled out there is no accelerator to gate, so the
+  // per-path loops below would iterate zero times and report a pass having
+  // asserted nothing. Skip instead: public CI builds exactly that config, and a
+  // vacuous pass there would hide a regression. Only the mid-stream IGZIP test
+  // is meaningful without this, and it is already #ifdef'd.
+  void SkipIfNoAcceleratorConfigured() {
+    if (ConfiguredAcceleratorPaths().empty()) {
+      GTEST_SKIP() << "no accelerator backend compiled in; nothing to gate";
+    }
+  }
+
+  char* input_ = nullptr;
+  std::string compressed_;
+
+ private:
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+};
+
+// Z_BLOCK asks inflate() to stop at the next block boundary and to report the
+// bit position in data_type. Offloaded, the call used to return the whole
+// stream with data_type untouched.
+TEST_F(InflateFlushGateTest, ZBlockPinsStreamToZlibAndReturnsAtBlockBoundary) {
+  SkipIfNoAcceleratorConfigured();
+  ExpectMatchesZlibControl(Z_BLOCK);
+}
+
+// Z_TREES stops at every block *header* too, and adds 256 to data_type when it
+// does -- the bit that distinguishes it from Z_BLOCK.
+TEST_F(InflateFlushGateTest, ZTreesPinsStreamToZlibAndReportsBlockHeaderEnd) {
+  SkipIfNoAcceleratorConfigured();
+  ExpectMatchesZlibControl(Z_TREES);
+
+  SetUncompressPath(ZLIB, false, false);
+  const std::vector<InflateStep> control = RunInflateSteps(
+      compressed_, Z_TREES, kFlushGateInputLength, nullptr, nullptr);
+  bool saw_block_header_end = false;
+  for (const InflateStep& step : control) {
+    if (step.data_type & 256) {
+      saw_block_header_end = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(saw_block_header_end)
+      << "Z_TREES must report the end of a block header at least once, or "
+         "ExpectMatchesZlibControl is comparing against a control that never "
+         "exercises the 256 bit";
+}
+
+// The pin is stream-wide, not per call: a caller that tracks bit positions must
+// not have the stream migrated onto an accelerator by a later Z_NO_FLUSH call,
+// which would silently stop updating data_type mid-stream.
+TEST_F(InflateFlushGateTest, ZBlockPinIsStickyForRemainderOfStream) {
+  SkipIfNoAcceleratorConfigured();
+  // One void helper per path so a failing ASSERT_* returns from the helper
+  // rather than from the test body, which would leave the remaining backends
+  // unchecked.
+  const auto check = [this](ExecutionPath path) {
+    SetUncompressPath(path, /*zlib_fallback=*/true, false);
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+
+    std::vector<Bytef> buffer(kFlushGateInputLength + 4096);
+    stream.next_in =
+        reinterpret_cast<Bytef*>(const_cast<char*>(compressed_.data()));
+    stream.avail_in = static_cast<uInt>(compressed_.size());
+    stream.next_out = buffer.data();
+    stream.avail_out = static_cast<uInt>(buffer.size());
+
+    ASSERT_EQ(inflate(&stream, Z_BLOCK), Z_OK) << PathLabel(path);
+    ASSERT_EQ(GetInflateExecutionPath(&stream), ZLIB) << PathLabel(path);
+    EXPECT_LT(stream.total_out, kFlushGateInputLength)
+        << PathLabel(path) << ": Z_BLOCK must stop before the whole stream";
+
+    int ret = Z_OK;
+    for (int i = 0; i < 64 && ret != Z_STREAM_END; i++) {
+      ret = inflate(&stream, Z_NO_FLUSH);
+      ASSERT_GE(ret, Z_OK) << PathLabel(path);
+      EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB)
+          << PathLabel(path)
+          << ": a later Z_NO_FLUSH call must not move the stream off zlib";
+    }
+    EXPECT_EQ(ret, Z_STREAM_END) << PathLabel(path);
+    EXPECT_EQ(stream.total_out, kFlushGateInputLength) << PathLabel(path);
+    EXPECT_EQ(memcmp(buffer.data(), input_, kFlushGateInputLength), 0)
+        << PathLabel(path);
+
+    inflateEnd(&stream);
+  };
+
+  for (const ExecutionPath path : ConfiguredAcceleratorPaths()) {
+    check(path);
+  }
+}
+
+// The gate pins the path rather than only clearing per-call availability, which
+// is what lets the stream reach zlib with use_zlib_uncompress=0: the request
+// was never offloadable, so this is not a fallback. Under per-call clearing the
+// same configuration would return Z_DATA_ERROR. This is the regression guard
+// for that design decision.
+TEST_F(InflateFlushGateTest, ZBlockSucceedsWithZlibUncompressDisabled) {
+  SkipIfNoAcceleratorConfigured();
+  // See ZBlockPinIsStickyForRemainderOfStream for why each path gets its own
+  // helper invocation rather than sharing the loop body.
+  const auto check = [this](ExecutionPath path) {
+    SetUncompressPath(path, /*zlib_fallback=*/false, false);
+    ASSERT_EQ(GetConfig(USE_ZLIB_UNCOMPRESS), 0u);
+
+    std::string output;
+    ExecutionPath path_after_first = UNDEFINED;
+    const std::vector<InflateStep> steps =
+        RunInflateSteps(compressed_, Z_BLOCK, kFlushGateInputLength, &output,
+                        &path_after_first);
+
+    ASSERT_FALSE(steps.empty());
+    EXPECT_EQ(steps.front().ret, Z_OK)
+        << PathLabel(path)
+        << ": Z_BLOCK must not fail when use_zlib_uncompress=0";
+    EXPECT_EQ(path_after_first, ZLIB) << PathLabel(path);
+    EXPECT_EQ(steps.back().ret, Z_STREAM_END) << PathLabel(path);
+    ASSERT_EQ(output.size(), kFlushGateInputLength) << PathLabel(path);
+    EXPECT_EQ(memcmp(output.data(), input_, kFlushGateInputLength), 0)
+        << PathLabel(path);
+  };
+
+  for (const ExecutionPath path : ConfiguredAcceleratorPaths()) {
+    check(path);
+  }
+}
+
+#ifdef USE_IGZIP
+// An IGZIP stream already in flight is exempt from the gate: ISA-L holds
+// unflushed inflate state that cannot be handed to zlib without corrupting the
+// output, so the stream stays on IGZIP and Z_BLOCK behaves as Z_NO_FLUSH. The
+// accepted residual is over-delivery plus an unwritten data_type -- never wrong
+// bytes. Mirrors ZBlockMidStreamStaysOnIGZIPAndRoundTrips on the deflate side.
+TEST_F(InflateFlushGateTest, ZBlockMidStreamStaysOnIGZIPAndRoundTrips) {
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/true, false);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+
+  std::vector<Bytef> buffer(kFlushGateInputLength + 4096);
+  stream.next_in =
+      reinterpret_cast<Bytef*>(const_cast<char*>(compressed_.data()));
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+
+  // Land the stream on IGZIP with a flush value the gate allows, feeding only
+  // part of the input so ISA-L is left holding state.
+  const size_t first_chunk = compressed_.size() / 4;
+  ASSERT_GT(first_chunk, 0u);
+  stream.avail_in = static_cast<uInt>(first_chunk);
+  const int first_ret = inflate(&stream, Z_NO_FLUSH);
+  ASSERT_GE(first_ret, Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+
+  // Now switch to Z_BLOCK mid-stream: the exemption keeps it on IGZIP.
+  stream.avail_in = static_cast<uInt>(compressed_.size() - first_chunk);
+  int ret = inflate(&stream, Z_BLOCK);
+  ASSERT_GE(ret, Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP)
+      << "an active IGZIP stream must not be handed to zlib mid-stream";
+
+  for (int i = 0; i < 64 && ret != Z_STREAM_END; i++) {
+    ret = inflate(&stream, Z_BLOCK);
+    ASSERT_GE(ret, Z_OK);
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+
+  // The bytes must still be exact -- only the return timing differs.
+  ASSERT_EQ(stream.total_out, kFlushGateInputLength);
+  EXPECT_EQ(memcmp(buffer.data(), input_, kFlushGateInputLength), 0);
+
+  inflateEnd(&stream);
+}
+#endif  // USE_IGZIP
+
 INSTANTIATE_TEST_SUITE_P(
     CompressDecompress, ZlibPartialAndMultiStreamTest,
     testing::Combine(
