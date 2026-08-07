@@ -3408,8 +3408,15 @@ std::string BuildMultiBlockRawDeflate(const char* input, size_t input_length) {
 
   z_stream stream;
   memset(&stream, 0, sizeof(stream));
-  EXPECT_EQ(deflateInit2(&stream, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY),
-            Z_OK);
+  // Bail out rather than EXPECT_EQ and continue: deflateBound() and deflate()
+  // below would touch an uninitialized stream. ASSERT_EQ cannot be used here
+  // because it expands to a bare `return;` and this helper returns a value; the
+  // empty string is caught by the caller's ASSERT_GT on the result size.
+  if (deflateInit2(&stream, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) !=
+      Z_OK) {
+    ADD_FAILURE() << "deflateInit2 failed";
+    return std::string();
+  }
 
   std::vector<Bytef> buffer(deflateBound(&stream, input_length) + 4096);
   stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input));
@@ -3445,7 +3452,14 @@ std::vector<InflateStep> RunInflateSteps(const std::string& compressed,
   std::vector<InflateStep> steps;
   z_stream stream;
   memset(&stream, 0, sizeof(stream));
-  EXPECT_EQ(inflateInit2(&stream, -15), Z_OK);
+  // See BuildMultiBlockRawDeflate: bail out rather than run inflate() on an
+  // uninitialized stream. No steps recorded, which every caller detects -- via
+  // ASSERT_FALSE(steps.empty()), the control-size check, or a size mismatch
+  // against the control run.
+  if (inflateInit2(&stream, -15) != Z_OK) {
+    ADD_FAILURE() << "inflateInit2 failed";
+    return steps;
+  }
 
   std::vector<Bytef> buffer(expected_length + 4096);
   stream.next_in =
@@ -3525,6 +3539,11 @@ class InflateFlushGateTest : public testing::Test {
     saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
     saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
     saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    // SetCompressPath/SetUncompressPath write these two unconditionally as
+    // well, so they must be restored too or this fixture leaks them into later
+    // tests and makes the suite order-dependent.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
 
     input_ = GenerateBlock(kFlushGateInputLength, compressible_block);
     ASSERT_NE(input_, nullptr);
@@ -3542,6 +3561,8 @@ class InflateFlushGateTest : public testing::Test {
     SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
     SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
     SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
   }
 
   // Runs `flush` once with every accelerator enabled in turn and once on zlib,
@@ -3615,6 +3636,8 @@ class InflateFlushGateTest : public testing::Test {
   uint32_t saved_use_iaa_compress_ = 0;
   uint32_t saved_use_qat_compress_ = 0;
   uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
 };
 
 // Z_BLOCK asks inflate() to stop at the next block boundary and to report the
