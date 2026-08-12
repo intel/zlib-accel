@@ -4047,6 +4047,191 @@ TEST_F(DictionaryMidstreamFallbackRegressionTest,
 #endif
 #endif
 
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+class DeflateParamsRegressionTest : public ::testing::Test {};
+
+// deflateParams() may lower the level to Z_NO_COMPRESSION after deflateInit*,
+// which asks for stored blocks that no backend can emit.  Before deflateParams
+// was intercepted, DeflateSettings::level was written only at init, so the
+// level-0 gate in deflate() never saw the change and the data was silently
+// compressed instead of stored -- on every backend, and with no error returned.
+//
+// zlib_fallback is deliberately false (use_zlib_compress == 0): a request that
+// was never offloadable has to reach orig_deflate by being pinned to ZLIB, not
+// by falling back, so this also guards the pin-vs-clear distinction.
+static void RunDeflateParamsLevelZeroRegression(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  // Output buffer is set up first: zlib's deflateParams() may need to emit the
+  // input compressed so far and returns Z_BUF_ERROR when it cannot.
+  ASSERT_EQ(deflateParams(&stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY), Z_OK);
+
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+  deflateEnd(&stream);
+
+  // Stored output must exceed its input.  No accelerator can fake this, which
+  // is what makes it the oracle for "level 0 was actually honored".
+  EXPECT_GT(produced, input_length);
+  EXPECT_LT(produced, input_length + 1024);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(DeflateParamsRegressionTest, IGZIPLevelZeroAfterInitStoresInput) {
+  RunDeflateParamsLevelZeroRegression(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(DeflateParamsRegressionTest, QATLevelZeroAfterInitStoresInput) {
+  RunDeflateParamsLevelZeroRegression(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(DeflateParamsRegressionTest, IAALevelZeroAfterInitStoresInput) {
+  RunDeflateParamsLevelZeroRegression(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// The level gate must not over-trigger: a legal level change still describes an
+// offloadable stream, so the path must stay on the accelerator.
+TEST_F(DeflateParamsRegressionTest, LegalLevelChangeStaysOffloadable) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, 9, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  ASSERT_EQ(deflateParams(&stream, 1, Z_DEFAULT_STRATEGY), Z_OK);
+
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  deflateEnd(&stream);
+
+  EXPECT_LT(produced, input_length);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+
+// A stream ISA-L has already started must NOT be pinned to zlib when the level
+// drops to 0 mid-stream.  ISA-L has emitted a header plus compressed data and
+// holds unflushed state, so handing it to a zlib deflate state that was never
+// fed writes a second header: measured Z_DATA_ERROR with only the pre-switch
+// bytes recoverable.  Staying on IGZIP leaves the new level unhonored -- a
+// deliberate, documented residual -- but keeps the output valid deflate.
+TEST_F(DeflateParamsRegressionTest, MidstreamLevelZeroKeepsStreamIntact) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t half_length = 32 * 1024;
+  const size_t input_length = 2 * half_length;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  // A real flush is what makes ISA-L take ownership of the stream.
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(half_length);
+  ASSERT_EQ(deflate(&stream, Z_SYNC_FLUSH), Z_OK);
+  ASSERT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+
+  ASSERT_EQ(deflateParams(&stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY), Z_OK);
+
+  stream.next_in = reinterpret_cast<Bytef*>(input) + half_length;
+  stream.avail_in = static_cast<uInt>(half_length);
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  deflateEnd(&stream);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+#endif  // USE_IGZIP || USE_QAT || USE_IAA
+
 void CreateAndWriteTempConfigFile(const char* file_path) {
   std::ofstream temp_file(file_path);
   temp_file << "use_qat_compress=5000\n";

@@ -51,6 +51,7 @@ static int (*orig_deflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_deflate)(z_streamp strm, int flush);
 static int (*orig_deflateEnd)(z_streamp strm);
 static int (*orig_deflateReset)(z_streamp strm);
+static int (*orig_deflateParams)(z_streamp strm, int level, int strategy);
 static int (*orig_inflateInit_)(z_streamp strm, const char* version,
                                 int stream_size);
 static int (*orig_inflateInit2_)(z_streamp strm, int window_bits,
@@ -126,6 +127,9 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_deflateEnd, int (*)(z_streamp), "deflateEnd");
 
   LOAD_SYMBOL(orig_deflateReset, int (*)(z_streamp), "deflateReset");
+
+  LOAD_SYMBOL(orig_deflateParams, int (*)(z_streamp, int, int),
+              "deflateParams");
 
   // Load inflate functions
   LOAD_SYMBOL(orig_inflateInit_, int (*)(z_streamp, const char*, int),
@@ -408,6 +412,27 @@ int ZEXPORT deflateSetDictionary(z_streamp strm, const Bytef* dictionary,
   return Z_OK;
 }
 
+int ZEXPORT deflateParams(z_streamp strm, int level, int strategy) {
+  Log(LogLevel::LOG_INFO, "deflateParams Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), ", level ", level, ", strategy ", strategy,
+      "\n");
+  if (orig_deflateParams == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+  const int ret = orig_deflateParams(strm, level, strategy);
+  // On Z_BUF_ERROR zlib documents the parameters as unchanged, so only record
+  // them when zlib actually accepted the change -- the same ret == Z_OK gating
+  // that deflateInit*() and both *SetDictionary() functions use.
+  if (ret == Z_OK) {
+    auto deflate_settings = deflate_stream_settings.Get(strm);
+    if (deflate_settings != nullptr) {
+      deflate_settings->level = level;
+      deflate_settings->strategy = strategy;
+    }
+  }
+  return ret;
+}
+
 int ZEXPORT deflate(z_streamp strm, int flush) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
@@ -435,7 +460,20 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // use_zlib_compress=0: the request was never an offload candidate, so this is
   // not a fallback -- the same reasoning that pins a dictionary stream to ZLIB.
   // deflateReset() clears the path, so this has to run per call, not at init.
-  if (!IsOffloadableCompressionLevel(deflate_settings->level)) {
+  //
+  // A stream ISA-L has already started is the one case that must not be pinned.
+  // deflateParams() can lower the level to 0 mid-stream, but by then ISA-L has
+  // emitted a header plus compressed data and still holds unflushed state, so
+  // handing the stream to a zlib deflate state that was never fed emits a
+  // second header and produces output that does not inflate (Z_DATA_ERROR, only
+  // the pre-switch bytes recoverable). Staying on IGZIP leaves the new level
+  // unhonored -- output is still valid, round-trippable deflate -- which is the
+  // same deliberate mid-stream residual as deflate()'s Z_BLOCK -> Z_SYNC_FLUSH
+  // aliasing. Documented in the README.
+  const bool igzip_owns_stream =
+      deflate_settings->path == IGZIP && deflate_settings->isal_strm != nullptr;
+  if (!IsOffloadableCompressionLevel(deflate_settings->level) &&
+      !igzip_owns_stream) {
     SetDeflatePath(deflate_settings, ZLIB);
   }
 
@@ -642,6 +680,10 @@ int ZEXPORT deflateReset(z_streamp strm) {
       static_cast<void*>(strm), "\n");
   auto deflate_settings = deflate_stream_settings.Get(strm);
   if (deflate_settings != nullptr) {
+    // Only the path is cleared. zlib's deflateReset keeps the compression level
+    // and strategy, including any set later by deflateParams(), so the recorded
+    // level must survive a reset too or path selection would disagree with the
+    // level zlib is actually using.
     SetDeflatePath(deflate_settings, UNDEFINED);
 
 #ifdef USE_IGZIP
