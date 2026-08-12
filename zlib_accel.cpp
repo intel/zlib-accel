@@ -688,7 +688,21 @@ int ZEXPORT deflateReset(z_streamp strm) {
 
 #ifdef USE_IGZIP
     if (deflate_settings->isal_strm != nullptr) {
-      ResetCompressIGZIP(deflate_settings->isal_strm);
+      // Keeping the recorded level is not sufficient for the ISA-L stream:
+      // isal_deflate_reset() deliberately preserves level and level_buf, and
+      // deflate() only calls InitCompressIGZIP() when isal_strm is null, so a
+      // level that deflateParams() changed since this stream was built would
+      // leave the next stream running at the old ISA-L level. Discard the
+      // stream in that case and let deflate() rebuild it from the current
+      // setting; the common reset, where the level did not change, keeps the
+      // stream and its level_buf allocation.
+      if (CompressLevelChangedIGZIP(deflate_settings->isal_strm,
+                                    deflate_settings->level)) {
+        EndCompressIGZIP(deflate_settings->isal_strm);
+        deflate_settings->isal_strm = nullptr;
+      } else {
+        ResetCompressIGZIP(deflate_settings->isal_strm);
+      }
     }
 #endif
   }

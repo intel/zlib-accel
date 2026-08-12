@@ -108,6 +108,27 @@ bool IsIGZIPDeflateFinished(const struct isal_zstream *stream) {
   return state == ZSTATE_END;
 }
 
+// Single source of truth for the zlib -> ISA-L compression level mapping.
+// Returns the ISA-L level, writing the level_buf size it needs to
+// *level_buf_size, or -1 for a zlib level ISA-L cannot serve (which includes
+// level 0 -- see InitCompressIGZIP()). CompressLevelChangedIGZIP() shares this
+// so a reset cannot disagree with what an init would have chosen.
+static int MapCompressionLevelIGZIP(int level, uint32_t *level_buf_size) {
+  if (level >= 1 && level <= 2) {
+    *level_buf_size = ISAL_DEF_LVL1_DEFAULT;
+    return 1;
+  }
+  if ((level >= 3 && level <= 6) || level == Z_DEFAULT_COMPRESSION) {
+    *level_buf_size = ISAL_DEF_LVL2_DEFAULT;
+    return 2;
+  }
+  if (level >= 7 && level <= 9) {
+    *level_buf_size = ISAL_DEF_LVL3_DEFAULT;
+    return 3;
+  }
+  return -1;
+}
+
 struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
   Log(LogLevel::LOG_INFO,
       "InitCompressIGZIP() initializing deflate with level ", level,
@@ -144,24 +165,17 @@ struct isal_zstream *InitCompressIGZIP(int level, int windowBits) {
   isal_strm->flush = NO_FLUSH;
 
   // Map Zlib levels to ISA-L levels
-  if (level >= 1 && level <= 2) {
-    isal_strm->level = 1;
-    isal_strm->level_buf = (uint8_t *)malloc(ISAL_DEF_LVL1_DEFAULT);
-    isal_strm->level_buf_size = ISAL_DEF_LVL1_DEFAULT;
-  } else if ((level >= 3 && level <= 6) || level == -1) {
-    isal_strm->level = 2;
-    isal_strm->level_buf = (uint8_t *)malloc(ISAL_DEF_LVL2_DEFAULT);
-    isal_strm->level_buf_size = ISAL_DEF_LVL2_DEFAULT;
-  } else if (level >= 7 && level <= 9) {
-    isal_strm->level = 3;
-    isal_strm->level_buf = (uint8_t *)malloc(ISAL_DEF_LVL3_DEFAULT);
-    isal_strm->level_buf_size = ISAL_DEF_LVL3_DEFAULT;
-  } else {
+  uint32_t level_buf_size = 0;
+  const int isal_level = MapCompressionLevelIGZIP(level, &level_buf_size);
+  if (isal_level < 0) {
     Log(LogLevel::LOG_ERROR, "InitCompressIGZIP() invalid compression level ",
         level, "\n");
     free(isal_strm);
     return nullptr;
   }
+  isal_strm->level = (uint32_t)isal_level;
+  isal_strm->level_buf = (uint8_t *)malloc(level_buf_size);
+  isal_strm->level_buf_size = level_buf_size;
 
   if (!isal_strm->level_buf) {
     free(isal_strm);
@@ -528,6 +542,18 @@ int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate) {
 
   Log(LogLevel::LOG_INFO, "EndUncompressIGZIP() inflate end\n");
   return Z_OK;
+}
+
+bool CompressLevelChangedIGZIP(const struct isal_zstream *isal_strm,
+                               int level) {
+  if (isal_strm == nullptr) {
+    return false;
+  }
+  uint32_t level_buf_size = 0;
+  // A zlib level ISA-L cannot serve maps to -1, which never equals a configured
+  // ISA-L level, so it reads as changed and the caller discards the stream.
+  return MapCompressionLevelIGZIP(level, &level_buf_size) !=
+         (int)isal_strm->level;
 }
 
 void ResetCompressIGZIP(struct isal_zstream *isal_strm) {
