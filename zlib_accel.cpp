@@ -318,6 +318,22 @@ static bool IsOffloadableCompressionLevel(int level) {
   return level == Z_DEFAULT_COMPRESSION || (level >= 1 && level <= 9);
 }
 
+// Z_BLOCK and Z_TREES ask inflate() to stop early -- at the next deflate block
+// boundary, and additionally at the end of each block header -- and to report
+// the bit position reached in z_stream.data_type. No backend can do either.
+// QAT and IAA decompress whole streams in one submission with no notion of a
+// block boundary, and ISA-L transits ISAL_BLOCK_NEW_HDR/ISAL_BLOCK_HDR inside
+// a single isal_inflate() call with no way to stop there. Left offloaded, such
+// a call over-delivers -- it returns the whole stream instead of one block and
+// leaves data_type untouched -- so the output is a correct prefix but the bit
+// accounting the caller asked for is silently missing. Applications pass these
+// values to append to, splice, or randomly access deflate streams, i.e. the
+// accounting *is* the request. zlib is the only implementation here that can
+// honor it, so route the stream there.
+static bool IsOffloadableInflateFlush(int flush) {
+  return flush != Z_BLOCK && flush != Z_TREES;
+}
+
 int ZEXPORT deflateInit_(z_streamp strm, int level, const char* version,
                          int stream_size) {
   Log(LogLevel::LOG_INFO, "deflateInit_ Line ", __LINE__, ", strm ",
@@ -747,6 +763,24 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       inflate_settings->window_bits >= 8 &&
       inflate_settings->window_bits <= kWindowBitsZlib && strm->avail_in >= 2 &&
       (strm->next_in[1] & ZLIB_FDICT_MASK)) {
+    SetInflatePath(inflate_settings, ZLIB);
+  }
+
+  // Z_BLOCK/Z_TREES cannot be honored by any accelerator, so pin the stream to
+  // zlib rather than only skipping the offload for this one call. The bit
+  // accounting such a caller performs spans the whole stream: letting a later
+  // Z_NO_FLUSH call migrate it onto an accelerator would leave data_type unset
+  // again mid-stream and break the accounting just as thoroughly. Pinning also
+  // reaches orig_inflate when use_zlib_uncompress=0, via the "path == ZLIB"
+  // term below -- a request that was never offloadable is not a fallback, the
+  // same reasoning that pins a dictionary stream or a level-0 deflate stream.
+  //
+  // An IGZIP stream already in flight is exempt: ISA-L holds unflushed inflate
+  // state that cannot be handed to zlib without corrupting the output, so such
+  // a stream keeps behaving as Z_NO_FLUSH. That mirrors the accepted residual
+  // on the compress side (see CompressIGZIP's flush mapping); both are
+  // documented in the README.
+  if (!in_call && !igzip_stream_active && !IsOffloadableInflateFlush(flush)) {
     SetInflatePath(inflate_settings, ZLIB);
   }
 
