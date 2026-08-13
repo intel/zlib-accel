@@ -4127,6 +4127,86 @@ TEST_F(DeflateParamsRegressionTest, IAALevelZeroAfterInitStoresInput) {
 }
 #endif
 
+// The mirror image of the level-0 gate: a deflateParams() call zlib *rejected*
+// left the parameters unchanged, so recording it would make path selection
+// disagree with the level zlib is really using.  The level here is legal and
+// only the strategy is out of range, so an ungated write would record level 0
+// and pin an otherwise offloadable stream to zlib, storing the input instead of
+// compressing it.
+//
+// Z_STREAM_ERROR rather than the Z_BUF_ERROR the same gate also covers: zlib
+// only returns Z_BUF_ERROR from deflateParams() when it cannot flush what its
+// own deflate state has buffered, and an offloaded stream never advances that
+// state (on IGZIP zlib's deflate() is never called, so last_flush stays at its
+// post-init value and the flushing branch is skipped entirely).  Both
+// rejections run through the one `ret == Z_OK` branch under test.
+static void RunDeflateParamsRejectedChangeNotRecorded(
+    ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  const int invalid_strategy = Z_FIXED + 1;
+  ASSERT_NE(deflateParams(&stream, Z_NO_COMPRESSION, invalid_strategy), Z_OK);
+
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), accel_path);
+  deflateEnd(&stream);
+
+  // Had the rejected level 0 been recorded, the stream would have been pinned
+  // to zlib and emitted stored blocks, which exceed their input.
+  EXPECT_LT(produced, input_length);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(output.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(DeflateParamsRegressionTest, IGZIPRejectedParamsChangeNotRecorded) {
+  RunDeflateParamsRejectedChangeNotRecorded(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(DeflateParamsRegressionTest, QATRejectedParamsChangeNotRecorded) {
+  RunDeflateParamsRejectedChangeNotRecorded(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(DeflateParamsRegressionTest, IAARejectedParamsChangeNotRecorded) {
+  RunDeflateParamsRejectedChangeNotRecorded(IAA);
+}
+#endif
+
 #ifdef USE_IGZIP
 // The level gate must not over-trigger: a legal level change still describes an
 // offloadable stream, so the path must stay on the accelerator.
