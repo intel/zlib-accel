@@ -36,6 +36,8 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
 
 int EndCompressIGZIP(struct isal_zstream *isal_strm);
 void ResetCompressIGZIP(struct isal_zstream *isal_strm);
+VISIBLE_FOR_TESTING bool CompressLevelChangedIGZIP(
+    const struct isal_zstream *isal_strm, int level);
 
 struct inflate_state *InitUncompressIGZIP(int windowBits);
 int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
