@@ -4310,6 +4310,39 @@ TEST_F(DeflateParamsRegressionTest, MidstreamLevelZeroKeepsStreamIntact) {
   DestroyBlock(input);
 }
 
+// Compresses the whole buffer on a fresh IGZIP stream at |level| in one
+// Z_FINISH call.  This is the control the two reset-ordering tests below
+// compare against, so a stream that has to be rebuilt at a new level must
+// reproduce it byte for byte.  ASSERT_* expands to a bare `return;`, which a
+// value-returning helper cannot use, so failures go through ADD_FAILURE() and
+// an empty result.
+static std::vector<Bytef> CompressWholeOnIgzipAtLevel(const char* input,
+                                                      size_t input_length,
+                                                      int level) {
+  z_stream local;
+  memset(&local, 0, sizeof(z_stream));
+  if (deflateInit2(&local, level, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) !=
+      Z_OK) {
+    ADD_FAILURE() << "deflateInit2 failed at level " << level;
+    return {};
+  }
+  std::vector<Bytef> out(deflateBound(&local, input_length) + 4096);
+  local.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input));
+  local.avail_in = static_cast<uInt>(input_length);
+  local.next_out = out.data();
+  local.avail_out = static_cast<uInt>(out.size());
+  const int ret = deflate(&local, Z_FINISH);
+  const size_t produced = out.size() - local.avail_out;
+  const ExecutionPath path = GetDeflateExecutionPath(&local);
+  deflateEnd(&local);
+  if (ret != Z_STREAM_END || path != IGZIP) {
+    ADD_FAILURE() << "level " << level << ": ret " << ret << ", path " << path;
+    return {};
+  }
+  out.resize(produced);
+  return out;
+}
+
 // Recording the level is not sufficient on its own: deflateReset() has to give
 // up an ISA-L stream that was built for a level deflateParams() has since
 // changed.  isal_deflate_reset() deliberately preserves level and level_buf,
@@ -4329,36 +4362,10 @@ TEST_F(DeflateParamsRegressionTest, ResetAfterLevelChangeRebuildsIgzipStream) {
   char* input = GenerateBlock(input_length, compressible_block);
   ASSERT_NE(input, nullptr);
 
-  // ASSERT_* expands to a bare `return;`, which a value-returning lambda cannot
-  // use, so failures go through ADD_FAILURE() and an empty result.
-  auto CompressWholeAtLevel = [&](int level) -> std::vector<Bytef> {
-    z_stream local;
-    memset(&local, 0, sizeof(z_stream));
-    if (deflateInit2(&local, level, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) !=
-        Z_OK) {
-      ADD_FAILURE() << "deflateInit2 failed at level " << level;
-      return {};
-    }
-    std::vector<Bytef> out(deflateBound(&local, input_length) + 4096);
-    local.next_in = reinterpret_cast<Bytef*>(input);
-    local.avail_in = static_cast<uInt>(input_length);
-    local.next_out = out.data();
-    local.avail_out = static_cast<uInt>(out.size());
-    const int ret = deflate(&local, Z_FINISH);
-    const size_t produced = out.size() - local.avail_out;
-    const ExecutionPath path = GetDeflateExecutionPath(&local);
-    deflateEnd(&local);
-    if (ret != Z_STREAM_END || path != IGZIP) {
-      ADD_FAILURE() << "level " << level << ": ret " << ret << ", path "
-                    << path;
-      return {};
-    }
-    out.resize(produced);
-    return out;
-  };
-
-  const std::vector<Bytef> control_level1 = CompressWholeAtLevel(1);
-  const std::vector<Bytef> control_level9 = CompressWholeAtLevel(9);
+  const std::vector<Bytef> control_level1 =
+      CompressWholeOnIgzipAtLevel(input, input_length, 1);
+  const std::vector<Bytef> control_level9 =
+      CompressWholeOnIgzipAtLevel(input, input_length, 9);
   ASSERT_FALSE(control_level1.empty());
   ASSERT_FALSE(control_level9.empty());
   ASSERT_NE(control_level1, control_level9);
@@ -4387,6 +4394,78 @@ TEST_F(DeflateParamsRegressionTest, ResetAfterLevelChangeRebuildsIgzipStream) {
 
   // After the reset this is a new stream, and the recorded level is 1.
   ASSERT_EQ(deflateReset(&stream), Z_OK);
+  std::vector<Bytef> after(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = after.data();
+  stream.avail_out = static_cast<uInt>(after.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = after.size() - stream.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  deflateEnd(&stream);
+  after.resize(produced);
+
+  EXPECT_EQ(after, control_level1);
+  EXPECT_NE(after, control_level9);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(after.data()), produced,
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  DestroyBlock(uncompressed);
+
+  DestroyBlock(input);
+}
+
+// The same stale ISA-L level through the opposite ordering, which the
+// deflateReset() half above cannot catch: reset FIRST, and the recorded level
+// still matches what the ISA-L stream was built for at that moment, so the
+// stream is legitimately kept.  deflateParams() then moves the level under a
+// stream deflate() reuses as-is, which used to leave the next stream running at
+// the old level -- measured 48335 bytes for a level-1 request where a fresh
+// level-1 stream produces 51021.  Same oracle as above; the two controls are
+// asserted to differ so it cannot pass vacuously.
+TEST_F(DeflateParamsRegressionTest, ParamsAfterResetRebuildsIgzipStream) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  const std::vector<Bytef> control_level1 =
+      CompressWholeOnIgzipAtLevel(input, input_length, 1);
+  const std::vector<Bytef> control_level9 =
+      CompressWholeOnIgzipAtLevel(input, input_length, 9);
+  ASSERT_FALSE(control_level1.empty());
+  ASSERT_FALSE(control_level9.empty());
+  ASSERT_NE(control_level1, control_level9);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, 9, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  // A complete stream first, so ISA-L really owns one built at level 9.
+  std::vector<Bytef> first(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = first.data();
+  stream.avail_out = static_cast<uInt>(first.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+
+  // The reset comes before the level change, so it has nothing to act on.
+  ASSERT_EQ(deflateReset(&stream), Z_OK);
+  ASSERT_EQ(deflateParams(&stream, 1, Z_DEFAULT_STRATEGY), Z_OK);
+
   std::vector<Bytef> after(deflateBound(&stream, input_length) + 4096);
   stream.next_in = reinterpret_cast<Bytef*>(input);
   stream.avail_in = static_cast<uInt>(input_length);

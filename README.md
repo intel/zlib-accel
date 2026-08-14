@@ -283,7 +283,7 @@ deflate/inflate and related functions
 
 For deflate, offload is supported for Z_FINISH flush option. Support for additional options will be added in later releases.   
 For deflateSetDictionary/inflateSetDictionary, zlib-accel simply sets the execution path to zlib, as dictionary compression is currently not supported for accelerators.   
-deflateParams is intercepted only to keep the recorded compression level current, so that a level set after initialization is still seen by path selection; the call itself is always forwarded to zlib.
+deflateParams is intercepted only to keep the recorded compression level current, so that a level set after initialization is still seen by path selection, and to give up an IGZIP stream that was built for a level the call supersedes; the call itself is always forwarded to zlib.
 
 utility functions
 - compress, uncompress

@@ -322,6 +322,18 @@ static bool IsOffloadableCompressionLevel(int level) {
   return level == Z_DEFAULT_COMPRESSION || (level >= 1 && level <= 9);
 }
 
+// True when ISA-L holds live state for this stream: it has emitted a header and
+// may still hold unflushed data, so the stream can neither be handed to zlib
+// nor rebuilt at a different compression level without corrupting the output.
+// Both deflate()'s level-0 pin and deflateParams()' discard of a stream built
+// for a superseded level exempt such a stream, and deflate() uses it to keep an
+// already-started IGZIP stream on IGZIP.
+static bool IgzipOwnsDeflateStream(
+    const std::shared_ptr<DeflateSettings>& settings) {
+  return settings != nullptr && settings->path == IGZIP &&
+         settings->isal_strm != nullptr;
+}
+
 // Z_BLOCK and Z_TREES ask inflate() to stop early -- at the next deflate block
 // boundary, and additionally at the end of each block header -- and to report
 // the bit position reached in z_stream.data_type. No backend can do either.
@@ -428,6 +440,27 @@ int ZEXPORT deflateParams(z_streamp strm, int level, int strategy) {
     if (deflate_settings != nullptr) {
       deflate_settings->level = level;
       deflate_settings->strategy = strategy;
+
+#ifdef USE_IGZIP
+      // deflateReset() gives up an ISA-L stream built for a level that has
+      // since changed, but the two orderings need separate handling: reset
+      // first and the level still matches at that point, so the stream is kept,
+      // and then this call changes the level under a stream deflate() will
+      // reuse as-is (it only builds one when isal_strm is null). Discard it
+      // here so the next deflate() rebuilds it at the level just requested.
+      //
+      // A stream ISA-L already owns is the one case to leave alone: it holds a
+      // header plus unflushed data, so it cannot be rebuilt mid-stream. That
+      // leaves the new level unhonored until the next reset, the same
+      // deliberate mid-stream residual as the level-0 pin's exemption in
+      // deflate().
+      if (!IgzipOwnsDeflateStream(deflate_settings) &&
+          deflate_settings->isal_strm != nullptr &&
+          CompressLevelChangedIGZIP(deflate_settings->isal_strm, level)) {
+        EndCompressIGZIP(deflate_settings->isal_strm);
+        deflate_settings->isal_strm = nullptr;
+      }
+#endif
     }
   }
   return ret;
@@ -470,10 +503,8 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // unhonored -- output is still valid, round-trippable deflate -- which is the
   // same deliberate mid-stream residual as deflate()'s Z_BLOCK -> Z_SYNC_FLUSH
   // aliasing. Documented in the README.
-  const bool igzip_owns_stream =
-      deflate_settings->path == IGZIP && deflate_settings->isal_strm != nullptr;
   if (!IsOffloadableCompressionLevel(deflate_settings->level) &&
-      !igzip_owns_stream) {
+      !IgzipOwnsDeflateStream(deflate_settings)) {
     SetDeflatePath(deflate_settings, ZLIB);
   }
 
@@ -498,8 +529,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         SupportedOptionsQAT(deflate_settings->window_bits, input_len);
 #endif
 #ifdef USE_IGZIP
-    igzip_stream_active = (deflate_settings->path == IGZIP &&
-                           deflate_settings->isal_strm != nullptr);
+    igzip_stream_active = IgzipOwnsDeflateStream(deflate_settings);
     igzip_available =
         configs[USE_IGZIP_COMPRESS] && SupportedOptionsIGZIPDeflate(flush);
 #endif
@@ -695,7 +725,8 @@ int ZEXPORT deflateReset(z_streamp strm) {
       // leave the next stream running at the old ISA-L level. Discard the
       // stream in that case and let deflate() rebuild it from the current
       // setting; the common reset, where the level did not change, keeps the
-      // stream and its level_buf allocation.
+      // stream and its level_buf allocation. The reverse ordering -- reset
+      // first, then deflateParams() -- is handled in deflateParams().
       if (CompressLevelChangedIGZIP(deflate_settings->isal_strm,
                                     deflate_settings->level)) {
         EndCompressIGZIP(deflate_settings->isal_strm);
