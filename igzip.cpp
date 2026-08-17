@@ -38,11 +38,16 @@ static void ConfigureDeflateWindow(struct isal_zstream *isal_strm,
   isal_strm->hist_bits = ClampHistBits(windowBits);
 }
 
-static void ConfigureInflateWindow(struct inflate_state *isal_strm_inflate,
-                                   int windowBits) {
+// windowBits -> the (crc_flag, hist_bits) pair ISA-L needs for decompression.
+// Kept separate from ConfigureInflateWindow() so that
+// UncompressWindowChangedIGZIP() can ask what a windowBits value maps to
+// without writing it anywhere, the same split as MapCompressionLevelIGZIP() and
+// CompressLevelChangedIGZIP() on the deflate side.
+static void MapInflateWindowIGZIP(int windowBits, uint32_t *crc_flag,
+                                  uint32_t *hist_bits) {
   if (windowBits < 0) {
-    isal_strm_inflate->crc_flag = IGZIP_DEFLATE;
-    isal_strm_inflate->hist_bits = ClampHistBits(-windowBits);
+    *crc_flag = IGZIP_DEFLATE;
+    *hist_bits = ClampHistBits(-windowBits);
     return;
   }
 
@@ -52,15 +57,21 @@ static void ConfigureInflateWindow(struct inflate_state *isal_strm_inflate,
   // 24..31. Values >= 32 request zlib/gzip auto-detection and are kept off
   // this path by SupportedOptionsIGZIPInflate().
   if (windowBits >= 16 && windowBits <= 31) {
-    isal_strm_inflate->crc_flag = IGZIP_GZIP;
-    isal_strm_inflate->hist_bits = ClampHistBits(windowBits - 16);
+    *crc_flag = IGZIP_GZIP;
+    *hist_bits = ClampHistBits(windowBits - 16);
     return;
   }
 
   // windowBits == 0 means "take the window size from the zlib header"; ISA-L
   // spells that as hist_bits == 0 (maximum history).
-  isal_strm_inflate->crc_flag = IGZIP_ZLIB;
-  isal_strm_inflate->hist_bits = ClampHistBits(windowBits);
+  *crc_flag = IGZIP_ZLIB;
+  *hist_bits = ClampHistBits(windowBits);
+}
+
+static void ConfigureInflateWindow(struct inflate_state *isal_strm_inflate,
+                                   int windowBits) {
+  MapInflateWindowIGZIP(windowBits, &isal_strm_inflate->crc_flag,
+                        &isal_strm_inflate->hist_bits);
 }
 
 bool SupportedOptionsIGZIPDeflate(int flush) {
@@ -588,6 +599,22 @@ bool CompressLevelChangedIGZIP(const struct isal_zstream *isal_strm,
   // ISA-L level, so it reads as changed and the caller discards the stream.
   return MapCompressionLevelIGZIP(level, &level_buf_size) !=
          (int)isal_strm->level;
+}
+
+bool UncompressWindowChangedIGZIP(const struct inflate_state *isal_strm_inflate,
+                                  int window_bits) {
+  if (isal_strm_inflate == nullptr) {
+    return false;
+  }
+  uint32_t crc_flag = 0;
+  uint32_t hist_bits = 0;
+  MapInflateWindowIGZIP(window_bits, &crc_flag, &hist_bits);
+  // Both fields matter: crc_flag decides which wrapper ISA-L expects and
+  // verifies, hist_bits the lookback distance it will accept. Neither survives
+  // a re-configuration, because isal_inflate_reset() preserves them, so the
+  // caller has to discard the stream when either one differs.
+  return crc_flag != isal_strm_inflate->crc_flag ||
+         hist_bits != isal_strm_inflate->hist_bits;
 }
 
 void ResetCompressIGZIP(struct isal_zstream *isal_strm) {

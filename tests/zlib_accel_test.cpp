@@ -5159,6 +5159,806 @@ TEST_F(StreamCopyRegressionTest,
 #endif  // USE_IGZIP
 #endif  // USE_IGZIP || USE_QAT || USE_IAA
 
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+class TerminalStateRegressionTest : public ::testing::Test {};
+
+// An offloaded stream never feeds zlib's own deflate/inflate state, so before
+// the shim recorded that a stream had ended, every call after Z_STREAM_END was
+// dispatched from scratch: QAT and IAA appended bytes zlib would never emit
+// (measured +8 -- a complete empty zlib stream -- after a finished one, and +2
+// for a non-Z_FINISH call), while IGZIP consumed 64 KiB of fresh input, wrote
+// nothing and reported success, which is data loss behind a success code.
+//
+// The expectations below are zlib's own, measured against a binary that does
+// not link the shim rather than read out of deflate.c, because zlib validates
+// its parameters *before* it reports the terminal state and the order matters:
+// avail_out == 0 outranks Z_STREAM_END on the deflate side but not on the
+// inflate side, a null next_out outranks it on both, a null next_in with input
+// outranks the "more input after FINISH" Z_BUF_ERROR, and inflate accepts any
+// flush value where deflate rejects everything but Z_FINISH.
+struct PostEndRow {
+  const char* label;
+  int flush;
+  bool avail_in_nonzero;
+  bool avail_out_zero;
+  bool null_next_out;
+  bool null_next_in;
+  int expected_deflate;
+  int expected_inflate;
+};
+
+static const PostEndRow kPostEndRows[] = {
+    {"avail_in>0, Z_FINISH", Z_FINISH, true, false, false, false, Z_BUF_ERROR,
+     Z_STREAM_END},
+    {"avail_in>0, Z_NO_FLUSH", Z_NO_FLUSH, true, false, false, false,
+     Z_STREAM_ERROR, Z_STREAM_END},
+    {"avail_in=0, Z_FINISH", Z_FINISH, false, false, false, false, Z_STREAM_END,
+     Z_STREAM_END},
+    {"avail_in=0, Z_NO_FLUSH", Z_NO_FLUSH, false, false, false, false,
+     Z_STREAM_ERROR, Z_STREAM_END},
+    {"avail_in=0, Z_SYNC_FLUSH", Z_SYNC_FLUSH, false, false, false, false,
+     Z_STREAM_ERROR, Z_STREAM_END},
+    {"avail_in=0, Z_BLOCK", Z_BLOCK, false, false, false, false, Z_STREAM_ERROR,
+     Z_STREAM_END},
+    {"avail_in=0, flush out of range", 99, false, false, false, false,
+     Z_STREAM_ERROR, Z_STREAM_END},
+    {"avail_in=0, Z_FINISH, avail_out=0", Z_FINISH, false, true, false, false,
+     Z_BUF_ERROR, Z_STREAM_END},
+    {"avail_in>0, Z_FINISH, avail_out=0", Z_FINISH, true, true, false, false,
+     Z_BUF_ERROR, Z_STREAM_END},
+    {"avail_in=0, Z_FINISH, next_out=NULL", Z_FINISH, false, false, true, false,
+     Z_STREAM_ERROR, Z_STREAM_ERROR},
+    {"avail_in>0, Z_FINISH, next_in=NULL", Z_FINISH, true, false, false, true,
+     Z_STREAM_ERROR, Z_STREAM_ERROR},
+};
+
+static const size_t kPostEndRowCount =
+    sizeof(kPostEndRows) / sizeof(kPostEndRows[0]);
+
+// Every row has to leave the stream exactly as it was, so total_in and
+// total_out are checked alongside the return code: a return code that happens
+// to match while bytes were still written is the failure mode this is guarding.
+static void CheckDeflatePostEndRows(z_streamp stream, char* input,
+                                    size_t input_length, Bytef* spare,
+                                    size_t spare_length) {
+  const uLong total_in_before = stream->total_in;
+  const uLong total_out_before = stream->total_out;
+
+  for (size_t i = 0; i < kPostEndRowCount; i++) {
+    const PostEndRow& row = kPostEndRows[i];
+    stream->next_in =
+        row.null_next_in ? nullptr : reinterpret_cast<Bytef*>(input);
+    stream->avail_in =
+        row.avail_in_nonzero ? static_cast<uInt>(input_length) : 0;
+    stream->next_out = row.null_next_out ? nullptr : spare;
+    stream->avail_out =
+        row.avail_out_zero ? 0 : static_cast<uInt>(spare_length);
+
+    EXPECT_EQ(deflate(stream, row.flush), row.expected_deflate) << row.label;
+    EXPECT_EQ(stream->total_in, total_in_before) << row.label;
+    EXPECT_EQ(stream->total_out, total_out_before) << row.label;
+  }
+
+  // Leave the stream holding valid pointers for whatever the caller does next.
+  stream->next_in = reinterpret_cast<Bytef*>(input);
+  stream->avail_in = 0;
+  stream->next_out = spare;
+  stream->avail_out = static_cast<uInt>(spare_length);
+}
+
+static void CheckInflatePostEndRows(z_streamp stream,
+                                    const std::string& compressed, Bytef* spare,
+                                    size_t spare_length) {
+  const uLong total_in_before = stream->total_in;
+  const uLong total_out_before = stream->total_out;
+  Bytef* compressed_bytes =
+      reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+
+  for (size_t i = 0; i < kPostEndRowCount; i++) {
+    const PostEndRow& row = kPostEndRows[i];
+    stream->next_in = row.null_next_in ? nullptr : compressed_bytes;
+    stream->avail_in =
+        row.avail_in_nonzero ? static_cast<uInt>(compressed.size()) : 0;
+    stream->next_out = row.null_next_out ? nullptr : spare;
+    stream->avail_out =
+        row.avail_out_zero ? 0 : static_cast<uInt>(spare_length);
+
+    EXPECT_EQ(inflate(stream, row.flush), row.expected_inflate) << row.label;
+    EXPECT_EQ(stream->total_in, total_in_before) << row.label;
+    EXPECT_EQ(stream->total_out, total_out_before) << row.label;
+  }
+
+  stream->next_in = compressed_bytes;
+  stream->avail_in = 0;
+  stream->next_out = spare;
+  stream->avail_out = static_cast<uInt>(spare_length);
+}
+
+static void RunDeflatePostEndMatchesZlib(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const size_t bound = deflateBound(&stream, input_length) + 4096;
+  std::vector<Bytef> output(bound);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - stream.avail_out;
+  ASSERT_EQ(GetDeflateExecutionPath(&stream), accel_path);
+  const std::vector<Bytef> first(output.begin(), output.begin() + produced);
+
+  // The spare buffer is deliberately separate from the finished stream's
+  // output: anything written into it would have landed after a complete stream.
+  std::vector<Bytef> spare(4096);
+  CheckDeflatePostEndRows(&stream, input, input_length, spare.data(),
+                          spare.size());
+
+  // The finished stream itself has to be untouched and still decodable.
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  size_t input_consumed = 0;
+  ExecutionPath uncompress_path = UNDEFINED;
+  ASSERT_EQ(
+      ZlibUncompress(reinterpret_cast<const char*>(first.data()), first.size(),
+                     input_length, &uncompressed, &uncompressed_length,
+                     &input_consumed, 15, Z_FINISH, 1, &uncompress_path),
+      Z_STREAM_END);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+  delete[] uncompressed;
+
+  // deflateReset clears the terminal state, so the same stream compresses
+  // again -- and byte-identically, since a reset stream is back where it
+  // started. A flag left set here would wedge the stream at Z_STREAM_END.
+  ASSERT_EQ(deflateReset(&stream), Z_OK);
+  std::vector<Bytef> again(bound);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  again.resize(stream.total_out);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), accel_path);
+  EXPECT_EQ(again, first);
+
+  ASSERT_EQ(deflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPDeflatePostEndMatchesZlib) {
+  RunDeflatePostEndMatchesZlib(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATDeflatePostEndMatchesZlib) {
+  RunDeflatePostEndMatchesZlib(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAADeflatePostEndMatchesZlib) {
+  RunDeflatePostEndMatchesZlib(IAA);
+}
+#endif
+
+static void RunInflatePostEndMatchesZlib(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  // Compressed by the same backend so the stream is one it will decompress.
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), accel_path);
+  ASSERT_EQ(stream.total_out, input_length);
+
+  // Re-feeding the whole stream decoded it a second time on QAT and IAA
+  // (measured +65536), which is what these rows rule out.
+  std::vector<Bytef> spare(4096);
+  CheckInflatePostEndRows(&stream, compressed, spare.data(), spare.size());
+
+  // inflateReset clears the terminal state, so the stream decodes again.
+  ASSERT_EQ(inflateReset(&stream), Z_OK);
+  std::vector<Bytef> again(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPInflatePostEndMatchesZlib) {
+  RunInflatePostEndMatchesZlib(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATInflatePostEndMatchesZlib) {
+  RunInflatePostEndMatchesZlib(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAInflatePostEndMatchesZlib) {
+  RunInflatePostEndMatchesZlib(IAA);
+}
+#endif
+
+// The review comment on the stream-copy work that started this: a copy of a
+// finished stream held a zlib deflate state the accelerator had never fed, so
+// feeding the copy produced a second stream (measured +1105 on QAT, +1698 on
+// IAA) where zlib returns Z_BUF_ERROR and writes nothing. The copy inherits the
+// terminal state, so it now refuses input exactly as its source does.
+static void RunFinishedDeflateCopyRefusesInput(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const size_t bound = deflateBound(&source, input_length) + 4096;
+  std::vector<Bytef> output(bound);
+  source.next_in = reinterpret_cast<Bytef*>(input);
+  source.avail_in = static_cast<uInt>(input_length);
+  source.next_out = output.data();
+  source.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&source, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&source), accel_path);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateCopy(&copy, &source), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&copy), accel_path);
+
+  std::vector<Bytef> spare(4096);
+  CheckDeflatePostEndRows(&copy, input, input_length, spare.data(),
+                          spare.size());
+
+  ASSERT_EQ(deflateEnd(&copy), Z_OK);
+  ASSERT_EQ(deflateEnd(&source), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATFinishedDeflateCopyRefusesInput) {
+  RunFinishedDeflateCopyRefusesInput(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAFinishedDeflateCopyRefusesInput) {
+  RunFinishedDeflateCopyRefusesInput(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// IGZIP has no copyable deflate state (level_buf holds pointers into its own
+// allocation), so a finished IGZIP stream refuses the copy outright rather than
+// producing one that has to be taught about the terminal state.
+TEST_F(TerminalStateRegressionTest, IGZIPRefusesFinishedDeflateCopy) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const size_t bound = deflateBound(&source, input_length) + 4096;
+  std::vector<Bytef> output(bound);
+  source.next_in = reinterpret_cast<Bytef*>(input);
+  source.avail_in = static_cast<uInt>(input_length);
+  source.next_out = output.data();
+  source.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&source, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&source), IGZIP);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  EXPECT_EQ(deflateCopy(&copy, &source), Z_STREAM_ERROR);
+
+  // A refused copy must not leave the source unusable: it still answers as a
+  // finished stream does.
+  std::vector<Bytef> spare(4096);
+  CheckDeflatePostEndRows(&source, input, input_length, spare.data(),
+                          spare.size());
+
+  ASSERT_EQ(deflateEnd(&source), Z_OK);
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+
+static void RunFinishedInflateCopyReturnsStreamEnd(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  source.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  source.avail_in = static_cast<uInt>(compressed.size());
+  source.next_out = uncompressed.data();
+  source.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&source, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&source), accel_path);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateCopy(&copy, &source), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&copy), accel_path);
+
+  std::vector<Bytef> spare(4096);
+  CheckInflatePostEndRows(&copy, compressed, spare.data(), spare.size());
+
+  ASSERT_EQ(inflateEnd(&copy), Z_OK);
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPFinishedInflateCopyReturnsStreamEnd) {
+  RunFinishedInflateCopyReturnsStreamEnd(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATFinishedInflateCopyReturnsStreamEnd) {
+  RunFinishedInflateCopyReturnsStreamEnd(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAFinishedInflateCopyReturnsStreamEnd) {
+  RunFinishedInflateCopyReturnsStreamEnd(IAA);
+}
+#endif
+
+// inflateReset2 is the one API that restarts a finished stream without going
+// through inflateReset, so a terminal-state flag it did not clear would wedge
+// the stream at Z_STREAM_END forever -- a failure this fix would introduce if
+// inflateReset2 were left unintercepted.
+static void RunInflateReset2ClearsStreamEnd(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), accel_path);
+
+  // Same windowBits, so nothing changes but the path and the terminal state.
+  ASSERT_EQ(inflateReset2(&stream, 15), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), UNDEFINED);
+
+  std::vector<Bytef> again(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPInflateReset2ClearsStreamEnd) {
+  RunInflateReset2ClearsStreamEnd(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATInflateReset2ClearsStreamEnd) {
+  RunInflateReset2ClearsStreamEnd(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAInflateReset2ClearsStreamEnd) {
+  RunInflateReset2ClearsStreamEnd(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// The IGZIP inflate path reports completion in two places. With avail_in == 0
+// and output still buffered inside ISA-L, inflate() drains that state and
+// returns Z_STREAM_END there rather than from the translation block, so a
+// stream that ends this way has to end up in the same terminal state. A small
+// first avail_out is what leaves ISA-L holding the output: it decompresses into
+// its own tmp_out_buffer, consumes the whole input doing so, and then has more
+// to give than the caller had room for.
+TEST_F(TerminalStateRegressionTest, IGZIPInflatePostEndAfterDrainMatchesZlib) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = 1024;
+  ASSERT_EQ(inflate(&stream, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  ASSERT_EQ(stream.avail_in, 0u);
+
+  // Every call from here on has avail_in == 0, so the completion can only come
+  // from the drain site.
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    stream.next_out = uncompressed.data() + stream.total_out;
+    stream.avail_out =
+        static_cast<uInt>(uncompressed.size() - stream.total_out);
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+
+  std::vector<Bytef> spare(4096);
+  CheckInflatePostEndRows(&stream, compressed, spare.data(), spare.size());
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+
+// The other half of intercepting inflateReset2: it is the only entry point that
+// changes windowBits on a live stream, so the recorded window_bits has to be
+// refreshed. Left stale, path selection keeps deciding on the old format and
+// hands raw deflate data to a backend expecting a zlib header.
+static void RunInflateReset2RefreshesWindowBits(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string zlib_stream;
+  std::string raw_stream;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &zlib_stream, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &raw_stream, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&zlib_stream[0]);
+  stream.avail_in = static_cast<uInt>(zlib_stream.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), accel_path);
+
+  // Raw deflate from here on. With use_zlib_uncompress=0 there is no fallback
+  // to hide a stale format behind.
+  ASSERT_EQ(inflateReset2(&stream, -15), Z_OK);
+
+  std::vector<Bytef> again(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&raw_stream[0]);
+  stream.avail_in = static_cast<uInt>(raw_stream.size());
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPInflateReset2RefreshesWindowBits) {
+  RunInflateReset2RefreshesWindowBits(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATInflateReset2RefreshesWindowBits) {
+  RunInflateReset2RefreshesWindowBits(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAInflateReset2RefreshesWindowBits) {
+  RunInflateReset2RefreshesWindowBits(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// isal_inflate_reset() deliberately preserves crc_flag and hist_bits, so an
+// ISA-L stream cannot be reset across a format change -- it has to be
+// discarded. Kept and merely reset, it would decode the gzip stream below with
+// crc_flag still IGZIP_ZLIB.
+TEST_F(TerminalStateRegressionTest,
+       IGZIPInflateReset2RebuildsStreamOnFormatChange) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string zlib_stream;
+  std::string gzip_stream;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &zlib_stream, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &gzip_stream, 31, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&zlib_stream[0]);
+  stream.avail_in = static_cast<uInt>(zlib_stream.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+
+  ASSERT_EQ(inflateReset2(&stream, 31), Z_OK);
+
+  std::vector<Bytef> again(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&gzip_stream[0]);
+  stream.avail_in = static_cast<uInt>(gzip_stream.size());
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+
+// The parity guard: on a stream that never left zlib, every row above is
+// answered by zlib itself. It passes both before and after this change, which
+// is the point -- it is what makes the accelerator rows meaningful, and it
+// fails if the gate ever starts answering for ZLIB-path streams with anything
+// other than zlib's own returns.
+TEST_F(TerminalStateRegressionTest, ZlibPathPostEndIsUnchanged) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const size_t bound = deflateBound(&cstream, input_length) + 4096;
+  std::vector<Bytef> output(bound);
+  cstream.next_in = reinterpret_cast<Bytef*>(input);
+  cstream.avail_in = static_cast<uInt>(input_length);
+  cstream.next_out = output.data();
+  cstream.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&cstream), ZLIB);
+  std::string compressed(reinterpret_cast<char*>(output.data()),
+                         cstream.total_out);
+
+  std::vector<Bytef> spare(4096);
+  CheckDeflatePostEndRows(&cstream, input, input_length, spare.data(),
+                          spare.size());
+  ASSERT_EQ(deflateEnd(&cstream), Z_OK);
+
+  z_stream dstream;
+  memset(&dstream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&dstream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  dstream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  dstream.avail_in = static_cast<uInt>(compressed.size());
+  dstream.next_out = uncompressed.data();
+  dstream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&dstream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&dstream), ZLIB);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+
+  CheckInflatePostEndRows(&dstream, compressed, spare.data(), spare.size());
+  ASSERT_EQ(inflateEnd(&dstream), Z_OK);
+
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP || USE_QAT || USE_IAA
+
 void CreateAndWriteTempConfigFile(const char* file_path) {
   std::ofstream temp_file(file_path);
   temp_file << "use_qat_compress=5000\n";

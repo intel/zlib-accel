@@ -49,4 +49,6 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
                     const unsigned long *total_out, bool *end_of_stream);
 int EndUncompressIGZIP(struct inflate_state *isal_strm_inflate);
 int ResetUncompressIGZIP(struct inflate_state *isal_strm_inflate);
+VISIBLE_FOR_TESTING bool UncompressWindowChangedIGZIP(
+    const struct inflate_state *isal_strm_inflate, int window_bits);
 #endif
