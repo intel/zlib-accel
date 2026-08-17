@@ -52,6 +52,7 @@ static int (*orig_deflate)(z_streamp strm, int flush);
 static int (*orig_deflateEnd)(z_streamp strm);
 static int (*orig_deflateReset)(z_streamp strm);
 static int (*orig_deflateParams)(z_streamp strm, int level, int strategy);
+static int (*orig_deflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_inflateInit_)(z_streamp strm, const char* version,
                                 int stream_size);
 static int (*orig_inflateInit2_)(z_streamp strm, int window_bits,
@@ -61,6 +62,7 @@ static int (*orig_inflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_inflate)(z_streamp strm, int flush);
 static int (*orig_inflateEnd)(z_streamp strm);
 static int (*orig_inflateReset)(z_streamp strm);
+static int (*orig_inflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_compress)(Bytef* dest, uLongf* destLen, const Bytef* source,
                             uLong sourceLen);
 static int (*orig_compress2)(Bytef* dest, uLongf* destLen, const Bytef* source,
@@ -131,6 +133,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_deflateParams, int (*)(z_streamp, int, int),
               "deflateParams");
 
+  LOAD_SYMBOL(orig_deflateCopy, int (*)(z_streamp, z_streamp), "deflateCopy");
+
   // Load inflate functions
   LOAD_SYMBOL(orig_inflateInit_, int (*)(z_streamp, const char*, int),
               "inflateInit_");
@@ -146,6 +150,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_inflateEnd, int (*)(z_streamp), "inflateEnd");
 
   LOAD_SYMBOL(orig_inflateReset, int (*)(z_streamp), "inflateReset");
+
+  LOAD_SYMBOL(orig_inflateCopy, int (*)(z_streamp, z_streamp), "inflateCopy");
 
   // Load compress/uncompress functions
   LOAD_SYMBOL(orig_compress, int (*)(Bytef*, uLongf*, const Bytef*, uLong),
@@ -267,6 +273,17 @@ class DeflateStreamSettings {
     map.Set(strm, std::move(settings));
   }
 
+  // Registers dest as a copy of an already-tracked stream, for deflateCopy().
+  // Deliberately not a copy of the DeflateSettings object: that would carry
+  // isal_strm over and leave the two streams sharing one ISA-L state.
+  void SetFromCopy(z_streamp dest, const DeflateSettings& source) {
+    auto settings = std::make_shared<DeflateSettings>(
+        source.level, source.method, source.window_bits, source.mem_level,
+        source.strategy);
+    settings->path = source.path;
+    map.Set(dest, std::move(settings));
+  }
+
   void Unset(z_streamp strm) { map.Unset(strm); }
 
   std::shared_ptr<DeflateSettings> Get(z_streamp strm) { return map.Get(strm); }
@@ -283,6 +300,18 @@ class InflateStreamSettings {
   void Set(z_streamp strm, int window_bits) {
     auto settings = std::make_shared<InflateSettings>(window_bits);
     map.Set(strm, std::move(settings));
+  }
+
+  // Registers dest as a copy of an already-tracked stream, for inflateCopy().
+  // isal_clone is passed in rather than copied from source so that ownership of
+  // the cloned ISA-L state is explicit: the caller allocates it, this entry
+  // point hands it to the new settings, and inflateEnd() frees it.
+  void SetFromCopy(z_streamp dest, const InflateSettings& source,
+                   struct inflate_state* isal_clone) {
+    auto settings = std::make_shared<InflateSettings>(source.window_bits);
+    settings->path = source.path;
+    settings->isal_strm = isal_clone;
+    map.Set(dest, std::move(settings));
   }
 
   void Unset(z_streamp strm) { map.Unset(strm); }
@@ -742,6 +771,48 @@ int ZEXPORT deflateReset(z_streamp strm) {
                                       : Z_VERSION_ERROR;
 }
 
+int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
+  Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__, ", dest ",
+      static_cast<void*>(dest), ", source ", static_cast<void*>(source), "\n");
+
+  auto deflate_settings = deflate_stream_settings.Get(source);
+
+  // Refuse while ISA-L owns the source stream. zlib's copy duplicates only the
+  // zlib deflate state, which on an offloaded stream has never been fed, and
+  // ISA-L's state cannot be duplicated alongside it: isal_zstream::level_buf is
+  // cast to a private struct holding pointers into its own allocation, so a
+  // byte-for-byte copy would leave both streams writing into one pending block.
+  // Flushing that block out of the way first is no help either -- those bytes
+  // belong to the prefix the two streams share, and deflateCopy() has no way to
+  // hand bytes back to the caller. Fail before orig_deflateCopy so dest is left
+  // exactly as the caller passed it, and a caller that ignores the return code
+  // gets Z_STREAM_ERROR from zlib on first use. Same shape as the mid-stream
+  // rejection in deflateSetDictionary().
+  if (IgzipOwnsDeflateStream(deflate_settings)) {
+    Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__,
+        " rejected, ISA-L holds live state for source stream\n");
+    return Z_STREAM_ERROR;
+  }
+
+  if (orig_deflateCopy == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  int ret = orig_deflateCopy(dest, source);
+  if (ret == Z_OK && deflate_settings != nullptr) {
+    // The copy inherits the source's path along with its init parameters: a
+    // source pinned to ZLIB -- by Z_NO_COMPRESSION or a preset dictionary --
+    // was pinned because the request was never offloadable, which is just as
+    // true of the copy, and leaving the copy UNDEFINED would re-run path
+    // selection on a stream that is already under way. No ISA-L stream is
+    // carried over: a live one was refused above, and one merely kept across
+    // deflateReset() is freshly reset, so deflate() rebuilds it lazily at the
+    // recorded level.
+    deflate_stream_settings.SetFromCopy(dest, *deflate_settings);
+  }
+  return ret;
+}
+
 int ZEXPORT inflateInit_(z_streamp strm, const char* version, int stream_size) {
   Log(LogLevel::LOG_INFO, "inflateInit_ Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
@@ -1103,6 +1174,52 @@ int ZEXPORT inflateReset(z_streamp strm) {
 
   return orig_inflateReset != nullptr ? orig_inflateReset(strm)
                                       : Z_VERSION_ERROR;
+}
+
+int ZEXPORT inflateCopy(z_streamp dest, z_streamp source) {
+  Log(LogLevel::LOG_INFO, "inflateCopy Line ", __LINE__, ", dest ",
+      static_cast<void*>(dest), ", source ", static_cast<void*>(source), "\n");
+
+  if (orig_inflateCopy == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  int ret = orig_inflateCopy(dest, source);
+  if (ret != Z_OK) {
+    return ret;
+  }
+
+  auto inflate_settings = inflate_stream_settings.Get(source);
+  if (inflate_settings == nullptr) {
+    // Untracked source: leave dest untracked too, so it reaches orig_inflate
+    // the same way the source does.
+    return ret;
+  }
+
+  struct inflate_state* isal_clone = nullptr;
+#ifdef USE_IGZIP
+  // Clone the ISA-L state only when ISA-L is the engine in use. Unlike the
+  // deflate side this is exact, mid-stream included: inflate_state is
+  // self-contained, and next_in/next_out are re-pointed on every call. A stream
+  // on any other path either holds no ISA-L state or will never use it again
+  // (ZLIB is sticky), so cloning it would only cost an allocation.
+  if (inflate_settings->path == IGZIP &&
+      inflate_settings->isal_strm != nullptr) {
+    isal_clone = CopyUncompressIGZIP(inflate_settings->isal_strm);
+    if (isal_clone == nullptr) {
+      // Undo zlib's half of the copy rather than register a stream with no
+      // ISA-L state to continue from; otherwise dest leaks zlib's inflate
+      // state, since a caller told the copy failed will not call inflateEnd.
+      if (orig_inflateEnd != nullptr) {
+        orig_inflateEnd(dest);
+      }
+      return Z_MEM_ERROR;
+    }
+  }
+#endif
+
+  inflate_stream_settings.SetFromCopy(dest, *inflate_settings, isal_clone);
+  return ret;
 }
 
 // Note: compress2 / uncompress2 are one-shot stateless paths. They do NOT

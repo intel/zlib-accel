@@ -40,6 +40,8 @@ VISIBLE_FOR_TESTING bool CompressLevelChangedIGZIP(
     const struct isal_zstream *isal_strm, int level);
 
 struct inflate_state *InitUncompressIGZIP(int windowBits);
+struct inflate_state *CopyUncompressIGZIP(
+    const struct inflate_state *isal_strm_inflate);
 int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
                     const uint8_t *input, uint32_t *input_length,
                     uint8_t *output, uint32_t *output_length,
