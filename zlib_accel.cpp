@@ -265,37 +265,78 @@ struct InflateSettings {
   struct inflate_state* isal_strm = nullptr;
 };
 
+// isal_strm is a raw pointer, so destroying a settings object does not free the
+// ISA-L stream it owns. Every path that discards an entry has to come through
+// here: *End() when the caller is done with the stream, and Set()/SetFromCopy()
+// when a new entry replaces one that is still holding state.
+static void ReleaseDeflateIgzipState(
+    const std::shared_ptr<DeflateSettings>& settings) {
+  if (settings == nullptr || settings->isal_strm == nullptr) {
+    return;
+  }
+#ifdef USE_IGZIP
+  EndCompressIGZIP(settings->isal_strm);
+#endif
+  settings->isal_strm = nullptr;
+}
+
+static void ReleaseInflateIgzipState(
+    const std::shared_ptr<InflateSettings>& settings) {
+  if (settings == nullptr || settings->isal_strm == nullptr) {
+    return;
+  }
+#ifdef USE_IGZIP
+  EndUncompressIGZIP(settings->isal_strm);
+#endif
+  settings->isal_strm = nullptr;
+}
+
 class DeflateStreamSettings {
  public:
   void Set(z_streamp strm, int level, int method, int window_bits,
            int mem_level, int strategy) {
+    auto previous = map.Get(strm);
     auto settings = std::make_shared<DeflateSettings>(
         level, method, window_bits, mem_level, strategy);
     map.Set(strm, std::move(settings));
+    // A second deflateInit*() on a stream that was never ended replaces an
+    // entry that may still own an ISA-L stream, which nothing can reach once
+    // the entry is gone. See SetFromCopy() for the ordering.
+    ReleaseDeflateIgzipState(previous);
   }
 
   // Registers dest as a copy of an already-tracked stream, for deflateCopy().
   // Deliberately not a copy of the DeflateSettings object: that would carry
   // isal_strm over and leave the two streams sharing one ISA-L state.
   //
-  // Reports allocation failure instead of throwing: the caller is an exported
-  // zlib symbol, so a bad_alloc escaping here would cross into a C caller that
-  // cannot catch it, and would abandon the destination stream zlib has already
-  // copied. Returning false lets the caller undo that copy and report
-  // Z_MEM_ERROR, which is what zlib documents for this condition.
+  // Reports failure instead of throwing: the caller is an exported zlib symbol,
+  // so an exception escaping here would cross into a C caller that cannot catch
+  // it, and would abandon the destination stream zlib has already copied. The
+  // catch is deliberately unqualified -- besides bad_alloc from the allocations
+  // here, ShardedMap::Set() locks a std::shared_mutex on the non-TBB build and
+  // so can throw std::system_error. Returning false lets the caller undo the
+  // copy and report Z_MEM_ERROR, which alongside Z_STREAM_ERROR is the only
+  // failure zlib documents for deflateCopy().
   bool SetFromCopy(z_streamp dest, const DeflateSettings& source) {
+    // dest may already be an initialized, used stream whose entry owns an ISA-L
+    // stream. Read that entry before replacing it, and release it only after
+    // the replacement has landed: freeing first would leave a dangling
+    // isal_strm in the map if the work below throws. The shared_ptr keeps the
+    // old settings alive past map.Set().
+    auto previous = map.Get(dest);
     try {
       auto settings = std::make_shared<DeflateSettings>(
           source.level, source.method, source.window_bits, source.mem_level,
           source.strategy);
       settings->path = source.path;
       map.Set(dest, std::move(settings));
-    } catch (const std::bad_alloc&) {
+    } catch (...) {
       Log(LogLevel::LOG_ERROR,
-          "SetFromCopy() allocation failed for deflate stream ",
+          "SetFromCopy() failed to register deflate stream ",
           static_cast<void*>(dest), "\n");
       return false;
     }
+    ReleaseDeflateIgzipState(previous);
     return true;
   }
 
@@ -313,8 +354,11 @@ DeflateStreamSettings deflate_stream_settings;
 class InflateStreamSettings {
  public:
   void Set(z_streamp strm, int window_bits) {
+    auto previous = map.Get(strm);
     auto settings = std::make_shared<InflateSettings>(window_bits);
     map.Set(strm, std::move(settings));
+    // See the deflate-side Set().
+    ReleaseInflateIgzipState(previous);
   }
 
   // Registers dest as a copy of an already-tracked stream, for inflateCopy().
@@ -323,20 +367,23 @@ class InflateStreamSettings {
   // point hands it to the new settings, and inflateEnd() frees it. Ownership
   // therefore transfers only when this returns true; on false the clone is
   // still the caller's to free, along with zlib's half of the copy. See the
-  // deflate-side comment for why allocation failure is reported, not thrown.
+  // deflate-side comment for why failure is reported, not thrown, and for the
+  // ordering of the release below.
   bool SetFromCopy(z_streamp dest, const InflateSettings& source,
                    struct inflate_state* isal_clone) {
+    auto previous = map.Get(dest);
     try {
       auto settings = std::make_shared<InflateSettings>(source.window_bits);
       settings->path = source.path;
       settings->isal_strm = isal_clone;
       map.Set(dest, std::move(settings));
-    } catch (const std::bad_alloc&) {
+    } catch (...) {
       Log(LogLevel::LOG_ERROR,
-          "SetFromCopy() allocation failed for inflate stream ",
+          "SetFromCopy() failed to register inflate stream ",
           static_cast<void*>(dest), "\n");
       return false;
     }
+    ReleaseInflateIgzipState(previous);
     return true;
   }
 
@@ -750,12 +797,7 @@ int ZEXPORT deflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   auto deflate_settings = deflate_stream_settings.Get(strm);
-  if (deflate_settings != nullptr && deflate_settings->isal_strm != nullptr) {
-#ifdef USE_IGZIP
-    EndCompressIGZIP(deflate_settings->isal_strm);
-#endif
-    deflate_settings->isal_strm = nullptr;
-  }
+  ReleaseDeflateIgzipState(deflate_settings);
   deflate_stream_settings.Unset(strm);
   return orig_deflateEnd != nullptr ? orig_deflateEnd(strm) : Z_VERSION_ERROR;
 }
@@ -814,13 +856,35 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
   // exactly as the caller passed it, and a caller that ignores the return code
   // gets Z_STREAM_ERROR from zlib on first use. Same shape as the mid-stream
   // rejection in deflateSetDictionary().
+  //
+  // Only IGZIP is checked because QAT and IAA compress all-or-nothing: they
+  // offload with Z_FINISH only, and every measured failure consumed and
+  // produced nothing rather than committing a partial result (81 QAT Gen4
+  // configurations, down to 300,000 bytes of output for a 300,031-byte
+  // requirement). That is a property of the libraries as they behave today, not
+  // of their contracts -- qatzip.h documents the opposite ("The calling API may
+  // have to process the destination buffer and call again"), and the IAA side
+  // is unmeasured, with CompressIAA assigning *input_length = job->total_in
+  // without comparing it to available_in. Were either to consume part of
+  // avail_in on a success, deflate() would advance the pointers and keep the
+  // accelerator path, leaving committed output over a zlib state that was never
+  // fed -- a state this guard would not catch. A plain follow-up deflate()
+  // mishandles it identically, so the gap is not specific to copying; the copy
+  // only makes it reachable in a second place.
   if (IgzipOwnsDeflateStream(deflate_settings)) {
     Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__,
         " rejected, ISA-L holds live state for source stream\n");
     return Z_STREAM_ERROR;
   }
 
-  if (orig_deflateCopy == nullptr) {
+  // deflateEnd is required as well as deflateCopy: registering dest below can
+  // fail, and undoing zlib's half of the copy is the only way to avoid handing
+  // back a destination the shim does not know about. Reporting the missing
+  // symbol here, before anything is allocated, keeps that rollback
+  // unconditional -- the alternative is a Z_MEM_ERROR for a copy the shim could
+  // not actually undo, which leaves dest live and leaking while the caller has
+  // been told it does not exist.
+  if (orig_deflateCopy == nullptr || orig_deflateEnd == nullptr) {
     return Z_VERSION_ERROR;
   }
 
@@ -839,9 +903,7 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
       // shim does not know about: an untracked copy degrades to orig_deflate on
       // a state the accelerator never fed, and a caller told the copy failed
       // will not call deflateEnd() to release it.
-      if (orig_deflateEnd != nullptr) {
-        orig_deflateEnd(dest);
-      }
+      orig_deflateEnd(dest);
       return Z_MEM_ERROR;
     }
   }
@@ -1184,12 +1246,7 @@ int ZEXPORT inflateEnd(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateEnd Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
   auto inflate_settings = inflate_stream_settings.Get(strm);
-  if (inflate_settings != nullptr && inflate_settings->isal_strm != nullptr) {
-#ifdef USE_IGZIP
-    EndUncompressIGZIP(inflate_settings->isal_strm);
-#endif
-    inflate_settings->isal_strm = nullptr;
-  }
+  ReleaseInflateIgzipState(inflate_settings);
   inflate_stream_settings.Unset(strm);
   return orig_inflateEnd != nullptr ? orig_inflateEnd(strm) : Z_VERSION_ERROR;
 }
@@ -1215,7 +1272,8 @@ int ZEXPORT inflateCopy(z_streamp dest, z_streamp source) {
   Log(LogLevel::LOG_INFO, "inflateCopy Line ", __LINE__, ", dest ",
       static_cast<void*>(dest), ", source ", static_cast<void*>(source), "\n");
 
-  if (orig_inflateCopy == nullptr) {
+  // Both symbols are required, for the reason given in deflateCopy().
+  if (orig_inflateCopy == nullptr || orig_inflateEnd == nullptr) {
     return Z_VERSION_ERROR;
   }
 
@@ -1245,9 +1303,7 @@ int ZEXPORT inflateCopy(z_streamp dest, z_streamp source) {
       // Undo zlib's half of the copy rather than register a stream with no
       // ISA-L state to continue from; otherwise dest leaks zlib's inflate
       // state, since a caller told the copy failed will not call inflateEnd.
-      if (orig_inflateEnd != nullptr) {
-        orig_inflateEnd(dest);
-      }
+      orig_inflateEnd(dest);
       return Z_MEM_ERROR;
     }
   }
@@ -1262,9 +1318,7 @@ int ZEXPORT inflateCopy(z_streamp dest, z_streamp source) {
       EndUncompressIGZIP(isal_clone);
     }
 #endif
-    if (orig_inflateEnd != nullptr) {
-      orig_inflateEnd(dest);
-    }
+    orig_inflateEnd(dest);
     return Z_MEM_ERROR;
   }
   return ret;
@@ -1520,6 +1574,16 @@ ExecutionPath GetInflateExecutionPath(z_streamp strm) {
     return ZLIB;
   }
   return inflate_settings->path;
+}
+
+bool DeflateOwnsIgzipState(z_streamp strm) {
+  auto deflate_settings = deflate_stream_settings.Get(strm);
+  return deflate_settings != nullptr && deflate_settings->isal_strm != nullptr;
+}
+
+bool InflateOwnsIgzipState(z_streamp strm) {
+  auto inflate_settings = inflate_stream_settings.Get(strm);
+  return inflate_settings != nullptr && inflate_settings->isal_strm != nullptr;
 }
 
 enum class FileMode { NONE, READ, WRITE, APPEND };
