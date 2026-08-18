@@ -4506,8 +4506,7 @@ class StreamCopyRegressionTest : public ::testing::Test {};
 // intercepted the copy had no entry at all.  Since the null guards landed, an
 // untracked z_streamp no longer crashes -- it silently runs on orig_deflate /
 // orig_inflate instead, which loses the offload outright and, with the source
-// midstream on IGZIP, produced output that does not inflate (measured
-// Z_DATA_ERROR with only the pre-copy bytes recoverable).
+// midstream on IGZIP, produces output that does not inflate.
 //
 // The simplest case: copy a stream that has not been used yet, then compress
 // independently on both.  Without registration the copy degrades to zlib.
@@ -4687,14 +4686,10 @@ TEST_F(StreamCopyRegressionTest, IAADeflateCopyInheritsZlibPin) {
 }
 #endif
 
-// The one case that cannot be copied at all.  ISA-L has emitted a header and
-// still holds unflushed state, and isal_zstream::level_buf is cast to a private
-// struct holding pointers into its own allocation, so a byte-for-byte copy
-// would leave both streams writing into one pending block.  Draining that block
-// first is no help either: those bytes belong to the prefix the two streams
-// share, and deflateCopy() has no way to hand bytes back to the caller.  So the
-// call is refused, and -- because it is refused before orig_deflateCopy runs --
-// dest is left exactly as the caller passed it and the source is untouched.
+// The one case that cannot be copied at all -- see deflateCopy() for why
+// ISA-L's state cannot be duplicated.  Because the call is refused before
+// orig_deflateCopy runs, dest is left exactly as the caller passed it and the
+// source is untouched.
 #ifdef USE_IGZIP
 TEST_F(StreamCopyRegressionTest, IGZIPRefusesMidstreamDeflateCopy) {
   SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
@@ -4977,16 +4972,13 @@ TEST_F(StreamCopyRegressionTest, IGZIPInflateCopySurvivesSourceEnd) {
 // Copying onto a destination that already owns ISA-L state.  Registering the
 // copy replaces the destination's entry, and isal_strm is a raw pointer that
 // destroying the old entry does not free, so the old ISA-L stream has to be
-// released explicitly or it leaks (measured under LSAN at 414,160 bytes per
-// deflateCopy and 87,368 -- sizeof(struct inflate_state) -- per inflateCopy,
-// over and above the state zlib itself leaks on a copy onto a live stream).
-// The leak itself is only visible to a memory checker -- the
-// replacement entry reads as owning nothing either way -- so what these two
-// cases pin is the other half: the copy owns no ISA-L state of its own, which
-// is what keeps the two streams from sharing one, and releasing the old state
-// does not disturb the zlib state the copy has to continue from.  Reaching the
-// state at all depends on deflateReset()/inflateReset() keeping the ISA-L
-// stream.
+// released explicitly or it leaks.  The leak is only visible to a memory
+// checker -- the replacement entry reads as owning nothing either way -- so
+// what these two cases pin is the other half: the copy owns no ISA-L state of
+// its own, which is what keeps the two streams from sharing one, and releasing
+// the old state does not disturb the zlib state the copy has to continue from.
+// Reaching the state at all depends on deflateReset()/inflateReset() keeping
+// the ISA-L stream.
 TEST_F(StreamCopyRegressionTest,
        IGZIPDeflateCopyReleasesDestinationIgzipState) {
   SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);

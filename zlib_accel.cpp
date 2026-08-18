@@ -311,12 +311,11 @@ class DeflateStreamSettings {
   //
   // Reports failure instead of throwing: the caller is an exported zlib symbol,
   // so an exception escaping here would cross into a C caller that cannot catch
-  // it, and would abandon the destination stream zlib has already copied. The
-  // catch is deliberately unqualified -- besides bad_alloc from the allocations
-  // here, ShardedMap::Set() locks a std::shared_mutex on the non-TBB build and
-  // so can throw std::system_error. Returning false lets the caller undo the
-  // copy and report Z_MEM_ERROR, which alongside Z_STREAM_ERROR is the only
-  // failure zlib documents for deflateCopy().
+  // it. The catch is deliberately unqualified -- besides bad_alloc from the
+  // allocations here, ShardedMap::Set() locks a std::shared_mutex on the
+  // non-TBB build and so can throw std::system_error. Returning false lets the
+  // caller undo the copy and report Z_MEM_ERROR, which alongside
+  // Z_STREAM_ERROR is the only failure zlib documents for deflateCopy().
   bool SetFromCopy(z_streamp dest, const DeflateSettings& source) {
     // dest may already be an initialized, used stream whose entry owns an ISA-L
     // stream. Read that entry before replacing it, and release it only after
@@ -849,28 +848,19 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
   // zlib deflate state, which on an offloaded stream has never been fed, and
   // ISA-L's state cannot be duplicated alongside it: isal_zstream::level_buf is
   // cast to a private struct holding pointers into its own allocation, so a
-  // byte-for-byte copy would leave both streams writing into one pending block.
-  // Flushing that block out of the way first is no help either -- those bytes
-  // belong to the prefix the two streams share, and deflateCopy() has no way to
-  // hand bytes back to the caller. Fail before orig_deflateCopy so dest is left
-  // exactly as the caller passed it, and a caller that ignores the return code
-  // gets Z_STREAM_ERROR from zlib on first use. Same shape as the mid-stream
-  // rejection in deflateSetDictionary().
+  // byte copy would leave both streams writing into one pending block. Draining
+  // that block first is no help -- those bytes belong to the prefix the two
+  // streams share, and deflateCopy() cannot hand bytes back to the caller.
+  // Failing before orig_deflateCopy leaves dest as the caller passed it, the
+  // same shape as deflateSetDictionary()'s mid-stream rejection.
   //
-  // Only IGZIP is checked because QAT and IAA compress all-or-nothing: they
-  // offload with Z_FINISH only, and every measured failure consumed and
-  // produced nothing rather than committing a partial result (81 QAT Gen4
-  // configurations, down to 300,000 bytes of output for a 300,031-byte
-  // requirement). That is a property of the libraries as they behave today, not
-  // of their contracts -- qatzip.h documents the opposite ("The calling API may
-  // have to process the destination buffer and call again"), and the IAA side
-  // is unmeasured, with CompressIAA assigning *input_length = job->total_in
-  // without comparing it to available_in. Were either to consume part of
-  // avail_in on a success, deflate() would advance the pointers and keep the
-  // accelerator path, leaving committed output over a zlib state that was never
-  // fed -- a state this guard would not catch. A plain follow-up deflate()
-  // mishandles it identically, so the gap is not specific to copying; the copy
-  // only makes it reachable in a second place.
+  // QAT and IAA need no equivalent check: they offload with Z_FINISH only and
+  // commit output only on full consumption, so they never leave a stream
+  // mid-stream. That is how the libraries behave rather than what they promise
+  // -- qatzip.h permits a partial result, and CompressIAA does not compare
+  // job->total_in to available_in -- so it is worth re-checking after a QATzip
+  // or QPL upgrade. A plain follow-up deflate() mishandles such a state
+  // identically, so the gap would not be specific to copying.
   if (IgzipOwnsDeflateStream(deflate_settings)) {
     Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__,
         " rejected, ISA-L holds live state for source stream\n");
@@ -879,11 +869,8 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
 
   // deflateEnd is required as well as deflateCopy: registering dest below can
   // fail, and undoing zlib's half of the copy is the only way to avoid handing
-  // back a destination the shim does not know about. Reporting the missing
-  // symbol here, before anything is allocated, keeps that rollback
-  // unconditional -- the alternative is a Z_MEM_ERROR for a copy the shim could
-  // not actually undo, which leaves dest live and leaking while the caller has
-  // been told it does not exist.
+  // back a destination the shim does not know about. Refusing here, before
+  // anything is allocated, keeps that rollback unconditional.
   if (orig_deflateCopy == nullptr || orig_deflateEnd == nullptr) {
     return Z_VERSION_ERROR;
   }
