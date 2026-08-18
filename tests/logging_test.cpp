@@ -324,6 +324,24 @@ TEST_F(LoggingTest, PrintDeflateBlockHeaderInsufficientData) {
 }
 
 /**
+ * @test Ensures PrintDeflateBlockHeader() produces no output and does not
+ *       dereference a null data pointer.
+ */
+TEST_F(LoggingTest, PrintDeflateBlockHeaderNullData) {
+  CreateLogFile(test_log_file.c_str());
+  config::SetConfig(config::LOG_LEVEL,
+                    static_cast<uint32_t>(LogLevel::LOG_INFO));
+
+  auto before = fs::exists(test_log_file) ? fs::file_size(test_log_file) : 0;
+
+  PrintDeflateBlockHeader(LogLevel::LOG_INFO, nullptr, 64, 15);
+  CloseLogFile();
+
+  auto after = fs::exists(test_log_file) ? fs::file_size(test_log_file) : 0;
+  EXPECT_EQ(before, after);
+}
+
+/**
  * @test Confirms that PrintDeflateBlockHeader() identifies the
  *       BFINAL bit when logging is enabled.
  */

@@ -22,6 +22,7 @@
 
 #include "../config/config.h"
 #include "../iaa.h"
+#include "../logging.h"
 #include "../qat.h"
 #include "../sharded_map.h"
 #include "../statistics.h"
@@ -5957,6 +5958,98 @@ TEST_F(TerminalStateRegressionTest, ZlibPathPostEndIsUnchanged) {
 
   DestroyBlock(input);
 }
+
+// The null next_in and null next_out rows above are answered by the terminal
+// state, so they say nothing about the same pointers on a stream that has not
+// ended. Those reach the shim's own reads -- the block-header diagnostic, the
+// zlib-header FDICT probe, the IAA decompressibility probe, and the offload
+// itself -- all of which run before zlib gets to reject the pointer. Every row
+// has to come back with zlib's Z_STREAM_ERROR and no bytes moved.
+static void CheckNullPointersRejected(z_streamp stream, bool is_deflate,
+                                      Bytef* buffer, size_t buffer_length,
+                                      int flush) {
+  const uLong total_in_before = stream->total_in;
+  const uLong total_out_before = stream->total_out;
+
+  for (int row = 0; row < 2; row++) {
+    const bool null_next_in = (row == 0);
+    stream->next_in = null_next_in ? nullptr : buffer;
+    stream->avail_in = null_next_in ? static_cast<uInt>(buffer_length) : 0;
+    stream->next_out = null_next_in ? buffer : nullptr;
+    stream->avail_out = null_next_in ? static_cast<uInt>(buffer_length) : 0;
+
+    const int ret =
+        is_deflate ? deflate(stream, flush) : inflate(stream, flush);
+    EXPECT_EQ(ret, Z_STREAM_ERROR) << (null_next_in ? "next_in" : "next_out");
+    EXPECT_EQ(stream->total_in, total_in_before);
+    EXPECT_EQ(stream->total_out, total_out_before);
+  }
+}
+
+// log_level is a runtime config, so raising it is what exercises the
+// block-header diagnostic on a library built with DEBUG_LOG.
+static void RunInflateRejectsNullPointers(ExecutionPath accel_path) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  const uint32_t saved_log_level = GetConfig(LOG_LEVEL);
+  SetConfig(LOG_LEVEL, static_cast<uint32_t>(LogLevel::LOG_INFO));
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> buffer(4096);
+  CheckNullPointersRejected(&stream, /*is_deflate=*/false, buffer.data(),
+                            buffer.size(), Z_NO_FLUSH);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  SetConfig(LOG_LEVEL, saved_log_level);
+}
+
+static void RunDeflateRejectsNullPointers(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  // Z_FINISH, so QAT and IAA consider the call offloadable and would hand the
+  // null pointer to the vendor library.
+  std::vector<Bytef> buffer(4096);
+  CheckNullPointersRejected(&stream, /*is_deflate=*/true, buffer.data(),
+                            buffer.size(), Z_FINISH);
+
+  ASSERT_EQ(deflateEnd(&stream), Z_OK);
+}
+
+TEST_F(TerminalStateRegressionTest, ZlibPathRejectsNullPointers) {
+  RunDeflateRejectsNullPointers(ZLIB);
+  RunInflateRejectsNullPointers(ZLIB);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPRejectsNullPointers) {
+  RunDeflateRejectsNullPointers(IGZIP);
+  RunInflateRejectsNullPointers(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATRejectsNullPointers) {
+  RunDeflateRejectsNullPointers(QAT);
+  RunInflateRejectsNullPointers(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAARejectsNullPointers) {
+  RunDeflateRejectsNullPointers(IAA);
+  RunInflateRejectsNullPointers(IAA);
+}
+#endif
 #endif  // USE_IGZIP || USE_QAT || USE_IAA
 
 void CreateAndWriteTempConfigFile(const char* file_path) {

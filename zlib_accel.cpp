@@ -631,6 +631,18 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     return ret;
   }
 
+  // Everything below reads next_in and next_out -- the offload hands both to a
+  // vendor library -- while zlib rejects a null pointer with data behind it
+  // before it looks at anything else. Delegate such a call so zlib produces
+  // that rejection instead of the shim dereferencing what zlib is about to
+  // refuse. zlib's parameter checks touch no stream state, so a delegated call
+  // is indistinguishable from an unshimmed one.
+  if (strm->next_out == nullptr ||
+      (strm->avail_in != 0 && strm->next_in == nullptr)) {
+    return orig_deflate != nullptr ? orig_deflate(strm, flush)
+                                   : Z_VERSION_ERROR;
+  }
+
   // The compression level is a property of the whole stream, not of one call,
   // so decide it here rather than discovering it when InitCompressIGZIP()
   // rejects the level. Pinning the path (rather than only clearing
@@ -1046,6 +1058,19 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         "\n");
     INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
     return ret;
+  }
+
+  // The zlib-header probe below, the IAA decompressibility probe and the
+  // offload itself all read next_in, and zlib rejects a null pointer with data
+  // behind it before it looks at anything else. Delegate such a call rather
+  // than dereferencing what zlib is about to refuse; its parameter checks touch
+  // no stream state, so a delegated call is indistinguishable from an unshimmed
+  // one. This also covers a null next_out, which the IGZIP drain below would
+  // otherwise hand to ISA-L.
+  if (strm->next_out == nullptr ||
+      (strm->next_in == nullptr && strm->avail_in != 0)) {
+    return orig_inflate != nullptr ? orig_inflate(strm, flush)
+                                   : Z_VERSION_ERROR;
   }
 
   int ret = 1;
