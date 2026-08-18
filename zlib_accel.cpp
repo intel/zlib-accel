@@ -52,6 +52,7 @@ static int (*orig_deflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_deflate)(z_streamp strm, int flush);
 static int (*orig_deflateEnd)(z_streamp strm);
 static int (*orig_deflateReset)(z_streamp strm);
+static int (*orig_deflateResetKeep)(z_streamp strm);
 static int (*orig_deflateParams)(z_streamp strm, int level, int strategy);
 static int (*orig_deflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_inflateInit_)(z_streamp strm, const char* version,
@@ -63,6 +64,7 @@ static int (*orig_inflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_inflate)(z_streamp strm, int flush);
 static int (*orig_inflateEnd)(z_streamp strm);
 static int (*orig_inflateReset)(z_streamp strm);
+static int (*orig_inflateResetKeep)(z_streamp strm);
 static int (*orig_inflateReset2)(z_streamp strm, int windowBits);
 static int (*orig_inflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_compress)(Bytef* dest, uLongf* destLen, const Bytef* source,
@@ -132,6 +134,8 @@ static int init_zlib_accel(void) {
 
   LOAD_SYMBOL(orig_deflateReset, int (*)(z_streamp), "deflateReset");
 
+  LOAD_SYMBOL(orig_deflateResetKeep, int (*)(z_streamp), "deflateResetKeep");
+
   LOAD_SYMBOL(orig_deflateParams, int (*)(z_streamp, int, int),
               "deflateParams");
 
@@ -152,6 +156,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_inflateEnd, int (*)(z_streamp), "inflateEnd");
 
   LOAD_SYMBOL(orig_inflateReset, int (*)(z_streamp), "inflateReset");
+
+  LOAD_SYMBOL(orig_inflateResetKeep, int (*)(z_streamp), "inflateResetKeep");
 
   LOAD_SYMBOL(orig_inflateReset2, int (*)(z_streamp, int), "inflateReset2");
 
@@ -424,6 +430,58 @@ static void SetInflatePath(const std::shared_ptr<InflateSettings>& settings,
     return;
   }
   settings->path = new_path;
+}
+
+// Shim-side state work every deflate reset entry point performs. Only the path
+// is cleared. zlib's deflateReset keeps the compression level and strategy,
+// including any set later by deflateParams(), so the recorded level must
+// survive a reset too or path selection would disagree with the level zlib is
+// actually using. The terminal-state flag has to go, though: a reset stream is
+// ready to compress again, and leaving it set would wedge every later deflate()
+// at Z_STREAM_END.
+static void ResetDeflateStreamState(
+    const std::shared_ptr<DeflateSettings>& settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  SetDeflatePath(settings, UNDEFINED);
+  settings->stream_end_reached = false;
+
+#ifdef USE_IGZIP
+  if (settings->isal_strm != nullptr) {
+    // Keeping the recorded level is not sufficient for the ISA-L stream:
+    // isal_deflate_reset() deliberately preserves level and level_buf, and
+    // deflate() only calls InitCompressIGZIP() when isal_strm is null, so a
+    // level that deflateParams() changed since this stream was built would
+    // leave the next stream running at the old ISA-L level. Discard the stream
+    // in that case and let deflate() rebuild it from the current setting; the
+    // common reset, where the level did not change, keeps the stream and its
+    // level_buf allocation. The reverse ordering -- reset first, then
+    // deflateParams() -- is handled in deflateParams().
+    if (CompressLevelChangedIGZIP(settings->isal_strm, settings->level)) {
+      EndCompressIGZIP(settings->isal_strm);
+      settings->isal_strm = nullptr;
+    } else {
+      ResetCompressIGZIP(settings->isal_strm);
+    }
+  }
+#endif
+}
+
+// Same for the inflate side. A reset stream is ready to decode again; leaving
+// the terminal state set would wedge every later inflate() at Z_STREAM_END.
+static void ResetInflateStreamState(
+    const std::shared_ptr<InflateSettings>& settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  SetInflatePath(settings, UNDEFINED);
+  settings->stream_end_reached = false;
+  if (settings->isal_strm != nullptr) {
+#ifdef USE_IGZIP
+    ResetUncompressIGZIP(settings->isal_strm);
+#endif
+  }
 }
 
 // zlib's Z_NO_COMPRESSION (0) asks for stored, uncompressed deflate blocks. No
@@ -864,44 +922,47 @@ int ZEXPORT deflateEnd(z_streamp strm) {
   return orig_deflateEnd != nullptr ? orig_deflateEnd(strm) : Z_VERSION_ERROR;
 }
 
+// zlib builds deflateReset() on top of deflateResetKeep(), so on a libz whose
+// internal calls are interposable this wrapper runs nested inside
+// orig_deflateReset(). Acting only after the original returns keeps the outer
+// wrapper's state work last, so the two orderings agree. Same shape as
+// deflateParams() and inflateReset2().
 int ZEXPORT deflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  auto deflate_settings = deflate_stream_settings.Get(strm);
-  if (deflate_settings != nullptr) {
-    // Only the path is cleared. zlib's deflateReset keeps the compression level
-    // and strategy, including any set later by deflateParams(), so the recorded
-    // level must survive a reset too or path selection would disagree with the
-    // level zlib is actually using. The terminal-state flag has to go, though:
-    // a reset stream is ready to compress again, and leaving it set would wedge
-    // every later deflate() at Z_STREAM_END.
-    SetDeflatePath(deflate_settings, UNDEFINED);
-    deflate_settings->stream_end_reached = false;
 
-#ifdef USE_IGZIP
-    if (deflate_settings->isal_strm != nullptr) {
-      // Keeping the recorded level is not sufficient for the ISA-L stream:
-      // isal_deflate_reset() deliberately preserves level and level_buf, and
-      // deflate() only calls InitCompressIGZIP() when isal_strm is null, so a
-      // level that deflateParams() changed since this stream was built would
-      // leave the next stream running at the old ISA-L level. Discard the
-      // stream in that case and let deflate() rebuild it from the current
-      // setting; the common reset, where the level did not change, keeps the
-      // stream and its level_buf allocation. The reverse ordering -- reset
-      // first, then deflateParams() -- is handled in deflateParams().
-      if (CompressLevelChangedIGZIP(deflate_settings->isal_strm,
-                                    deflate_settings->level)) {
-        EndCompressIGZIP(deflate_settings->isal_strm);
-        deflate_settings->isal_strm = nullptr;
-      } else {
-        ResetCompressIGZIP(deflate_settings->isal_strm);
-      }
-    }
-#endif
+  if (orig_deflateReset == nullptr) {
+    return Z_VERSION_ERROR;
   }
 
-  return orig_deflateReset != nullptr ? orig_deflateReset(strm)
-                                      : Z_VERSION_ERROR;
+  const int ret = orig_deflateReset(strm);
+  if (ret == Z_OK) {
+    ResetDeflateStreamState(deflate_stream_settings.Get(strm));
+  }
+  return ret;
+}
+
+// The other entry point that restarts a finished stream: deflateReset() is
+// deflateResetKeep() plus lm_init(), so an application can reach it directly
+// and a terminal state left set here would wedge the stream at Z_STREAM_END.
+// What it keeps -- the LZ77 window and hash -- only affects how zlib would
+// encode the next stream, not whether the shim may offload it: an offloaded
+// stream emits no back-references into the previous one, which is a
+// self-contained stream any decoder accepts. So no path pin here, unlike
+// inflateResetKeep().
+int ZEXPORT deflateResetKeep(z_streamp strm) {
+  Log(LogLevel::LOG_INFO, "deflateResetKeep Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), "\n");
+
+  if (orig_deflateResetKeep == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_deflateResetKeep(strm);
+  if (ret == Z_OK) {
+    ResetDeflateStreamState(deflate_stream_settings.Get(strm));
+  }
+  return ret;
 }
 
 int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
@@ -1354,24 +1415,51 @@ int ZEXPORT inflateEnd(z_streamp strm) {
   return orig_inflateEnd != nullptr ? orig_inflateEnd(strm) : Z_VERSION_ERROR;
 }
 
+// inflateReset() is inflateResetKeep() plus a discarded window, so this wrapper
+// may run nested inside orig_inflateReset() where libz's internal calls are
+// interposable. Acting after the original returns puts this wrapper's state
+// work last, which is what makes the path pin inflateResetKeep() applies
+// specific to a direct call. Same shape as inflateReset2().
 int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  auto inflate_settings = inflate_stream_settings.Get(strm);
-  if (inflate_settings != nullptr) {
-    SetInflatePath(inflate_settings, UNDEFINED);
-    // A reset stream is ready to decode again; leaving the terminal state set
-    // would wedge every later inflate() at Z_STREAM_END.
-    inflate_settings->stream_end_reached = false;
-    if (inflate_settings->isal_strm != nullptr) {
-#ifdef USE_IGZIP
-      ResetUncompressIGZIP(inflate_settings->isal_strm);
-#endif
-    }
+
+  if (orig_inflateReset == nullptr) {
+    return Z_VERSION_ERROR;
   }
 
-  return orig_inflateReset != nullptr ? orig_inflateReset(strm)
-                                      : Z_VERSION_ERROR;
+  const int ret = orig_inflateReset(strm);
+  if (ret == Z_OK) {
+    ResetInflateStreamState(inflate_stream_settings.Get(strm));
+  }
+  return ret;
+}
+
+// inflateResetKeep() restarts the stream but keeps the window zlib has built,
+// so like the other reset entry points it has to clear the terminal state, and
+// unlike them it also has to pin the stream to zlib. Retaining the window is
+// the only reason to call this rather than inflateReset() -- neither frees it
+// -- so a caller that does is saying the next stream may reference the previous
+// stream's bytes. That is a preset dictionary in all but name, and no backend
+// can see that history: an accelerator would decode the lookback from whatever
+// its own window happens to hold. The pin is what inflateSetDictionary() does
+// for the same reason, and inflateReset() lifts it, being the reset that
+// actually discards the history.
+int ZEXPORT inflateResetKeep(z_streamp strm) {
+  Log(LogLevel::LOG_INFO, "inflateResetKeep Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), "\n");
+
+  if (orig_inflateResetKeep == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_inflateResetKeep(strm);
+  if (ret == Z_OK) {
+    auto inflate_settings = inflate_stream_settings.Get(strm);
+    ResetInflateStreamState(inflate_settings);
+    SetInflatePath(inflate_settings, ZLIB);
+  }
+  return ret;
 }
 
 // inflateReset2() is the only zlib entry point that changes windowBits on a
@@ -1399,8 +1487,7 @@ int ZEXPORT inflateReset2(z_streamp strm, int windowBits) {
 
   auto inflate_settings = inflate_stream_settings.Get(strm);
   if (inflate_settings != nullptr) {
-    SetInflatePath(inflate_settings, UNDEFINED);
-    inflate_settings->stream_end_reached = false;
+    ResetInflateStreamState(inflate_settings);
     inflate_settings->window_bits = windowBits;
 
     if (inflate_settings->isal_strm != nullptr) {
