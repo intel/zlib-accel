@@ -4498,6 +4498,667 @@ TEST_F(DeflateParamsRegressionTest, ParamsAfterResetRebuildsIgzipStream) {
 #endif  // USE_IGZIP
 #endif  // USE_IGZIP || USE_QAT || USE_IAA
 
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+class StreamCopyRegressionTest : public ::testing::Test {};
+
+// deflateCopy()/inflateCopy() duplicate zlib's stream state, but the shim keeps
+// its own per-stream state in maps keyed by z_streamp, so before these were
+// intercepted the copy had no entry at all.  Since the null guards landed, an
+// untracked z_streamp no longer crashes -- it silently runs on orig_deflate /
+// orig_inflate instead, which loses the offload outright and, with the source
+// midstream on IGZIP, produces output that does not inflate.
+//
+// The simplest case: copy a stream that has not been used yet, then compress
+// independently on both.  Without registration the copy degrades to zlib.
+static void RunDeflateCopyPreservesOffload(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateCopy(&copy, &source), Z_OK);
+
+  // The copy is compressed first, so nothing it does can be explained by state
+  // the source built up afterwards.
+  const size_t bound = deflateBound(&source, input_length) + 4096;
+  std::vector<Bytef> copy_output(bound);
+  copy.next_in = reinterpret_cast<Bytef*>(input);
+  copy.avail_in = static_cast<uInt>(input_length);
+  copy.next_out = copy_output.data();
+  copy.avail_out = static_cast<uInt>(copy_output.size());
+  ASSERT_EQ(deflate(&copy, Z_FINISH), Z_STREAM_END);
+  const size_t copy_produced = copy_output.size() - copy.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&copy), accel_path);
+  ASSERT_EQ(deflateEnd(&copy), Z_OK);
+  copy_output.resize(copy_produced);
+
+  std::vector<Bytef> source_output(bound);
+  source.next_in = reinterpret_cast<Bytef*>(input);
+  source.avail_in = static_cast<uInt>(input_length);
+  source.next_out = source_output.data();
+  source.avail_out = static_cast<uInt>(source_output.size());
+  ASSERT_EQ(deflate(&source, Z_FINISH), Z_STREAM_END);
+  const size_t source_produced = source_output.size() - source.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&source), accel_path);
+  ASSERT_EQ(deflateEnd(&source), Z_OK);
+  source_output.resize(source_produced);
+
+  // Both streams started from the same point and were given the same input, so
+  // the copy has to be indistinguishable from the source it came from.
+  EXPECT_EQ(copy_output, source_output);
+
+  z_stream check;
+  memset(&check, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&check, 15), Z_OK);
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  check.next_in = copy_output.data();
+  check.avail_in = static_cast<uInt>(copy_output.size());
+  check.next_out = uncompressed.data();
+  check.avail_out = static_cast<uInt>(uncompressed.size());
+  ASSERT_EQ(inflate(&check, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(check.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+  ASSERT_EQ(inflateEnd(&check), Z_OK);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(StreamCopyRegressionTest, IGZIPDeflateCopyPreservesOffload) {
+  RunDeflateCopyPreservesOffload(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(StreamCopyRegressionTest, QATDeflateCopyPreservesOffload) {
+  RunDeflateCopyPreservesOffload(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(StreamCopyRegressionTest, IAADeflateCopyPreservesOffload) {
+  RunDeflateCopyPreservesOffload(IAA);
+}
+#endif
+
+// A stream pinned to ZLIB must hand that pin to its copy rather than let the
+// copy re-run path selection.  A preset dictionary is the case where it shows:
+// the dictionary lives in zlib's deflate state, which deflateCopy duplicates,
+// but no backend supports one, so a copy left UNDEFINED would offload the very
+// next call and compress without the dictionary at all.  The oracle is that the
+// copy's output cannot be inflated without the dictionary; an offloaded copy
+// produces a stream that needs none.
+//
+// (The level-0 pin cannot serve here: it is recomputed per call from the
+// recorded level, so it re-applies on the copy even when nothing is inherited.)
+static void RunDeflateCopyInheritsZlibPin(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+  const uint32_t saved_ignore_dictionary = GetConfig(IGNORE_ZLIB_DICTIONARY);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  const unsigned char dict[] = "stream-copy-preset-dictionary";
+  const uInt dict_length = static_cast<uInt>(sizeof(dict) - 1);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  ASSERT_EQ(deflateSetDictionary(&source, dict, dict_length), Z_OK);
+  ASSERT_EQ(GetDeflateExecutionPath(&source), ZLIB);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateCopy(&copy, &source), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&copy), ZLIB);
+
+  std::vector<Bytef> output(deflateBound(&source, input_length) + 4096);
+  copy.next_in = reinterpret_cast<Bytef*>(input);
+  copy.avail_in = static_cast<uInt>(input_length);
+  copy.next_out = output.data();
+  copy.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&copy, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - copy.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&copy), ZLIB);
+  ASSERT_EQ(deflateEnd(&copy), Z_OK);
+  ASSERT_EQ(deflateEnd(&source), Z_OK);
+
+  z_stream check;
+  memset(&check, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&check, 15), Z_OK);
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  check.next_in = output.data();
+  check.avail_in = static_cast<uInt>(produced);
+  check.next_out = uncompressed.data();
+  check.avail_out = static_cast<uInt>(uncompressed.size());
+
+  // FDICT in the zlib header is what proves the copy really used zlib's
+  // dictionary state instead of being handed to an accelerator.
+  ASSERT_EQ(inflate(&check, Z_NO_FLUSH), Z_NEED_DICT);
+  ASSERT_EQ(inflateSetDictionary(&check, dict, dict_length), Z_OK);
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&check, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(check.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+  ASSERT_EQ(inflateEnd(&check), Z_OK);
+
+  DestroyBlock(input);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, saved_ignore_dictionary);
+}
+
+#ifdef USE_IGZIP
+TEST_F(StreamCopyRegressionTest, IGZIPDeflateCopyInheritsZlibPin) {
+  RunDeflateCopyInheritsZlibPin(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(StreamCopyRegressionTest, QATDeflateCopyInheritsZlibPin) {
+  RunDeflateCopyInheritsZlibPin(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(StreamCopyRegressionTest, IAADeflateCopyInheritsZlibPin) {
+  RunDeflateCopyInheritsZlibPin(IAA);
+}
+#endif
+
+// The one case that cannot be copied at all -- see deflateCopy() for why
+// ISA-L's state cannot be duplicated.  Because the call is refused before
+// orig_deflateCopy runs, dest is left exactly as the caller passed it and the
+// source is untouched.
+#ifdef USE_IGZIP
+TEST_F(StreamCopyRegressionTest, IGZIPRefusesMidstreamDeflateCopy) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t half_length = 32 * 1024;
+  const size_t input_length = 2 * half_length;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&source, input_length) + 4096);
+  source.next_out = output.data();
+  source.avail_out = static_cast<uInt>(output.size());
+
+  // A real flush is what makes ISA-L take ownership of the stream.
+  source.next_in = reinterpret_cast<Bytef*>(input);
+  source.avail_in = static_cast<uInt>(half_length);
+  ASSERT_EQ(deflate(&source, Z_SYNC_FLUSH), Z_OK);
+  ASSERT_EQ(GetDeflateExecutionPath(&source), IGZIP);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  EXPECT_EQ(deflateCopy(&copy, &source), Z_STREAM_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&source), IGZIP);
+
+  // dest was never initialized, so a caller that ignores the return code gets
+  // zlib's error on first use rather than output from a half-built stream.
+  std::vector<Bytef> copy_output(4096);
+  copy.next_in = reinterpret_cast<Bytef*>(input);
+  copy.avail_in = static_cast<uInt>(half_length);
+  copy.next_out = copy_output.data();
+  copy.avail_out = static_cast<uInt>(copy_output.size());
+  EXPECT_EQ(deflate(&copy, Z_FINISH), Z_STREAM_ERROR);
+
+  // The refused copy must not have disturbed the source: it finishes normally
+  // and its output is one valid deflate stream.
+  source.next_in = reinterpret_cast<Bytef*>(input) + half_length;
+  source.avail_in = static_cast<uInt>(half_length);
+  ASSERT_EQ(deflate(&source, Z_FINISH), Z_STREAM_END);
+  const size_t produced = output.size() - source.avail_out;
+  EXPECT_EQ(GetDeflateExecutionPath(&source), IGZIP);
+  ASSERT_EQ(deflateEnd(&source), Z_OK);
+
+  z_stream check;
+  memset(&check, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&check, 15), Z_OK);
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  check.next_in = output.data();
+  check.avail_in = static_cast<uInt>(produced);
+  check.next_out = uncompressed.data();
+  check.avail_out = static_cast<uInt>(uncompressed.size());
+  ASSERT_EQ(inflate(&check, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(check.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+  ASSERT_EQ(inflateEnd(&check), Z_OK);
+
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+
+// The inflate side of the registration gap: a copy taken before the first
+// inflate() call has to keep decompressing on the accelerator, not silently
+// drop to zlib.
+static void RunInflateCopyPreservesOffload(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  // Compressed by the same backend, so the stream is one it can decompress
+  // (IAA in particular only takes streams within its own window size).
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, 15), Z_OK);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateCopy(&copy, &source), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  copy.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  copy.avail_in = static_cast<uInt>(compressed.size());
+  copy.next_out = uncompressed.data();
+  copy.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&copy, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&copy), accel_path);
+  EXPECT_EQ(copy.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+
+  ASSERT_EQ(inflateEnd(&copy), Z_OK);
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(StreamCopyRegressionTest, IGZIPInflateCopyPreservesOffload) {
+  RunInflateCopyPreservesOffload(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(StreamCopyRegressionTest, QATInflateCopyPreservesOffload) {
+  RunInflateCopyPreservesOffload(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(StreamCopyRegressionTest, IAAInflateCopyPreservesOffload) {
+  RunInflateCopyPreservesOffload(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// Unlike the deflate side, a midstream inflateCopy() is exact: every member of
+// ISA-L's inflate_state is a scalar or an inline array, and next_in/next_out
+// are re-pointed on every call, so the clone owns no memory the source also
+// owns. Both streams must therefore be able to finish the same stream
+// independently. Before inflateCopy was intercepted the copy held no ISA-L
+// state at all and could not continue: ISA-L had consumed the input into its
+// own buffers, so the bytes the copy needed were no longer in avail_in and it
+// returned Z_BUF_ERROR for as long as it was called.
+TEST_F(StreamCopyRegressionTest, IGZIPMidstreamInflateCopyIsIndependent) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  const size_t prefix_length = 20000;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, 15), Z_OK);
+
+  // Capping avail_out short of the full output is what leaves ISA-L midstream,
+  // holding both a partly consumed input and undelivered output.
+  std::vector<Bytef> source_output(input_length + 1024);
+  source.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  source.avail_in = static_cast<uInt>(compressed.size());
+  source.next_out = source_output.data();
+  source.avail_out = static_cast<uInt>(prefix_length);
+  ASSERT_EQ(inflate(&source, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&source), IGZIP);
+  ASSERT_EQ(source.total_out, prefix_length);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateCopy(&copy, &source), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&copy), IGZIP);
+
+  // inflateCopy duplicates next_out along with everything else, so the copy has
+  // to be pointed at its own buffer before it writes anything.
+  std::vector<Bytef> copy_output(input_length + 1024);
+  copy.next_out = copy_output.data();
+  copy.avail_out = static_cast<uInt>(copy_output.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&copy, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  const size_t copy_produced = copy_output.size() - copy.avail_out;
+  ASSERT_EQ(copy_produced, input_length - prefix_length);
+  EXPECT_EQ(memcmp(copy_output.data(), input + prefix_length, copy_produced),
+            0);
+  ASSERT_EQ(inflateEnd(&copy), Z_OK);
+
+  // The source has to be just as usable afterwards, which is what rules out the
+  // two streams sharing one ISA-L state.
+  source.next_out = source_output.data() + prefix_length;
+  source.avail_out = static_cast<uInt>(source_output.size() - prefix_length);
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&source, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(source.total_out, input_length);
+  EXPECT_EQ(memcmp(source_output.data(), input, input_length), 0);
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+
+  DestroyBlock(input);
+}
+
+// The lifetimes have to be independent in the other direction too: ending the
+// source frees its ISA-L state, so a copy that had merely borrowed the pointer
+// would be reading freed memory here.
+TEST_F(StreamCopyRegressionTest, IGZIPInflateCopySurvivesSourceEnd) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  const size_t prefix_length = 20000;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, 15), Z_OK);
+
+  std::vector<Bytef> source_output(input_length + 1024);
+  source.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  source.avail_in = static_cast<uInt>(compressed.size());
+  source.next_out = source_output.data();
+  source.avail_out = static_cast<uInt>(prefix_length);
+  ASSERT_EQ(inflate(&source, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&source), IGZIP);
+
+  z_stream copy;
+  memset(&copy, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateCopy(&copy, &source), Z_OK);
+
+  std::vector<Bytef> copy_output(input_length + 1024);
+  copy.next_out = copy_output.data();
+  copy.avail_out = static_cast<uInt>(copy_output.size());
+
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&copy, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  const size_t copy_produced = copy_output.size() - copy.avail_out;
+  ASSERT_EQ(copy_produced, input_length - prefix_length);
+  EXPECT_EQ(memcmp(copy_output.data(), input + prefix_length, copy_produced),
+            0);
+  ASSERT_EQ(inflateEnd(&copy), Z_OK);
+
+  DestroyBlock(input);
+}
+
+// Copying onto a destination that already owns ISA-L state.  Registering the
+// copy replaces the destination's entry, and isal_strm is a raw pointer that
+// destroying the old entry does not free, so the old ISA-L stream has to be
+// released explicitly or it leaks.  The leak is only visible to a memory
+// checker -- the replacement entry reads as owning nothing either way -- so
+// what these two cases pin is the other half: the copy owns no ISA-L state of
+// its own, which is what keeps the two streams from sharing one, and releasing
+// the old state does not disturb the zlib state the copy has to continue from.
+// Reaching the state at all depends on deflateReset()/inflateReset() keeping
+// the ISA-L stream.
+TEST_F(StreamCopyRegressionTest,
+       IGZIPDeflateCopyReleasesDestinationIgzipState) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 * 1024;
+  const size_t prefix_length = 20000;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  z_stream dest;
+  memset(&dest, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&dest, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  const size_t bound = deflateBound(&dest, input_length) + 4096;
+  std::vector<Bytef> scratch(bound);
+  dest.next_in = reinterpret_cast<Bytef*>(input);
+  dest.avail_in = static_cast<uInt>(input_length);
+  dest.next_out = scratch.data();
+  dest.avail_out = static_cast<uInt>(scratch.size());
+  ASSERT_EQ(deflate(&dest, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&dest), IGZIP);
+  ASSERT_TRUE(DeflateOwnsIgzipState(&dest));
+
+  // The reset keeps the ISA-L stream -- the recorded level has not changed, so
+  // there is nothing to rebuild -- which is what makes the leak reachable.
+  ASSERT_EQ(deflateReset(&dest), Z_OK);
+  ASSERT_TRUE(DeflateOwnsIgzipState(&dest));
+
+  // A source pinned to ZLIB, which is the one kind deflateCopy accepts from a
+  // stream that has already been used.
+  SetCompressPath(ZLIB, false, false, false);
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> source_output(bound);
+  source.next_in = reinterpret_cast<Bytef*>(input);
+  source.avail_in = static_cast<uInt>(prefix_length);
+  source.next_out = source_output.data();
+  source.avail_out = static_cast<uInt>(source_output.size());
+  ASSERT_EQ(deflate(&source, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(source.avail_in, 0u);
+  ASSERT_EQ(GetDeflateExecutionPath(&source), ZLIB);
+  const size_t source_produced = source_output.size() - source.avail_out;
+
+  ASSERT_EQ(deflateCopy(&dest, &source), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&dest), ZLIB);
+  EXPECT_FALSE(DeflateOwnsIgzipState(&dest));
+
+  // Finishing on the copy proves the release did not disturb the state the copy
+  // is meant to continue from: the prefix the source emitted plus the tail the
+  // copy emits has to be the whole input.
+  std::vector<Bytef> dest_output(bound);
+  dest.next_in = reinterpret_cast<Bytef*>(input) + prefix_length;
+  dest.avail_in = static_cast<uInt>(input_length - prefix_length);
+  dest.next_out = dest_output.data();
+  dest.avail_out = static_cast<uInt>(dest_output.size());
+  ASSERT_EQ(deflate(&dest, Z_FINISH), Z_STREAM_END);
+  const size_t dest_produced = dest_output.size() - dest.avail_out;
+  ASSERT_EQ(deflateEnd(&dest), Z_OK);
+  // The source is abandoned with its stream unfinished, which is exactly the
+  // case zlib reports Z_DATA_ERROR for; the copy carried the tail.
+  ASSERT_EQ(deflateEnd(&source), Z_DATA_ERROR);
+
+  std::vector<Bytef> compressed(source_output.begin(),
+                                source_output.begin() + source_produced);
+  compressed.insert(compressed.end(), dest_output.begin(),
+                    dest_output.begin() + dest_produced);
+
+  z_stream check;
+  memset(&check, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&check, 15), Z_OK);
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  check.next_in = compressed.data();
+  check.avail_in = static_cast<uInt>(compressed.size());
+  check.next_out = uncompressed.data();
+  check.avail_out = static_cast<uInt>(uncompressed.size());
+  ASSERT_EQ(inflate(&check, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(check.total_out, input_length);
+  EXPECT_EQ(memcmp(uncompressed.data(), input, input_length), 0);
+  ASSERT_EQ(inflateEnd(&check), Z_OK);
+
+  DestroyBlock(input);
+}
+
+// The inflate half.  The source has to be off IGZIP here: an IGZIP source hands
+// the copy a freshly cloned inflate_state, so the destination would own ISA-L
+// state either way.  That direction is covered by
+// IGZIPMidstreamInflateCopyIsIndependent, which fails if the release ever
+// reaches the clone instead of the entry it replaced.
+TEST_F(StreamCopyRegressionTest,
+       IGZIPInflateCopyReleasesDestinationIgzipState) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  const size_t prefix_length = 20000;
+  char* input = GenerateBlock(input_length, compressible_block);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream dest;
+  memset(&dest, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&dest, 15), Z_OK);
+
+  std::vector<Bytef> scratch(input_length + 1024);
+  dest.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  dest.avail_in = static_cast<uInt>(compressed.size());
+  dest.next_out = scratch.data();
+  dest.avail_out = static_cast<uInt>(scratch.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&dest, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&dest), IGZIP);
+  ASSERT_TRUE(InflateOwnsIgzipState(&dest));
+
+  ASSERT_EQ(inflateReset(&dest), Z_OK);
+  ASSERT_TRUE(InflateOwnsIgzipState(&dest));
+
+  SetUncompressPath(ZLIB, false, false);
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, 15), Z_OK);
+
+  std::vector<Bytef> source_output(input_length + 1024);
+  source.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  source.avail_in = static_cast<uInt>(compressed.size());
+  source.next_out = source_output.data();
+  source.avail_out = static_cast<uInt>(prefix_length);
+  ASSERT_EQ(inflate(&source, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&source), ZLIB);
+  const size_t source_produced = source.total_out;
+
+  ASSERT_EQ(inflateCopy(&dest, &source), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&dest), ZLIB);
+  EXPECT_FALSE(InflateOwnsIgzipState(&dest));
+
+  // As on the deflate side, the copy has to be able to finish the stream the
+  // source was partway through.
+  std::vector<Bytef> dest_output(input_length + 1024);
+  dest.next_out = dest_output.data();
+  dest.avail_out = static_cast<uInt>(dest_output.size());
+  ret = Z_OK;
+  for (int guard = 0; guard < 128; ++guard) {
+    ret = inflate(&dest, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  const size_t dest_produced = dest_output.size() - dest.avail_out;
+  ASSERT_EQ(dest_produced, input_length - source_produced);
+  EXPECT_EQ(memcmp(dest_output.data(), input + source_produced, dest_produced),
+            0);
+  ASSERT_EQ(inflateEnd(&dest), Z_OK);
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+#endif  // USE_IGZIP || USE_QAT || USE_IAA
+
 void CreateAndWriteTempConfigFile(const char* file_path) {
   std::ofstream temp_file(file_path);
   temp_file << "use_qat_compress=5000\n";

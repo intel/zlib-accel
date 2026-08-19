@@ -347,6 +347,40 @@ struct inflate_state *InitUncompressIGZIP(int windowBits) {
   return isal_strm_inflate;
 }
 
+struct inflate_state *CopyUncompressIGZIP(
+    const struct inflate_state *isal_strm_inflate) {
+  if (!isal_strm_inflate) {
+    Log(LogLevel::LOG_ERROR,
+        "CopyUncompressIGZIP() source isal_strm_inflate is NULL\n");
+    return nullptr;
+  }
+
+  struct inflate_state *clone =
+      (struct inflate_state *)malloc(sizeof(struct inflate_state));
+  if (!clone) {
+    Log(LogLevel::LOG_ERROR,
+        "CopyUncompressIGZIP() memory allocation for inflate_state failed\n");
+    return nullptr;
+  }
+
+  // A plain struct copy is a complete clone: every field of inflate_state is a
+  // scalar or an inline array (tmp_in_buffer, tmp_out_buffer, and the
+  // lit_huff_code/dist_huff_code lookup tables), so it owns no heap memory and
+  // holds no pointer into itself.  The only pointers it does hold, next_in and
+  // next_out, address the caller's buffers and are re-pointed on every
+  // UncompressIGZIP() call, so they need no fixing up here.
+  //
+  // There is deliberately no CompressCopyIGZIP() counterpart: isal_zstream's
+  // level_buf is cast to ISA-L's private struct level_buf, which stores
+  // pointers into its own allocation (the pending ICF block, and the level 3
+  // match buffer), so copying it byte for byte would leave the clone writing
+  // into the source's buffer.  deflateCopy() refuses instead.
+  *clone = *isal_strm_inflate;
+
+  Log(LogLevel::LOG_INFO, "CopyUncompressIGZIP() cloned inflate state\n");
+  return clone;
+}
+
 void IGZIPHandleActiveStreamNoInput(z_streamp strm,
                                     struct inflate_state *isal_strm_inflate,
                                     int *ret) {

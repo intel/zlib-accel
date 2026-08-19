@@ -42,6 +42,7 @@ IGZIP
 - Compression:
   - `Z_BLOCK` is not offloadable. It ends a deflate block without byte-aligning the output and without emitting the `00 00 FF FF` sync marker, which ISA-L cannot express — its only two flushing modes, `SYNC_FLUSH` and `FULL_FLUSH`, both always byte-align and always emit the marker. A stream that uses `Z_BLOCK` is therefore handled by zlib. The one exception is a stream that has already started on IGZIP under a different flush value and then switches to `Z_BLOCK` mid-stream: ISA-L holds unflushed stream state at that point and the stream cannot be moved to zlib without corrupting the output, so `Z_BLOCK` is treated as `Z_SYNC_FLUSH` (byte-aligned, with the extra sync marker). The result is still valid deflate that any decompressor accepts; only an application parsing block boundaries itself can observe the difference.
   - `Z_PARTIAL_FLUSH` is treated as `Z_SYNC_FLUSH`, which zlib permits.
+  - `deflateCopy` returns `Z_STREAM_ERROR` for a stream that has already started on IGZIP, leaving both streams untouched. ISA-L has emitted a header and still holds unflushed stream state, and that state cannot be duplicated: its level buffer holds pointers into its own allocation, so a copy of it would share the source's pending output. Flushing that pending output first is not an alternative either, since those bytes belong to the prefix the two streams share and `deflateCopy` has no way to return bytes to the caller. On IGZIP, therefore, only a stream that has not yet called `deflate` can be copied — copying to size the output, or to compress the same input under different settings, still works. Branching a common prefix into several alternative tails requires copying after the prefix has been fed, so it needs a source that is not on IGZIP: such a stream is handled by zlib or by QAT/IAA (which offload `Z_FINISH` only, so a mid-stream call has already pinned it to zlib) and copies without restriction. `inflateCopy` is unrestricted on every path, at any point in a stream.
 
 All backends
 - The `strategy` argument of `deflateInit2`/`deflateParams` is not honored by any backend (QAT, IAA, or IGZIP). Compressed output remains valid and round-trips correctly — zlib defines strategy as affecting "the compression ratio but not the correctness of the compressed output" — but the ratio tuning requested by `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`, or `Z_FILTERED` is silently ignored. Applications that depend on a specific strategy for output size or entropy characteristics should disable offload for those streams.
@@ -278,12 +279,13 @@ unset LD_PRELOAD
 ## Intercepted Zlib Functions
 
 deflate/inflate and related functions
-- deflateInit, deflateInit2, deflateSetDictionary, deflateParams, deflate, deflateEnd, deflateReset
-- inflateInit, inflateInit2, inflateSetDictionary, inflate, inflateEnd, inflateReset
+- deflateInit, deflateInit2, deflateSetDictionary, deflateParams, deflateCopy, deflate, deflateEnd, deflateReset
+- inflateInit, inflateInit2, inflateSetDictionary, inflateCopy, inflate, inflateEnd, inflateReset
 
 For deflate, offload is supported for Z_FINISH flush option. Support for additional options will be added in later releases.   
 For deflateSetDictionary/inflateSetDictionary, zlib-accel simply sets the execution path to zlib, as dictionary compression is currently not supported for accelerators.   
-deflateParams is intercepted only to keep the recorded compression level current, so that a level set after initialization is still seen by path selection, and to give up an IGZIP stream that was built for a level the call supersedes; the call itself is always forwarded to zlib.
+deflateParams is intercepted only to keep the recorded compression level current, so that a level set after initialization is still seen by path selection, and to give up an IGZIP stream that was built for a level the call supersedes; the call itself is always forwarded to zlib.   
+deflateCopy/inflateCopy are intercepted so that the copy gets its own per-stream state: zlib duplicates the stream it owns, but zlib-accel keys its own state on the `z_stream` pointer, so without this the copy would be unknown to the shim and silently run on zlib. The copy inherits the settings and execution path of the source, and for inflate it also gets an independent copy of the IGZIP decompression state, so either stream can be used, reset, or ended without affecting the other. `inflateCopy` is supported on every path; `deflateCopy` has one restriction, described under IGZIP above.
 
 utility functions
 - compress, uncompress
