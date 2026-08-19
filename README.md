@@ -297,7 +297,27 @@ utility functions
 - compress, uncompress2
 
 gzip file functions
-- gzopen, gzdopen, gzwrite, gzread, gzclose, gzeof
+- gzopen, gzdopen, gzclose, gzclose_r, gzclose_w, gzeof
+- gzwrite, gzputc, gzputs, gzfwrite, gzprintf, gzvprintf, gzflush, gzsetparams
+- gzread, gzgetc, gzgetc_, gzgets, gzfread, gzungetc
+
+zlib's `gz*` API is a streaming one: zlib keeps a single deflate or inflate stream per file, plus its own buffer, across every call the application makes. zlib-accel does not stream it. On the write side it buffers what the application writes and compresses each buffer into a *complete gzip member*, so a large file becomes a sequence of members where zlib produces one. That is valid gzip and decompresses normally with any tool; what it costs is compression ratio, since no match reaches across a member boundary. On the read side a member has to decompress within one internal buffer, or the rest of the file is decompressed by zlib.
+
+Every function that moves bytes is therefore intercepted and served from zlib-accel's own buffer. A call that reached zlib instead would act on zlib's stream for that file, which has never seen any of the file's data and whose position bears no relation to the file offset zlib-accel has reached — on the write side it would interleave a second member with the ones zlib-accel wrote, and on the read side it would return bytes decoded from the middle of a compressed member. `gzputc`, `gzputs`, `gzfwrite` and `gzprintf`/`gzvprintf` therefore write through the same path as `gzwrite`, and `gzgetc`, `gzgetc_`, `gzgets` and `gzfread` read through the same path as `gzread`. `gzprintf`/`gzvprintf` format the string themselves rather than handing the file to zlib to format it, which would leave the rest of the file unaccelerated.
+
+`gzflush` writes the buffered data out as a complete member, which is what makes it visible to a reader, and satisfies every flush value zlib accepts; it is deliberately not forwarded to zlib, whose own flush would write a gzip header for a stream holding none of this file's data. `gzungetc` stores one byte of push-back — what zlib guarantees — which `gzread` returns ahead of anything else and `gzeof` counts as data; a second push before that byte is read is refused, as zlib permits. `gzclose_r` and `gzclose_w` reach the same close path as `gzclose`, which writes out whatever is still buffered, and reject a file opened for the other direction exactly as zlib does; a close that reached zlib instead would report success while discarding the buffered tail of the file. The compression level in the `gzopen`/`gzdopen` mode string and in `gzsetparams` is recorded and used, including level 0, which routes the file to zlib (see the level note under All backends above).
+
+A `gzFile` zlib-accel has no entry for — one the application did not open through `gzopen`/`gzdopen`, including the `NULL` a failed open returns — is forwarded to zlib unchanged, as is a file already on the zlib path.
+
+The rest of zlib's `gz*` API is **not** intercepted. Those functions act on zlib's own state for the file, which does not reflect what zlib-accel has read or written:
+
+| Not intercepted | Consequence on a file zlib-accel owns |
+|---|---|
+| `gztell`, `gzoffset`, `gzseek`, `gzrewind` | The offsets reported come from zlib's own accounting, which has tracked none of the file's data, so they are wrong. `gzseek` and `gzrewind` additionally move the file descriptor zlib-accel is reading from or writing to, so the calls that follow act at the wrong offset. Reading or writing a file from start to finish is unaffected; an application that seeks within a `gzFile` should disable gz offload. |
+| `gzbuffer` | Sets the size of zlib's own buffers. zlib-accel uses its own, so the request has no effect while the file is accelerated. |
+| `gzerror`, `gzclearerr` | Report zlib's error state for the file, which stays clear even when an accelerated call has failed. The return values of the intercepted calls are the reliable signal. |
+| `gzdirect` | Answers from zlib's view of the file. On a read-mode file zlib inspects the header by reading the descriptor itself, and those bytes are then missing from what zlib-accel reads. |
+| `gzopen64`, `gzseek64`, `gztell64`, `gzoffset64` | Not exported, so they are handled by zlib alone. Note that zlib.h redirects `gzopen` to `gzopen64` for an application built with `-D_FILE_OFFSET_BITS=64`: such a file is handled by zlib end to end — correct, but not accelerated. |
 
 
 ## Other Notes
