@@ -83,6 +83,7 @@ static int (*orig_gzclose)(gzFile file);
 static int (*orig_gzclose_r)(gzFile file);
 static int (*orig_gzclose_w)(gzFile file);
 static int (*orig_gzeof)(gzFile file);
+static int (*orig_gzsetparams)(gzFile file, int level, int strategy);
 
 // Forward declaration — defined after DeflateStreamSettings,
 // InflateStreamSettings, and GzipFiles class definitions below
@@ -194,6 +195,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_gzclose_w, int (*)(gzFile), "gzclose_w");
 
   LOAD_SYMBOL(orig_gzeof, int (*)(gzFile), "gzeof");
+
+  LOAD_SYMBOL(orig_gzsetparams, int (*)(gzFile, int, int), "gzsetparams");
 
   if (missing_symbol_count > 0) {
     Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " ",
@@ -1901,10 +1904,37 @@ bool InflateOwnsIgzipState(z_streamp strm) {
 
 enum class FileMode { NONE, READ, WRITE, APPEND };
 
+// What a gzopen/gzdopen mode string asks for beyond the open(2) flags. zlib
+// parses all of this out of the same string in gz_open(), so the shim has to as
+// well or it acts on settings the application asked for and zlib recorded.
+struct GzOpenParams {
+  FileMode mode = FileMode::NONE;
+  int level = Z_DEFAULT_COMPRESSION;
+  // 'T' asks zlib to write the data straight through with no deflate wrapper at
+  // all. No backend can do that, and compressing it anyway leaves a gzip file
+  // where the caller asked for a copy.
+  bool transparent = false;
+  // '+' is an error to zlib: it cannot read and write one file at once. It
+  // matters here because the shim opens the file itself, before zlib ever sees
+  // the mode string, so a mode zlib refuses must not reach open(2) -- O_TRUNC
+  // would already have emptied a file that plain zlib leaves untouched.
+  bool rejected = false;
+};
+
 struct GzipFile {
   GzipFile() { Reset(); }
 
-  GzipFile(int _fd, FileMode file_mode) : fd(_fd), mode(file_mode) { Reset(); }
+  GzipFile(int _fd, const GzOpenParams& params)
+      : fd(_fd), mode(params.mode), level(params.level) {
+    Reset();
+    // Two requests no backend can serve, both known at open time. Pin the file
+    // to zlib rather than leaving the decision to each write: gzwrite only
+    // reaches its zlib branch through path == ZLIB, so anything else would
+    // depend on use_zlib_compress being set.
+    if (params.transparent || !IsOffloadableCompressionLevel(params.level)) {
+      path = ZLIB;
+    }
+  }
 
   ~GzipFile() {
     if (data_buf != nullptr) {
@@ -1933,7 +1963,7 @@ struct GzipFile {
 
     memset(&deflate_stream, 0, sizeof(z_stream));
     if (orig_deflateInit2_ != nullptr) {
-      orig_deflateInit2_(&deflate_stream, -1, Z_DEFLATED, kWindowBitsGzip, 8,
+      orig_deflateInit2_(&deflate_stream, level, Z_DEFLATED, kWindowBitsGzip, 8,
                          Z_DEFAULT_STRATEGY, ZLIB_VERSION,
                          (int)sizeof(z_stream));
     }
@@ -1964,6 +1994,10 @@ struct GzipFile {
   bool use_zlib_for_decompression = false;
   bool reached_eof = false;
   FileMode mode = FileMode::NONE;
+  // The level the application asked for, through the gzopen mode string or a
+  // later gzsetparams. Reset() keeps it, matching zlib, whose reset paths
+  // preserve the level too.
+  int level = Z_DEFAULT_COMPRESSION;
 
   // For gzwrite
   // data_buf --(compress)--> io_buf --(write)--> file
@@ -1996,8 +2030,8 @@ struct GzipFile {
 
 class GzipFiles {
  public:
-  void Set(gzFile file, int fd, FileMode file_mode) {
-    auto f = std::make_shared<GzipFile>(fd, file_mode);
+  void Set(gzFile file, int fd, const GzOpenParams& params) {
+    auto f = std::make_shared<GzipFile>(fd, params);
     map.Set(file, std::move(f));
   }
 
@@ -2019,23 +2053,35 @@ static void InitStreamRegistries() {
 }
 
 // Inspired by gz_open in gzlib.c
-int GetOpenFlags(const char* mode, FileMode* file_mode) {
+int GetOpenFlags(const char* mode, GzOpenParams* params) {
   bool cloexec = false;
   bool exclusive = false;
 
   while (*mode) {
-    // TODO not all modes covered. Verify if any more to add.
+    // The strategy characters ('f', 'h', 'R', 'F') are read and discarded the
+    // same way the rest of the shim discards deflateParams' strategy argument.
+    if (*mode >= '0' && *mode <= '9') {
+      params->level = *mode - '0';
+      mode++;
+      continue;
+    }
     switch (*mode) {
       case 'r':
-        *file_mode = FileMode::READ;
+        params->mode = FileMode::READ;
         break;
       case 'w':
-        *file_mode = FileMode::WRITE;
+        params->mode = FileMode::WRITE;
         break;
       case 'a':
-        *file_mode = FileMode::APPEND;
+        params->mode = FileMode::APPEND;
         break;
       case 'b':
+        break;
+      case 'T':
+        params->transparent = true;
+        break;
+      case '+':
+        params->rejected = true;
         break;
 #ifdef O_CLOEXEC
       case 'e':
@@ -2064,13 +2110,13 @@ int GetOpenFlags(const char* mode, FileMode* file_mode) {
 #ifdef O_CLOEXEC
       (cloexec ? O_CLOEXEC : 0) |
 #endif
-      (*file_mode == FileMode::READ
+      (params->mode == FileMode::READ
            ? O_RDONLY
            : (O_WRONLY | O_CREAT |
 #ifdef O_EXCL
               (exclusive ? O_EXCL : 0) |
 #endif
-              (*file_mode == FileMode::WRITE ? O_TRUNC : O_APPEND)));
+              (params->mode == FileMode::WRITE ? O_TRUNC : O_APPEND)));
 
   return oflag;
 }
@@ -2081,8 +2127,17 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   if (orig_gzdopen == nullptr) {
     return nullptr;
   }
-  FileMode file_mode = FileMode::NONE;
-  int oflag = GetOpenFlags(mode, &file_mode);
+  GzOpenParams params;
+  int oflag = GetOpenFlags(mode, &params);
+  // A mode string zlib rejects has to be rejected before open(2), not after:
+  // zlib returns NULL without creating or truncating anything, and so must
+  // this. FileMode::NONE means the string named no direction, which zlib also
+  // refuses.
+  if (params.rejected || params.mode == FileMode::NONE) {
+    Log(LogLevel::LOG_INFO, "gzopen Line ", __LINE__, ", path ", path,
+        ", mode ", mode, " rejected without opening the file\n");
+    return nullptr;
+  }
   int fd = open((const char*)path, oflag, 0666);
   if (fd < 0) {
     return nullptr;
@@ -2096,7 +2151,7 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   Log(LogLevel::LOG_INFO, "gzopen Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", path ", path, ", mode ", mode, "\n");
 
-  gzip_files.Set(file, fd, file_mode);
+  gzip_files.Set(file, fd, params);
   return file;
 }
 
@@ -2109,10 +2164,17 @@ gzFile ZEXPORT gzdopen(int fd, const char* mode) {
   Log(LogLevel::LOG_INFO, "gzdopen Line ", __LINE__, ", file ", fd, ", fd ",
       static_cast<void*>(file), ", mode ", mode, "\n");
 
-  FileMode file_mode = FileMode::NONE;
-  GetOpenFlags(mode, &file_mode);
+  // zlib returns NULL for a mode string it refuses. Registering that would key
+  // an entry by NULL, which every gz* entry point then finds when the
+  // application passes NULL, in place of the unregistered-file handling.
+  if (file == nullptr) {
+    return nullptr;
+  }
 
-  gzip_files.Set(file, fd, file_mode);
+  GzOpenParams params;
+  GetOpenFlags(mode, &params);
+
+  gzip_files.Set(file, fd, params);
   return file;
 }
 
@@ -2174,7 +2236,7 @@ static int GzwriteAcceleratorCompress(GzipFile* gz, uint8_t* input,
 #ifdef USE_IGZIP
     in_call = true;
     struct isal_zstream* isal_strm =
-        InitCompressIGZIP(Z_DEFAULT_COMPRESSION, kWindowBitsGzip);
+        InitCompressIGZIP(gz->level, kWindowBitsGzip);
     if (isal_strm == nullptr) {
       ret = 1;
     } else {
@@ -2279,9 +2341,15 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
   return ret;
 }
 
-static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len) {
+// pinned says the file reaches zlib because the request was never offloadable
+// -- level 0, or a transparent write -- rather than because zlib compression
+// was selected. Such a write must not depend on use_zlib_compress being set, or
+// the pin turns into a failed write; deflate() carries the same term at its own
+// zlib fall-through.
+static int GzwriteZlibCompress(gzFile file, voidpc buf, unsigned len,
+                               bool pinned) {
   int ret = 0;
-  if (configs[USE_ZLIB_COMPRESS] && orig_gzwrite != nullptr) {
+  if ((configs[USE_ZLIB_COMPRESS] || pinned) && orig_gzwrite != nullptr) {
     ret = orig_gzwrite(file, buf, len);
   } else {
     ret = 0;
@@ -2352,6 +2420,38 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
   return 0;
 }
 
+// Compress and write out everything data_buf holds, leaving the buffer ready
+// for more input. The gzwrite loop needs this, and so does every entry point
+// that has to make the bytes written so far visible in the file before it acts
+// (gzclose, gzflush, gzsetparams, and the handoff to zlib in gzvprintf).
+static int FlushBufferedWrite(gzFile file, GzipFile* gz) {
+  if (gz->data_buf_content == 0) {
+    return 0;
+  }
+
+  // CompressAndWrite may fall back to zlib, so it needs the same symbols
+  // gzwrite checks for; without them the buffered data cannot be flushed and
+  // the file would be silently truncated, so report the failure.
+  if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
+    Log(LogLevel::LOG_ERROR, "FlushBufferedWrite Line ", __LINE__,
+        " a required zlib symbol is unresolved, cannot flush\n");
+    return 1;
+  }
+
+  int ret = CompressAndWrite(file, gz);
+  if (ret != 0) {
+    return ret;
+  }
+
+  // Shift whatever CompressAndWrite did not consume to the beginning.
+  // TODO replace with circular buffer to avoid copy
+  uint32_t data_remaining = gz->data_buf_content - gz->data_buf_pos;
+  memmove(gz->data_buf, gz->data_buf + gz->data_buf_pos, data_remaining);
+  gz->data_buf_content = data_remaining;
+  gz->data_buf_pos = 0;
+  return 0;
+}
+
 int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
   auto gz = gzip_files.Get(file);
   if (gz == nullptr) {
@@ -2398,22 +2498,14 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
 
       // Compress and write the buffer
       if (written_bytes < len) {
-        int ret = CompressAndWrite(file, gz.get());
-        if (ret != 0) {
+        if (FlushBufferedWrite(file, gz.get()) != 0) {
           written_bytes = 0;
           goto gzwrite_end;
         }
-
-        // Shift any remaining content of data_buf to beginning
-        // TODO replace with circular buffer to avoid copy
-        uint32_t data_remaining = gz->data_buf_content - gz->data_buf_pos;
-        memmove(gz->data_buf, gz->data_buf + gz->data_buf_pos, data_remaining);
-        gz->data_buf_content = data_remaining;
-        gz->data_buf_pos = 0;
       }
     }
   } else {
-    written_bytes = GzwriteZlibCompress(file, buf, len);
+    written_bytes = GzwriteZlibCompress(file, buf, len, gz->path == ZLIB);
     gz->path = ZLIB;
   }
 
@@ -2423,6 +2515,56 @@ gzwrite_end:
       gz->data_buf_pos, ", path ", static_cast<int>(gz->path), "\n");
 
   return written_bytes;
+}
+
+// Without interception the level the application asks for here is recorded by
+// zlib and honored by nobody: the shim compresses through its own streams, so
+// subsequent writes keep the level the file was opened with. Same class of
+// silent contract violation deflateParams() had.
+int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
+  Log(LogLevel::LOG_INFO, "gzsetparams Line ", __LINE__, ", file ",
+      static_cast<void*>(file), ", level ", level, ", strategy ", strategy,
+      "\n");
+  if (orig_gzsetparams == nullptr) {
+    return Z_STREAM_ERROR;
+  }
+
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzsetparams(file, level, strategy);
+  }
+
+  // Forward first: zlib's own checks (write mode, no sticky error, not a
+  // transparent file) decide the return value, and zlib has to record the level
+  // too, since it is the one that compresses if this file is later handed back.
+  const int ret = orig_gzsetparams(file, level, strategy);
+  if (ret != Z_OK) {
+    return ret;
+  }
+
+  // Data still buffered was written under the old level, so it has to go out as
+  // a member of its own before the new level is recorded.
+  if (FlushBufferedWrite(file, gz.get()) != 0) {
+    return Z_STREAM_ERROR;
+  }
+
+  gz->level = level;
+  // Keep the fallback stream at the level the file now has; it is built by
+  // Reset() and outlives any number of members. Reset() builds it with the
+  // default strategy and nothing in the shim acts on strategy, so only the
+  // level is applied here.
+  if (orig_deflateParams != nullptr) {
+    orig_deflateParams(&gz->deflate_stream, level, Z_DEFAULT_STRATEGY);
+  }
+
+  // Same pin, for the same reason, as the one the constructor applies to a file
+  // opened at level 0: no backend can emit stored blocks, and gzwrite only
+  // reaches zlib through path == ZLIB.
+  if (!IsOffloadableCompressionLevel(level)) {
+    gz->path = ZLIB;
+  }
+
+  return Z_OK;
 }
 
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
@@ -2641,20 +2783,8 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
   int ret = 0;
   if (gz->path != ZLIB &&
       (gz->mode == FileMode::WRITE || gz->mode == FileMode::APPEND)) {
-    // Compress any remaining buffered data. CompressAndWrite may fall back to
-    // zlib, so it needs the same symbols gzwrite checks for; without them the
-    // buffered data cannot be flushed and the file would be silently
-    // truncated, so report the failure.
-    int write_ret = 0;
-    if (gz->data_buf_content > 0) {
-      if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
-        Log(LogLevel::LOG_ERROR, "GzCloseCommon Line ", __LINE__,
-            " a required zlib symbol is unresolved, cannot flush\n");
-        write_ret = 1;
-      } else {
-        write_ret = CompressAndWrite(file, gz.get());
-      }
-    }
+    // Compress any remaining buffered data.
+    int write_ret = FlushBufferedWrite(file, gz.get());
 
     // Capture file size and name before the close
     off_t file_size = lseek(gz->fd, 0, SEEK_CUR);

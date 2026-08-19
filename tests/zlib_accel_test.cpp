@@ -6910,6 +6910,7 @@ TEST_F(UnregisteredStreamTest, GzFunctionsOnUnregisteredFile) {
   EXPECT_EQ(gzclose(nullptr), Z_STREAM_ERROR);
   EXPECT_EQ(gzclose_r(nullptr), Z_STREAM_ERROR);
   EXPECT_EQ(gzclose_w(nullptr), Z_STREAM_ERROR);
+  EXPECT_EQ(gzsetparams(nullptr, 1, Z_DEFAULT_STRATEGY), Z_STREAM_ERROR);
 }
 
 // These tests mutate the global path configuration, so restore it in TearDown
@@ -7047,17 +7048,18 @@ TEST_F(GzipFileTest, GzeofDoesNotReportEofWithBufferedData) {
 // enabled, so which one is selected does not matter to the close tests below --
 // what matters is that one is, because with none of them the call delegates
 // straight to zlib and the shim never buffers anything.
-static ExecutionPath EnableSomeGzCompressPath() {
+static ExecutionPath EnableSomeGzCompressPath(bool zlib_fallback = true) {
 #if defined(USE_IGZIP)
-  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+  SetCompressPath(IGZIP, zlib_fallback, false, false);
   return IGZIP;
 #elif defined(USE_QAT)
-  SetCompressPath(QAT, /*zlib_fallback=*/true, false, false);
+  SetCompressPath(QAT, zlib_fallback, false, false);
   return QAT;
 #elif defined(USE_IAA)
-  SetCompressPath(IAA, /*zlib_fallback=*/true, false, false);
+  SetCompressPath(IAA, zlib_fallback, false, false);
   return IAA;
 #else
+  (void)zlib_fallback;
   SetCompressPath(ZLIB, false, false, false);
   return ZLIB;
 #endif
@@ -7171,6 +7173,203 @@ TEST_F(GzipFileTest, GzcloseRClosesReadFile) {
 
   remove(filename);
   DestroyBlock(input);
+}
+
+static size_t GzFileSize(const char* filename) {
+  std::error_code ec;
+  auto size = std::filesystem::file_size(filename, ec);
+  return ec ? 0 : static_cast<size_t>(size);
+}
+
+// Writes the whole payload through the shim and returns the size of the file it
+// produced. set_level >= 0 asks for the level through gzsetparams once the file
+// is open, which is the request the mode string cannot express. 0 on any
+// failure, so a caller asserting on a size catches it.
+static size_t GzWriteFileAndGetSize(const char* filename, const char* mode,
+                                    const char* input, size_t length,
+                                    int set_level) {
+  remove(filename);
+  gzFile fp = gzopen(filename, mode);
+  if (fp == nullptr) {
+    return 0;
+  }
+  if (set_level >= 0 &&
+      gzsetparams(fp, set_level, Z_DEFAULT_STRATEGY) != Z_OK) {
+    gzclose(fp);
+    return 0;
+  }
+  if (gzwrite(fp, input, static_cast<unsigned>(length)) !=
+      static_cast<int>(length)) {
+    gzclose(fp);
+    return 0;
+  }
+  if (gzclose(fp) != Z_OK) {
+    return 0;
+  }
+  return GzFileSize(filename);
+}
+
+// The level in a gzopen mode string used to be dropped: GetOpenFlags ignored
+// the digit, so every file was compressed at the default level whatever the
+// application asked for. Level 0 is the request with a visible contract -- it
+// asks for stored, uncompressed blocks, which no backend can emit -- so the
+// file has to be routed to zlib.
+TEST_F(GzipFileTest, GzopenLevelZeroPinsToZlib) {
+  // With use_zlib_compress off, only the pin can get this file to zlib: an
+  // accelerator is enabled and zlib compression is not selected, so a write
+  // that depends on the config instead of the pin writes nothing at all.
+  EnableSomeGzCompressPath(/*zlib_fallback=*/false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 64 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e4);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb0");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+            static_cast<int>(input_length));
+  EXPECT_EQ(GetGzipFileExecutionPath(fp), ZLIB);
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  // Stored blocks are larger than what they store, which is what separates a
+  // level that reached the compressor from one that was ignored.
+  EXPECT_GT(GzFileSize(filename), input_length);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(input, uncompressed, input_length), 0);
+
+  delete[] uncompressed;
+  DestroyBlock(input);
+}
+
+// The rest of the level range is only observable as a difference in ratio, and
+// only on IGZIP: QAT and IAA take no compression level at all, so a level is
+// recorded for them and cannot be honored.
+TEST_F(GzipFileTest, GzopenAndGzsetparamsLevelReachTheCompressor) {
+#if defined(USE_IGZIP)
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+#else
+  GTEST_SKIP() << "no backend that takes a compression level is compiled in";
+#endif
+  SetUncompressPath(ZLIB, false, false);
+
+  // Over data_buf_size, so the file is more than one member and the level has
+  // to survive from one member to the next.
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e5);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  const size_t size_level_1 =
+      GzWriteFileAndGetSize(filename, "wb1", input, input_length, -1);
+  const size_t size_level_9 =
+      GzWriteFileAndGetSize(filename, "wb9", input, input_length, -1);
+  // Opened at 9, then asked for 1 before anything is written: the level in
+  // effect is the one gzsetparams set, so this must match "wb1" exactly.
+  const size_t size_set_to_1 =
+      GzWriteFileAndGetSize(filename, "wb9", input, input_length, 1);
+
+  ASSERT_GT(size_level_1, 0u);
+  ASSERT_GT(size_level_9, 0u);
+  ASSERT_GT(size_set_to_1, 0u);
+  EXPECT_LT(size_level_9, size_level_1);
+  EXPECT_EQ(size_set_to_1, size_level_1);
+
+  remove(filename);
+  DestroyBlock(input);
+}
+
+// gzsetparams down to level 0 mid-file is the gz analogue of deflateParams'
+// level-0 pin: the rest of the file has to be routed to zlib, and the data
+// already buffered has to reach the file as a member of its own first.
+TEST_F(GzipFileTest, GzsetparamsLevelZeroRoutesRestOfFileToZlib) {
+  // As above: use_zlib_compress off, so the second half reaches zlib only
+  // through the pin.
+  EnableSomeGzCompressPath(/*zlib_fallback=*/false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t half = 100 << 10;
+  const size_t input_length = 2 * half;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e6);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+
+  // Under data_buf_size, so this half is still in the shim's buffer when
+  // gzsetparams is called.
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(half)),
+            static_cast<int>(half));
+  ASSERT_EQ(gzsetparams(fp, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY), Z_OK);
+  EXPECT_EQ(GetGzipFileExecutionPath(fp), ZLIB);
+  ASSERT_EQ(gzwrite(fp, input + half, static_cast<unsigned>(half)),
+            static_cast<int>(half));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(input, uncompressed, input_length), 0);
+
+  delete[] uncompressed;
+  DestroyBlock(input);
+}
+
+// zlib rejects gzsetparams on a file opened for reading. The shim has to
+// forward before it acts, or it records a level for a file zlib refused.
+TEST_F(GzipFileTest, GzsetparamsRejectsReadFile) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e7);
+  ASSERT_NE(input, nullptr);
+  ASSERT_EQ(ZlibCompressGzipFile(input, input_length), Z_OK);
+
+  gzFile fp = gzopen("file.gz", "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzsetparams(fp, 1, Z_DEFAULT_STRATEGY), Z_STREAM_ERROR);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+
+  DestroyBlock(input);
+}
+
+// The shim opens the file itself, before zlib ever validates the mode string,
+// so a mode zlib refuses must not reach open(2): O_TRUNC would empty a file
+// plain zlib leaves untouched, and O_CREAT would create one it never creates.
+TEST_F(GzipFileTest, GzopenRejectsBadModeWithoutTouchingTheFile) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const char* filename = "file.gz";
+  std::vector<char> input(4096, 'a');
+  ASSERT_EQ(ZlibCompressGzipFile(input.data(), input.size()), Z_OK);
+  const size_t size_before = GzFileSize(filename);
+  ASSERT_GT(size_before, 0u);
+
+  // '+' asks to read and write one file at once, which zlib refuses.
+  EXPECT_EQ(gzopen(filename, "w+"), nullptr);
+  EXPECT_EQ(GzFileSize(filename), size_before);
+
+  // A mode string that names no direction is refused too.
+  const char* missing = "file-mode-check.gz";
+  remove(missing);
+  EXPECT_EQ(gzopen(missing, "b"), nullptr);
+  EXPECT_FALSE(std::filesystem::exists(missing));
+  remove(missing);
 }
 
 class ShardedMapTest : public ::testing::Test {};
