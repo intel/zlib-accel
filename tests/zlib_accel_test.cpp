@@ -5210,10 +5210,10 @@ class TerminalStateRegressionTest : public ::testing::Test {};
 
 // An offloaded stream never feeds zlib's own deflate/inflate state, so before
 // the shim recorded that a stream had ended, every call after Z_STREAM_END was
-// dispatched from scratch: QAT and IAA appended bytes zlib would never emit
-// (measured +8 -- a complete empty zlib stream -- after a finished one, and +2
-// for a non-Z_FINISH call), while IGZIP consumed 64 KiB of fresh input, wrote
-// nothing and reported success, which is data loss behind a success code.
+// dispatched from scratch: QAT and IAA appended bytes zlib would never emit --
+// a complete empty stream after a finished one, or a second header -- while
+// IGZIP consumed the whole input, wrote nothing and reported success, which is
+// data loss behind a success code.
 //
 // The expectations below are zlib's own, measured against a binary that does
 // not link the shim rather than read out of deflate.c, because zlib validates
@@ -5438,8 +5438,8 @@ static void RunInflatePostEndMatchesZlib(ExecutionPath accel_path) {
   ASSERT_EQ(GetInflateExecutionPath(&stream), accel_path);
   ASSERT_EQ(stream.total_out, input_length);
 
-  // Re-feeding the whole stream decoded it a second time on QAT and IAA
-  // (measured +65536), which is what these rows rule out.
+  // Re-feeding the whole stream decoded it a second time on QAT and IAA, which
+  // is what these rows rule out.
   std::vector<Bytef> spare(4096);
   CheckInflatePostEndRows(&stream, compressed, spare.data(), spare.size());
 
@@ -5485,9 +5485,9 @@ TEST_F(TerminalStateRegressionTest, IAAInflatePostEndMatchesZlib) {
 
 // The review comment on the stream-copy work that started this: a copy of a
 // finished stream held a zlib deflate state the accelerator had never fed, so
-// feeding the copy produced a second stream (measured +1105 on QAT, +1698 on
-// IAA) where zlib returns Z_BUF_ERROR and writes nothing. The copy inherits the
-// terminal state, so it now refuses input exactly as its source does.
+// feeding the copy produced a second stream where zlib returns Z_BUF_ERROR and
+// writes nothing. The copy inherits the terminal state, so it now refuses input
+// exactly as its source does.
 static void RunFinishedDeflateCopyRefusesInput(ExecutionPath accel_path) {
   SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
   SetUncompressPath(ZLIB, false, false);
@@ -5538,44 +5538,12 @@ TEST_F(TerminalStateRegressionTest, IAAFinishedDeflateCopyRefusesInput) {
 #endif
 
 #ifdef USE_IGZIP
-// IGZIP has no copyable deflate state (level_buf holds pointers into its own
-// allocation), so a finished IGZIP stream refuses the copy outright rather than
-// producing one that has to be taught about the terminal state.
-TEST_F(TerminalStateRegressionTest, IGZIPRefusesFinishedDeflateCopy) {
-  SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
-  SetUncompressPath(ZLIB, false, false);
-
-  const size_t input_length = 64 * 1024;
-  char* input = GenerateBlock(input_length, compressible_block);
-  ASSERT_NE(input, nullptr);
-
-  z_stream source;
-  memset(&source, 0, sizeof(z_stream));
-  ASSERT_EQ(deflateInit2(&source, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
-                         Z_DEFAULT_STRATEGY),
-            Z_OK);
-
-  const size_t bound = deflateBound(&source, input_length) + 4096;
-  std::vector<Bytef> output(bound);
-  source.next_in = reinterpret_cast<Bytef*>(input);
-  source.avail_in = static_cast<uInt>(input_length);
-  source.next_out = output.data();
-  source.avail_out = static_cast<uInt>(output.size());
-  ASSERT_EQ(deflate(&source, Z_FINISH), Z_STREAM_END);
-  ASSERT_EQ(GetDeflateExecutionPath(&source), IGZIP);
-
-  z_stream copy;
-  memset(&copy, 0, sizeof(z_stream));
-  EXPECT_EQ(deflateCopy(&copy, &source), Z_STREAM_ERROR);
-
-  // A refused copy must not leave the source unusable: it still answers as a
-  // finished stream does.
-  std::vector<Bytef> spare(4096);
-  CheckDeflatePostEndRows(&source, input, input_length, spare.data(),
-                          spare.size());
-
-  ASSERT_EQ(deflateEnd(&source), Z_OK);
-  DestroyBlock(input);
+// A finished IGZIP stream is copyable for the same reason the copy needs no
+// ISA-L state: ISA-L is at ZSTATE_END with all output delivered, and the
+// terminal state the copy inherits answers every call on it. Only a live IGZIP
+// stream is refused, which IGZIPRefusesMidstreamDeflateCopy covers.
+TEST_F(TerminalStateRegressionTest, IGZIPFinishedDeflateCopyRefusesInput) {
+  RunFinishedDeflateCopyRefusesInput(IGZIP);
 }
 #endif  // USE_IGZIP
 

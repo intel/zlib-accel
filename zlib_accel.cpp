@@ -971,15 +971,19 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
 
   auto deflate_settings = deflate_stream_settings.Get(source);
 
-  // Refuse while ISA-L owns the source stream. zlib's copy duplicates only the
-  // zlib deflate state, which on an offloaded stream has never been fed, and
-  // ISA-L's state cannot be duplicated alongside it: isal_zstream::level_buf is
-  // cast to a private struct holding pointers into its own allocation, so a
-  // byte copy would leave both streams writing into one pending block. Draining
-  // that block first is no help -- those bytes belong to the prefix the two
-  // streams share, and deflateCopy() cannot hand bytes back to the caller.
-  // Failing before orig_deflateCopy leaves dest as the caller passed it, the
-  // same shape as deflateSetDictionary()'s mid-stream rejection.
+  // Refuse while ISA-L owns the source stream and has not finished it. A
+  // finished stream is copyable: ISA-L is at ZSTATE_END with all output
+  // delivered, so there is no state left to duplicate, and the terminal state
+  // the copy inherits answers every deflate() on it -- the same handling QAT
+  // and IAA already get. zlib's copy duplicates only the zlib deflate state,
+  // which on an offloaded stream has never been fed, and ISA-L's state cannot
+  // be duplicated alongside it: isal_zstream::level_buf is cast to a private
+  // struct holding pointers into its own allocation, so a byte copy would leave
+  // both streams writing into one pending block. Draining that block first is
+  // no help -- those bytes belong to the prefix the two streams share, and
+  // deflateCopy() cannot hand bytes back to the caller. Failing before
+  // orig_deflateCopy leaves dest as the caller passed it, the same shape as
+  // deflateSetDictionary()'s mid-stream rejection.
   //
   // QAT and IAA need no equivalent check: they offload with Z_FINISH only and
   // commit output only on full consumption, so they never leave a stream
@@ -988,7 +992,8 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
   // job->total_in to available_in -- so it is worth re-checking after a QATzip
   // or QPL upgrade. A plain follow-up deflate() mishandles such a state
   // identically, so the gap would not be specific to copying.
-  if (IgzipOwnsDeflateStream(deflate_settings)) {
+  if (IgzipOwnsDeflateStream(deflate_settings) &&
+      !deflate_settings->stream_end_reached) {
     Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__,
         " rejected, ISA-L holds live state for source stream\n");
     return Z_STREAM_ERROR;
@@ -1009,9 +1014,10 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
     // was pinned because the request was never offloadable, which is just as
     // true of the copy, and leaving the copy UNDEFINED would re-run path
     // selection on a stream that is already under way. No ISA-L stream is
-    // carried over: a live one was refused above, and one merely kept across
-    // deflateReset() is freshly reset, so deflate() rebuilds it lazily at the
-    // recorded level.
+    // carried over: a live one was refused above, one merely kept across
+    // deflateReset() is freshly reset, and one belonging to a finished stream
+    // has nothing left to give, so deflate() rebuilds it lazily at the recorded
+    // level after a reset clears the terminal state.
     if (!deflate_stream_settings.SetFromCopy(dest, *deflate_settings)) {
       // Undo zlib's half of the copy rather than hand back a destination the
       // shim does not know about: an untracked copy degrades to orig_deflate on
@@ -1156,12 +1162,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     IGZIPHandleActiveStreamNoInput(strm, inflate_settings->isal_strm, &ret);
     in_call = false;
     // Second site where inflate() reports a completion, so it records the
-    // terminal state too. Measured as redundant on its own -- ISA-L's
-    // inflate_state stays in ISAL_BLOCK_FINISH and answers later calls the way
-    // zlib would, which is why IGZIP was the one path that never appended
-    // anything after Z_STREAM_END. It is recorded anyway so the flag means the
-    // same thing on every path: once a stream has ended, the gate above answers
-    // for it rather than any given backend's state.
+    // terminal state too. Redundant on its own -- ISA-L's inflate_state stays
+    // in ISAL_BLOCK_FINISH and answers later calls the way zlib would. It is
+    // recorded anyway so the flag means the same thing on every path: once a
+    // stream has ended, the gate above answers for it rather than any given
+    // backend's state.
     if (ret == Z_STREAM_END) {
       inflate_settings->stream_end_reached = true;
     }
