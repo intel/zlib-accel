@@ -695,10 +695,18 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // that rejection instead of the shim dereferencing what zlib is about to
   // refuse. zlib's parameter checks touch no stream state, so a delegated call
   // is indistinguishable from an unshimmed one.
+  // Counted like the fall-through below rather than like an early exit: the
+  // call did reach zlib, and its rejection is an error the statistics should
+  // show.
   if (strm->next_out == nullptr ||
       (strm->avail_in != 0 && strm->next_in == nullptr)) {
-    return orig_deflate != nullptr ? orig_deflate(strm, flush)
-                                   : Z_VERSION_ERROR;
+    if (orig_deflate == nullptr) {
+      return Z_VERSION_ERROR;
+    }
+    const int ret = orig_deflate(strm, flush);
+    INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
+    INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
+    return ret;
   }
 
   // The compression level is a property of the whole stream, not of one call,
@@ -1134,10 +1142,17 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // no stream state, so a delegated call is indistinguishable from an unshimmed
   // one. This also covers a null next_out, which the IGZIP drain below would
   // otherwise hand to ISA-L.
+  // Counted like the fall-through below rather than like an early exit, for the
+  // same reason as in deflate().
   if (strm->next_out == nullptr ||
       (strm->next_in == nullptr && strm->avail_in != 0)) {
-    return orig_inflate != nullptr ? orig_inflate(strm, flush)
-                                   : Z_VERSION_ERROR;
+    if (orig_inflate == nullptr) {
+      return Z_VERSION_ERROR;
+    }
+    const int ret = orig_inflate(strm, flush);
+    INCREMENT_STAT(INFLATE_ZLIB_COUNT);
+    INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
+    return ret;
   }
 
   int ret = 1;
@@ -1450,6 +1465,18 @@ int ZEXPORT inflateReset(z_streamp strm) {
 // its own window happens to hold. The pin is what inflateSetDictionary() does
 // for the same reason, and inflateReset() lifts it, being the reset that
 // actually discards the history.
+//
+// What the pin cannot do is supply the history. If the previous stream was
+// offloaded, zlib's own window never received it, so a next stream that really
+// does reference those bytes fails in orig_inflate() with Z_DATA_ERROR rather
+// than decoding. That is inherent: the bytes exist only in the output the
+// accelerator already handed the caller, and whether they will be referenced is
+// unknowable while the previous stream is still being decoded. What the pin
+// buys is the failure mode -- a zlib data error on the stream that needs the
+// history, instead of a backend decoding a lookback against an unrelated window
+// and returning success. Rejecting the reset outright would be worse: it fails
+// the common history-independent restart, which works, to report the rare case
+// earlier. Documented in the README.
 int ZEXPORT inflateResetKeep(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateResetKeep Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");

@@ -5865,6 +5865,149 @@ TEST_F(TerminalStateRegressionTest, IAAInflateResetKeepClearsStreamEnd) {
 }
 #endif
 
+// Drives inflate() over one entire stream and returns the code it settled on.
+static int InflateWholeStream(z_stream* stream, std::vector<Bytef>* in,
+                              Bytef* out, size_t out_length) {
+  stream->next_in = in->data();
+  stream->avail_in = static_cast<uInt>(in->size());
+  stream->next_out = out;
+  stream->avail_out = static_cast<uInt>(out_length);
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128 && ret == Z_OK; guard++) {
+    ret = inflate(stream, Z_NO_FLUSH);
+  }
+  return ret;
+}
+
+// What the pin after inflateResetKeep decides is which engine decodes the next
+// stream, not what history that engine has: an offloaded stream never fed
+// zlib's window, so a next stream that references its bytes cannot be decoded
+// at all. The all-zlib decode is the oracle for that claim -- it decodes the
+// same pair correctly -- so what the accelerated half pins is the failure mode:
+// a zlib data error on the stream that needs the history, rather than a backend
+// resolving the lookback against an unrelated window and reporting success.
+static void RunInflateResetKeepHistoryDependentStreamFails(
+    ExecutionPath accel_path) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  const size_t tail_length = 8 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11d3);
+  ASSERT_NE(input, nullptr);
+
+  // A stream that only decodes against another stream's output. Raw deflate,
+  // because a preset dictionary sets the encoder's window there without an
+  // FDICT bit: the second stream is then ordinary deflate whose distances reach
+  // behind its own first byte, which is exactly what a window retained across
+  // inflateResetKeep is supposed to supply.
+  z_stream first_stream;
+  memset(&first_stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&first_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15,
+                         8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+  std::vector<Bytef> first(deflateBound(&first_stream, input_length) + 128);
+  first_stream.next_in = reinterpret_cast<Bytef*>(input);
+  first_stream.avail_in = static_cast<uInt>(input_length);
+  first_stream.next_out = first.data();
+  first_stream.avail_out = static_cast<uInt>(first.size());
+  ASSERT_EQ(deflate(&first_stream, Z_FINISH), Z_STREAM_END);
+  first.resize(first_stream.total_out);
+  ASSERT_EQ(deflateEnd(&first_stream), Z_OK);
+
+  z_stream second_stream;
+  memset(&second_stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&second_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15,
+                         8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+  ASSERT_EQ(deflateSetDictionary(&second_stream,
+                                 reinterpret_cast<const Bytef*>(input),
+                                 static_cast<uInt>(input_length)),
+            Z_OK);
+  std::vector<Bytef> second(deflateBound(&second_stream, tail_length) + 128);
+  second_stream.next_in =
+      reinterpret_cast<Bytef*>(input + input_length - tail_length);
+  second_stream.avail_in = static_cast<uInt>(tail_length);
+  second_stream.next_out = second.data();
+  second_stream.avail_out = static_cast<uInt>(second.size());
+  ASSERT_EQ(deflate(&second_stream, Z_FINISH), Z_STREAM_END);
+  second.resize(second_stream.total_out);
+  ASSERT_EQ(deflateEnd(&second_stream), Z_OK);
+
+  std::vector<Bytef> out(input_length + 1024);
+
+  // The dependence itself, without which the rest of the test proves nothing:
+  // on its own the second stream is not decodable at all.
+  z_stream standalone;
+  memset(&standalone, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&standalone, -15), Z_OK);
+  ASSERT_EQ(InflateWholeStream(&standalone, &second, out.data(), out.size()),
+            Z_DATA_ERROR);
+  ASSERT_EQ(inflateEnd(&standalone), Z_OK);
+
+  // Oracle: decoded end to end by zlib, which does hold the history, the pair
+  // round-trips.
+  z_stream oracle;
+  memset(&oracle, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&oracle, -15), Z_OK);
+  ASSERT_EQ(InflateWholeStream(&oracle, &first, out.data(), out.size()),
+            Z_STREAM_END);
+  ASSERT_EQ(oracle.total_out, input_length);
+  ASSERT_EQ(inflateResetKeep(&oracle), Z_OK);
+  ASSERT_EQ(InflateWholeStream(&oracle, &second, out.data(), out.size()),
+            Z_STREAM_END);
+  EXPECT_EQ(oracle.total_out, tail_length);
+  EXPECT_EQ(memcmp(out.data(), input + input_length - tail_length, tail_length),
+            0);
+  ASSERT_EQ(inflateEnd(&oracle), Z_OK);
+
+  // Offloaded, the same second stream has no history to decode against.
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+  ASSERT_EQ(InflateWholeStream(&stream, &first, out.data(), out.size()),
+            Z_STREAM_END);
+  ASSERT_EQ(stream.total_out, input_length);
+  if (GetInflateExecutionPath(&stream) != accel_path) {
+    // Not every backend can decode what zlib produced with a 32 KiB window, and
+    // a stream that fell back to zlib fed zlib's window -- the case the oracle
+    // above already covers.
+    ASSERT_EQ(inflateEnd(&stream), Z_OK);
+    DestroyBlock(input);
+    GTEST_SKIP() << "first stream was not offloaded to the path under test";
+  }
+
+  ASSERT_EQ(inflateResetKeep(&stream), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+  EXPECT_EQ(InflateWholeStream(&stream, &second, out.data(), out.size()),
+            Z_DATA_ERROR);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest,
+       IGZIPInflateResetKeepHistoryDependentStreamFails) {
+  RunInflateResetKeepHistoryDependentStreamFails(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest,
+       QATInflateResetKeepHistoryDependentStreamFails) {
+  RunInflateResetKeepHistoryDependentStreamFails(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest,
+       IAAInflateResetKeepHistoryDependentStreamFails) {
+  RunInflateResetKeepHistoryDependentStreamFails(IAA);
+}
+#endif
+
 #ifdef USE_IGZIP
 // The IGZIP inflate path reports completion in two places. With avail_in == 0
 // and output still buffered inside ISA-L, inflate() drains that state and
