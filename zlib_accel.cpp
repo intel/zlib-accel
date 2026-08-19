@@ -80,6 +80,8 @@ static gzFile (*orig_gzdopen)(int fd, const char* mode);
 static int (*orig_gzwrite)(gzFile file, voidpc buf, unsigned len);
 static int (*orig_gzread)(gzFile file, voidp buf, unsigned len);
 static int (*orig_gzclose)(gzFile file);
+static int (*orig_gzclose_r)(gzFile file);
+static int (*orig_gzclose_w)(gzFile file);
 static int (*orig_gzeof)(gzFile file);
 
 // Forward declaration — defined after DeflateStreamSettings,
@@ -186,6 +188,10 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_gzread, int (*)(gzFile, voidp, unsigned), "gzread");
 
   LOAD_SYMBOL(orig_gzclose, int (*)(gzFile), "gzclose");
+
+  LOAD_SYMBOL(orig_gzclose_r, int (*)(gzFile), "gzclose_r");
+
+  LOAD_SYMBOL(orig_gzclose_w, int (*)(gzFile), "gzclose_w");
 
   LOAD_SYMBOL(orig_gzeof, int (*)(gzFile), "gzeof");
 
@@ -2582,23 +2588,53 @@ gzread_end:
   return read_bytes;
 }
 
-int ZEXPORT gzclose(gzFile file) {
+// gzclose, gzclose_r and gzclose_w share one body: whichever entry point the
+// application used, a file the shim owns needs its buffered data flushed, its
+// size captured before zlib's own close appends to it, and that appended data
+// truncated away again.
+//
+// required_mode is what separates the three, and it has to be checked before
+// any of that work happens. zlib's gzclose_r and gzclose_w reject a file opened
+// for the other direction without touching it, so a mismatched call here must
+// not flush or truncate a file zlib would have left alone. FileMode::NONE
+// accepts either direction and is what gzclose passes. Append is checked as a
+// write because zlib folds it into its own write mode right after opening the
+// file, which is why zlib's gzclose_w accepts an appended file.
+static bool GzCloseModeMatches(FileMode mode, FileMode required_mode) {
+  switch (required_mode) {
+    case FileMode::READ:
+      return mode == FileMode::READ;
+    case FileMode::WRITE:
+    case FileMode::APPEND:
+      return mode == FileMode::WRITE || mode == FileMode::APPEND;
+    case FileMode::NONE:
+      break;
+  }
+  return true;
+}
+
+static int GzCloseCommon(gzFile file, FileMode required_mode,
+                         int (*orig_close)(gzFile file)) {
   auto gz = gzip_files.Get(file);
-  if (gz == nullptr || orig_gzclose == nullptr) {
-    // Every path below ends in orig_gzclose, so without it there is nothing
+  if (gz == nullptr || orig_close == nullptr) {
+    // Every path below ends in orig_close, so without it there is nothing
     // useful to do; leave the entry in place rather than losing the state of a
-    // file that stays open. Z_STREAM_ERROR matches what zlib's own gzclose
-    // returns for a file it cannot act on.
-    return orig_gzclose != nullptr ? orig_gzclose(file) : Z_STREAM_ERROR;
+    // file that stays open. Z_STREAM_ERROR matches what zlib's own close
+    // functions return for a file they cannot act on.
+    return orig_close != nullptr ? orig_close(file) : Z_STREAM_ERROR;
   }
 
-  // Unregister up front, before orig_gzclose frees the gzFile. Unsetting after
+  if (!GzCloseModeMatches(gz->mode, required_mode)) {
+    return Z_STREAM_ERROR;
+  }
+
+  // Unregister up front, before orig_close frees the gzFile. Unsetting after
   // the free would erase the entry of whatever file has since been allocated at
   // the same address, so do it once here rather than on each exit path. Holding
   // gz (a shared_ptr) keeps this file's state alive until we return.
   gzip_files.Unset(file);
 
-  Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
+  Log(LogLevel::LOG_INFO, "GzCloseCommon Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buffered ", gz->data_buf_content, ", path ",
       static_cast<int>(gz->path), "\n");
 
@@ -2612,7 +2648,7 @@ int ZEXPORT gzclose(gzFile file) {
     int write_ret = 0;
     if (gz->data_buf_content > 0) {
       if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
-        Log(LogLevel::LOG_ERROR, "gzclose Line ", __LINE__,
+        Log(LogLevel::LOG_ERROR, "GzCloseCommon Line ", __LINE__,
             " a required zlib symbol is unresolved, cannot flush\n");
         write_ret = 1;
       } else {
@@ -2620,23 +2656,23 @@ int ZEXPORT gzclose(gzFile file) {
       }
     }
 
-    // Capture file size and name before gzclose
+    // Capture file size and name before the close
     off_t file_size = lseek(gz->fd, 0, SEEK_CUR);
     char file_path[MAXPATHLEN];
     ssize_t readlink_ret =
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
                  MAXPATHLEN - 1);
     if (readlink_ret == -1) {
-      ret = orig_gzclose(file);
-      Log(LogLevel::LOG_ERROR, "gzclose Line ", __LINE__,
+      ret = orig_close(file);
+      Log(LogLevel::LOG_ERROR, "GzCloseCommon Line ", __LINE__,
           ", readlink_ret return error \n");
       return ret;
     }
     file_path[readlink_ret] = '\0';
 
-    int close_ret = orig_gzclose(file);
+    int close_ret = orig_close(file);
 
-    // Remove any file content added by gzclose
+    // Remove any file content added by the close
     int truncate_ret = 0;
     if (file_size != -1) {
       truncate_ret = truncate(file_path, file_size);
@@ -2650,12 +2686,28 @@ int ZEXPORT gzclose(gzFile file) {
       ret = Z_STREAM_ERROR;
     }
   } else {
-    ret = orig_gzclose(file);
+    ret = orig_close(file);
   }
-  Log(LogLevel::LOG_INFO, "gzclose Line ", __LINE__, ", file ",
+  Log(LogLevel::LOG_INFO, "GzCloseCommon Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", return code ", ret, ", buffered processed ",
       gz->data_buf_pos, "\n");
   return ret;
+}
+
+int ZEXPORT gzclose(gzFile file) {
+  return GzCloseCommon(file, FileMode::NONE, orig_gzclose);
+}
+
+// Without these two, a file the shim owns and the application closes through
+// gzclose_r/gzclose_w never reaches GzCloseCommon: the buffered data is not
+// flushed, the registry entry outlives the gzFile, and the content zlib's own
+// close appends is left in the file instead of being truncated away.
+int ZEXPORT gzclose_r(gzFile file) {
+  return GzCloseCommon(file, FileMode::READ, orig_gzclose_r);
+}
+
+int ZEXPORT gzclose_w(gzFile file) {
+  return GzCloseCommon(file, FileMode::WRITE, orig_gzclose_w);
 }
 
 int ZEXPORT gzeof(gzFile file) {
@@ -2674,6 +2726,14 @@ int ZEXPORT gzeof(gzFile file) {
   bool data_remaining = (gz->data_buf_content - gz->data_buf_pos) > 0 ||
                         (gz->io_buf_content - gz->io_buf_pos) > 0;
   return gz->reached_eof && !data_remaining;
+}
+
+ExecutionPath GetGzipFileExecutionPath(gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr) {
+    return ZLIB;
+  }
+  return gz->path;
 }
 #if defined(__clang__)
 #pragma clang attribute pop

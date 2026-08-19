@@ -6908,6 +6908,8 @@ TEST_F(UnregisteredStreamTest, GzFunctionsOnUnregisteredFile) {
   EXPECT_EQ(gzread(nullptr, buf.data(), static_cast<unsigned>(buf.size())), -1);
   EXPECT_EQ(gzwrite(nullptr, buf.data(), static_cast<unsigned>(buf.size())), 0);
   EXPECT_EQ(gzclose(nullptr), Z_STREAM_ERROR);
+  EXPECT_EQ(gzclose_r(nullptr), Z_STREAM_ERROR);
+  EXPECT_EQ(gzclose_w(nullptr), Z_STREAM_ERROR);
 }
 
 // These tests mutate the global path configuration, so restore it in TearDown
@@ -6918,18 +6920,22 @@ class GzipFileTest : public ::testing::Test {
   void SetUp() override {
     saved_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
     saved_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
     saved_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
     saved_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
     saved_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
     saved_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
   }
 
   void TearDown() override {
     SetConfig(USE_IAA_COMPRESS, saved_iaa_compress_);
     SetConfig(USE_QAT_COMPRESS, saved_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_igzip_compress_);
     SetConfig(USE_ZLIB_COMPRESS, saved_zlib_compress_);
     SetConfig(USE_IAA_UNCOMPRESS, saved_iaa_uncompress_);
     SetConfig(USE_QAT_UNCOMPRESS, saved_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_igzip_uncompress_);
     SetConfig(USE_ZLIB_UNCOMPRESS, saved_zlib_uncompress_);
     remove("file.gz");
   }
@@ -6937,9 +6943,11 @@ class GzipFileTest : public ::testing::Test {
  private:
   uint32_t saved_iaa_compress_ = 0;
   uint32_t saved_qat_compress_ = 0;
+  uint32_t saved_igzip_compress_ = 0;
   uint32_t saved_zlib_compress_ = 0;
   uint32_t saved_iaa_uncompress_ = 0;
   uint32_t saved_qat_uncompress_ = 0;
+  uint32_t saved_igzip_uncompress_ = 0;
   uint32_t saved_zlib_uncompress_ = 0;
 };
 
@@ -7033,6 +7041,136 @@ TEST_F(GzipFileTest, GzeofDoesNotReportEofWithBufferedData) {
   EXPECT_EQ(output, input);
 
   EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// gzwrite takes its own buffered route whenever any compress accelerator is
+// enabled, so which one is selected does not matter to the close tests below --
+// what matters is that one is, because with none of them the call delegates
+// straight to zlib and the shim never buffers anything.
+static ExecutionPath EnableSomeGzCompressPath() {
+#if defined(USE_IGZIP)
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+  return IGZIP;
+#elif defined(USE_QAT)
+  SetCompressPath(QAT, /*zlib_fallback=*/true, false, false);
+  return QAT;
+#elif defined(USE_IAA)
+  SetCompressPath(IAA, /*zlib_fallback=*/true, false, false);
+  return IAA;
+#else
+  SetCompressPath(ZLIB, false, false, false);
+  return ZLIB;
+#endif
+}
+
+// gzwrite buffers up to data_buf_size before compressing, so the tail of a
+// write is still in the shim's buffer when the application closes the file.
+// gzclose flushes it; an application that closes through gzclose_w instead
+// reached zlib directly, which knows nothing about that buffer, so the tail was
+// dropped and the close still reported success.
+TEST_F(GzipFileTest, GzcloseWFlushesBufferedData) {
+  EnableSomeGzCompressPath();
+  SetUncompressPath(ZLIB, false, false);
+
+  // Over data_buf_size (256 KiB) so gzwrite compresses one full buffer and
+  // leaves the remainder for the close to flush.
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e1);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+            static_cast<int>(input_length));
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+  // Not an ASSERT: the content check below is still worth running, but a zlib
+  // path here means nothing was left buffered and the case proves nothing.
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+#endif
+  ASSERT_EQ(gzclose_w(fp), Z_OK);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(input, uncompressed, input_length), 0);
+
+  delete[] uncompressed;
+  DestroyBlock(input);
+}
+
+// zlib's gzclose_r and gzclose_w reject a file opened for the other direction
+// without touching it. The shim has to reject it at the same point: the body it
+// shares with gzclose flushes the buffer, closes the file and truncates it back
+// to the size it recorded, none of which zlib would have done here.
+TEST_F(GzipFileTest, GzcloseRejectsMismatchedMode) {
+  EnableSomeGzCompressPath();
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e2);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+            static_cast<int>(input_length));
+
+  // Reading close on a write file: rejected, and the file still writable.
+  EXPECT_EQ(gzclose_r(fp), Z_STREAM_ERROR);
+  ASSERT_EQ(gzclose_w(fp), Z_OK);
+
+  // The rejected call must not have consumed the buffered data.
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(input, uncompressed, input_length), 0);
+
+  delete[] uncompressed;
+  DestroyBlock(input);
+}
+
+// The read direction of the same split. gzclose_r has to unregister the file
+// and reach zlib's own close; a write close on it is rejected.
+TEST_F(GzipFileTest, GzcloseRClosesReadFile) {
+  SetCompressPath(ZLIB, false, false, false);
+#if defined(USE_IAA)
+  SetUncompressPath(IAA, true, false);
+#elif defined(USE_QAT)
+  SetUncompressPath(QAT, true, false);
+#elif defined(USE_IGZIP)
+  SetUncompressPath(IGZIP, true, false);
+#else
+  SetUncompressPath(ZLIB, false, false);
+#endif
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11e3);
+  ASSERT_NE(input, nullptr);
+  ASSERT_EQ(ZlibCompressGzipFile(input, input_length), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  std::vector<char> output(input_length, 0);
+  ASSERT_EQ(gzread(fp, output.data(), static_cast<unsigned>(output.size())),
+            static_cast<int>(input_length));
+  EXPECT_EQ(memcmp(input, output.data(), input_length), 0);
+
+  EXPECT_EQ(gzclose_w(fp), Z_STREAM_ERROR);
+  EXPECT_EQ(gzclose_r(fp), Z_OK);
+
+  remove(filename);
+  DestroyBlock(input);
 }
 
 class ShardedMapTest : public ::testing::Test {};
