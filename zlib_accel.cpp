@@ -93,6 +93,11 @@ static int (*orig_gzputs)(gzFile file, const char* s);
 static z_size_t (*orig_gzfwrite)(voidpc buf, z_size_t size, z_size_t nitems,
                                  gzFile file);
 static int (*orig_gzvprintf)(gzFile file, const char* format, va_list va);
+static int (*orig_gzgetc)(gzFile file);
+static int (*orig_gzungetc)(int c, gzFile file);
+static char* (*orig_gzgets)(gzFile file, char* buf, int len);
+static z_size_t (*orig_gzfread)(voidp buf, z_size_t size, z_size_t nitems,
+                                gzFile file);
 
 // Forward declaration — defined after DeflateStreamSettings,
 // InflateStreamSettings, and GzipFiles class definitions below
@@ -218,6 +223,15 @@ static int init_zlib_accel(void) {
 
   LOAD_SYMBOL(orig_gzvprintf, int (*)(gzFile, const char*, va_list),
               "gzvprintf");
+
+  LOAD_SYMBOL(orig_gzgetc, int (*)(gzFile), "gzgetc");
+
+  LOAD_SYMBOL(orig_gzungetc, int (*)(int, gzFile), "gzungetc");
+
+  LOAD_SYMBOL(orig_gzgets, char* (*)(gzFile, char*, int), "gzgets");
+
+  LOAD_SYMBOL(orig_gzfread, z_size_t(*)(voidp, z_size_t, z_size_t, gzFile),
+              "gzfread");
 
   if (missing_symbol_count > 0) {
     Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " ",
@@ -1976,6 +1990,7 @@ struct GzipFile {
     path = UNDEFINED;
     use_zlib_for_decompression = false;
     reached_eof = false;
+    pushback = -1;
 
     data_buf_pos = 0;
     data_buf_content = 0;
@@ -2019,6 +2034,12 @@ struct GzipFile {
   // later gzsetparams. Reset() keeps it, matching zlib, whose reset paths
   // preserve the level too.
   int level = Z_DEFAULT_COMPRESSION;
+  // A byte handed back by gzungetc, or -1 for none. It cannot be expressed as a
+  // step back in data_buf: the byte pushed need not be the byte read, and there
+  // need not have been a read at all. gzread serves it ahead of its own
+  // buffers. One byte is what zlib guarantees; a second push before a read may
+  // fail, which is what this does.
+  int pushback = -1;
 
   // For gzwrite
   // data_buf --(compress)--> io_buf --(write)--> file
@@ -2733,12 +2754,7 @@ int ZEXPORTVA gzprintf(gzFile file, const char* format, ...) {
   return ret;
 }
 
-int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
-  auto gz = gzip_files.Get(file);
-  if (gz == nullptr) {
-    return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
-  }
-
+static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
   // Check every symbol this function may need before touching any state. The
   // accelerator path can hand the rest of the file to zlib at any point, and a
   // concatenated stream needs a reset between members, so a check made partway
@@ -2824,9 +2840,8 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
           uint8_t* output = reinterpret_cast<uint8_t*>(gz->data_buf);
           if (!gz->use_zlib_for_decompression) {
             bool end_of_stream = false;
-            ret =
-                GzreadAcceleratorUncompress(gz.get(), input, &input_len, output,
-                                            &output_len, &end_of_stream);
+            ret = GzreadAcceleratorUncompress(gz, input, &input_len, output,
+                                              &output_len, &end_of_stream);
             Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
                 static_cast<void*>(file), ", accelerator return code ", ret,
                 ", input ", input_len, ", output ", output_len, "\n");
@@ -2894,6 +2909,134 @@ gzread_end:
       gz->data_buf_content - gz->data_buf_pos, ", path ",
       static_cast<int>(gz->path), "\n");
   return read_bytes;
+}
+
+int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr) {
+    return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
+  }
+
+  // A byte pushed back by gzungetc is the first thing the next read returns;
+  // the rest of the request comes from the file as usual.
+  if (gz->pushback >= 0 && len > 0 && buf != nullptr) {
+    *static_cast<char*>(buf) = static_cast<char>(gz->pushback);
+    gz->pushback = -1;
+    if (len == 1) {
+      return 1;
+    }
+    int ret =
+        GzreadOwnedFile(file, gz.get(), static_cast<char*>(buf) + 1, len - 1);
+    // The pushed byte reached the caller even if the rest of the read did not.
+    return ret > 0 ? ret + 1 : 1;
+  }
+
+  return GzreadOwnedFile(file, gz.get(), buf, len);
+}
+
+// The read counterparts of the write helpers: each reads through zlib's own gz
+// stream, which on a file the shim owns is positioned nowhere near where the
+// shim has read to, so a forwarded call returns bytes from the middle of a
+// compressed member. Served here through the shim's own gzread instead.
+//
+// zlib.h makes gzgetc a macro that serves a byte straight out of zlib's buffer
+// and only calls the function when that buffer is empty -- which, on a file the
+// shim reads, it always is. The definition here therefore has to shed the macro
+// first, exactly as zlib's own gzread.c does.
+#undef gzgetc
+int ZEXPORT gzgetc(gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzgetc != nullptr ? orig_gzgetc(file) : -1;
+  }
+  if (gz->mode != FileMode::READ) {
+    return -1;
+  }
+
+  unsigned char ch = 0;
+  return gzread(file, &ch, 1) == 1 ? static_cast<int>(ch) : -1;
+}
+
+// zlib exports both the macro above and this plain function, for callers that
+// want the symbol rather than the macro.
+int ZEXPORT gzgetc_(gzFile file) { return gzgetc(file); }
+
+int ZEXPORT gzungetc(int c, gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzungetc != nullptr ? orig_gzungetc(c, file) : -1;
+  }
+  // zlib's own refusals: a file that is not being read, a byte that is not one,
+  // and a push onto a byte that has not been read back yet.
+  if (gz->mode != FileMode::READ || c < 0 || gz->pushback >= 0) {
+    return -1;
+  }
+
+  // Only the pushback byte changes. reached_eof records that the file itself
+  // has been read to its end, which is still true and is what stops gzread from
+  // reading it again; gzeof is the one that has to account for this byte, and
+  // it does so by looking at the pushback rather than at that flag.
+  gz->pushback = static_cast<int>(static_cast<unsigned char>(c));
+  return gz->pushback;
+}
+
+char* ZEXPORT gzgets(gzFile file, char* buf, int len) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzgets != nullptr ? orig_gzgets(file, buf, len) : nullptr;
+  }
+  if (buf == nullptr || len < 1 || gz->mode != FileMode::READ) {
+    return nullptr;
+  }
+
+  // Up to a newline, which is kept, or len - 1 bytes, whichever comes first.
+  int copied = 0;
+  while (copied < len - 1) {
+    int c = gzgetc(file);
+    if (c < 0) {
+      break;
+    }
+    buf[copied++] = static_cast<char>(c);
+    if (c == '\n') {
+      break;
+    }
+  }
+  // Nothing read at all means end of file, which zlib reports as no string
+  // rather than an empty one.
+  if (copied == 0) {
+    return nullptr;
+  }
+  buf[copied] = '\0';
+  return buf;
+}
+
+z_size_t ZEXPORT gzfread(voidp buf, z_size_t size, z_size_t nitems,
+                         gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzfread != nullptr ? orig_gzfread(buf, size, nitems, file) : 0;
+  }
+  if (gz->mode != FileMode::READ) {
+    return 0;
+  }
+
+  // zlib's overflow check, and its answer of whole items read.
+  z_size_t len = nitems * size;
+  if (size != 0 && len / size != nitems) {
+    return 0;
+  }
+  z_size_t read_total = 0;
+  while (read_total < len) {
+    z_size_t remaining = len - read_total;
+    unsigned chunk =
+        remaining > UINT_MAX ? UINT_MAX : static_cast<unsigned>(remaining);
+    int ret = gzread(file, static_cast<char*>(buf) + read_total, chunk);
+    if (ret <= 0) {
+      break;
+    }
+    read_total += static_cast<unsigned>(ret);
+  }
+  return size != 0 ? read_total / size : 0;
 }
 
 // gzclose, gzclose_r and gzclose_w share one body: whichever entry point the
@@ -3019,8 +3162,11 @@ int ZEXPORT gzeof(gzFile file) {
   // would silently truncate a "while (!gzeof(file)) gzread(...)" loop, so match
   // gzread's own view of whether more data is available (see the
   // file_data_remaining/data_remaining checks in its loop above).
+  // A byte pushed back by gzungetc counts as data too: it is the next thing a
+  // read returns.
   bool data_remaining = (gz->data_buf_content - gz->data_buf_pos) > 0 ||
-                        (gz->io_buf_content - gz->io_buf_pos) > 0;
+                        (gz->io_buf_content - gz->io_buf_pos) > 0 ||
+                        gz->pushback >= 0;
   return gz->reached_eof && !data_remaining;
 }
 

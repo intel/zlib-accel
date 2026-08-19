@@ -6916,6 +6916,15 @@ TEST_F(UnregisteredStreamTest, GzFunctionsOnUnregisteredFile) {
   EXPECT_EQ(gzputs(nullptr, "a"), -1);
   EXPECT_EQ(gzfwrite(buf.data(), 1, buf.size(), nullptr), 0u);
   EXPECT_EQ(gzprintf(nullptr, "%d", 1), Z_STREAM_ERROR);
+  // zlib.h's gzgetc macro dereferences the handle, so a null one has to reach
+  // the function form: gzgetc_, or the parenthesized name.
+  EXPECT_EQ(gzgetc_(nullptr), -1);
+  EXPECT_EQ((gzgetc)(nullptr), -1);
+  EXPECT_EQ(gzungetc('a', nullptr), -1);
+  EXPECT_EQ(gzgets(nullptr, reinterpret_cast<char*>(buf.data()),
+                   static_cast<int>(buf.size())),
+            nullptr);
+  EXPECT_EQ(gzfread(buf.data(), 1, buf.size(), nullptr), 0u);
 }
 
 // These tests mutate the global path configuration, so restore it in TearDown
@@ -7066,6 +7075,25 @@ static ExecutionPath EnableSomeGzCompressPath(bool zlib_fallback = true) {
 #else
   (void)zlib_fallback;
   SetCompressPath(ZLIB, false, false, false);
+  return ZLIB;
+#endif
+}
+
+// The read counterpart: gzread only takes its own buffered route while an
+// uncompress accelerator is enabled, and the read helpers are only served by
+// the shim for a file on that route.
+static ExecutionPath EnableSomeGzUncompressPath() {
+#if defined(USE_IGZIP)
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/true, false);
+  return IGZIP;
+#elif defined(USE_QAT)
+  SetUncompressPath(QAT, /*zlib_fallback=*/true, false);
+  return QAT;
+#elif defined(USE_IAA)
+  SetUncompressPath(IAA, /*zlib_fallback=*/true, false);
+  return IAA;
+#else
+  SetUncompressPath(ZLIB, false, false);
   return ZLIB;
 #endif
 }
@@ -7549,6 +7577,148 @@ TEST_F(GzipFileTest, WriteHelpersInterleaveWithGzwrite) {
 
   delete[] uncompressed;
   DestroyBlock(input);
+}
+
+// The read helpers all have to come out of the shim's own gzread. Each reads
+// through zlib's gz stream otherwise, which on a file the shim is reading sits
+// at an unrelated offset, so the bytes they return are from the middle of a
+// compressed member. Interleaving them with gzread checks the position they all
+// share.
+TEST_F(GzipFileTest, ReadHelpersServeTheAcceleratedFile) {
+  SetCompressPath(ZLIB, false, false, false);
+  EnableSomeGzUncompressPath();
+
+  // Two lines for gzgets, then a block for gzfread and gzread.
+  const size_t block_length = 16 << 10;
+  char* block = GenerateSeededCompressibleBlock(block_length, /*seed=*/0x11ec);
+  ASSERT_NE(block, nullptr);
+  std::string payload = "first line\nsecond line\n";
+  payload.append(block, block_length);
+  ASSERT_EQ(ZlibCompressGzipFile(payload.data(), payload.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  std::string got;
+
+  // One byte, pushed back, and read again: the same byte both times.
+  int first = gzgetc(fp);
+  ASSERT_EQ(first, payload[0]);
+  ASSERT_EQ(gzungetc(first, fp), first);
+  ASSERT_EQ(gzgetc(fp), first);
+  got.push_back(static_cast<char>(first));
+
+  // The rest of the first line, then the second. The newline is kept.
+  char line[64];
+  ASSERT_EQ(gzgets(fp, line, sizeof(line)), line);
+  EXPECT_STREQ(line, "irst line\n");
+  got.append(line);
+  ASSERT_EQ(gzgets(fp, line, sizeof(line)), line);
+  EXPECT_STREQ(line, "second line\n");
+  got.append(line);
+
+  const z_size_t item_size = 4;
+  const z_size_t item_count = 32;
+  std::vector<char> items(item_size * item_count, 0);
+  ASSERT_EQ(gzfread(items.data(), item_size, item_count, fp), item_count);
+  got.append(items.data(), items.size());
+
+  std::vector<char> rest(payload.size(), 0);
+  int rest_length = gzread(fp, rest.data(), static_cast<unsigned>(rest.size()));
+  ASSERT_GE(rest_length, 0);
+  got.append(rest.data(), static_cast<size_t>(rest_length));
+
+  ASSERT_EQ(got.size(), payload.size());
+  EXPECT_EQ(got, payload);
+  EXPECT_NE(gzeof(fp), 0);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+  DestroyBlock(block);
+}
+
+// gzungetc hands back a byte that need not be one that was read, and may be
+// called before any read, so it cannot be a step back in the shim's buffer. The
+// byte it stores is data like any other: a read returns it first, and the file
+// is no longer at its end.
+TEST_F(GzipFileTest, GzungetcPushesOneByteBack) {
+  SetCompressPath(ZLIB, false, false, false);
+  EnableSomeGzUncompressPath();
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11ed);
+  ASSERT_NE(input, nullptr);
+  ASSERT_EQ(ZlibCompressGzipFile(input, input_length), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  // -1 is not a byte, so it is refused whatever the state of the file.
+  EXPECT_EQ(gzungetc(-1, fp), -1);
+
+  std::vector<char> output(input_length, 0);
+  ASSERT_EQ(gzread(fp, output.data(), static_cast<unsigned>(output.size())),
+            static_cast<int>(input_length));
+  EXPECT_EQ(memcmp(input, output.data(), input_length), 0);
+
+  // One more read to take the file past its end, so gzeof answers yes.
+  char tail = 0;
+  EXPECT_EQ(gzread(fp, &tail, 1), 0);
+  ASSERT_NE(gzeof(fp), 0);
+
+  // A byte pushed back at end of file is readable again, and the file is no
+  // longer at its end.
+  ASSERT_EQ(gzungetc('Q', fp), 'Q');
+  EXPECT_EQ(gzeof(fp), 0);
+  if (GetGzipFileExecutionPath(fp) != ZLIB) {
+    // The shim keeps room for the one byte zlib guarantees, so a second push
+    // before that byte is read is refused -- which zlib permits.
+    EXPECT_EQ(gzungetc('R', fp), -1);
+  }
+  EXPECT_EQ(gzgetc(fp), 'Q');
+  EXPECT_EQ(gzgetc(fp), -1);
+  EXPECT_NE(gzeof(fp), 0);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+  DestroyBlock(input);
+}
+
+// gzgets stops at a newline or at one byte short of the buffer, whichever comes
+// first, and reports end of file as no string rather than an empty one.
+TEST_F(GzipFileTest, GzgetsStopsAtNewlineAndAtBufferSize) {
+  SetCompressPath(ZLIB, false, false, false);
+  EnableSomeGzUncompressPath();
+
+  const std::string payload = "abc\ndefghij\n";
+  ASSERT_EQ(ZlibCompressGzipFile(payload.data(), payload.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  char line[64];
+  // Room for three bytes, and no newline among them, so the line is cut there.
+  ASSERT_EQ(gzgets(fp, line, 4), line);
+  EXPECT_STREQ(line, "abc");
+  // The newline it stopped short of comes back on its own.
+  ASSERT_EQ(gzgets(fp, line, sizeof(line)), line);
+  EXPECT_STREQ(line, "\n");
+  ASSERT_EQ(gzgets(fp, line, 5), line);
+  EXPECT_STREQ(line, "defg");
+  ASSERT_EQ(gzgets(fp, line, sizeof(line)), line);
+  EXPECT_STREQ(line, "hij\n");
+  EXPECT_EQ(gzgets(fp, line, sizeof(line)), nullptr);
+
+  // Arguments zlib refuses outright.
+  EXPECT_EQ(gzgets(fp, line, 0), nullptr);
+  EXPECT_EQ(gzgets(fp, nullptr, sizeof(line)), nullptr);
+  EXPECT_EQ(gzfread(line, 8, std::numeric_limits<z_size_t>::max() / 4, fp), 0u);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
 }
 
 // zlib refuses a gzfwrite whose size * nitems does not fit, and writes nothing.
