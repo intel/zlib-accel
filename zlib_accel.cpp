@@ -8,7 +8,10 @@
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <climits>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -84,6 +87,12 @@ static int (*orig_gzclose_r)(gzFile file);
 static int (*orig_gzclose_w)(gzFile file);
 static int (*orig_gzeof)(gzFile file);
 static int (*orig_gzsetparams)(gzFile file, int level, int strategy);
+static int (*orig_gzflush)(gzFile file, int flush);
+static int (*orig_gzputc)(gzFile file, int c);
+static int (*orig_gzputs)(gzFile file, const char* s);
+static z_size_t (*orig_gzfwrite)(voidpc buf, z_size_t size, z_size_t nitems,
+                                 gzFile file);
+static int (*orig_gzvprintf)(gzFile file, const char* format, va_list va);
 
 // Forward declaration — defined after DeflateStreamSettings,
 // InflateStreamSettings, and GzipFiles class definitions below
@@ -197,6 +206,18 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_gzeof, int (*)(gzFile), "gzeof");
 
   LOAD_SYMBOL(orig_gzsetparams, int (*)(gzFile, int, int), "gzsetparams");
+
+  LOAD_SYMBOL(orig_gzflush, int (*)(gzFile, int), "gzflush");
+
+  LOAD_SYMBOL(orig_gzputc, int (*)(gzFile, int), "gzputc");
+
+  LOAD_SYMBOL(orig_gzputs, int (*)(gzFile, const char*), "gzputs");
+
+  LOAD_SYMBOL(orig_gzfwrite, z_size_t(*)(voidpc, z_size_t, z_size_t, gzFile),
+              "gzfwrite");
+
+  LOAD_SYMBOL(orig_gzvprintf, int (*)(gzFile, const char*, va_list),
+              "gzvprintf");
 
   if (missing_symbol_count > 0) {
     Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__, " ",
@@ -2565,6 +2586,151 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
   }
 
   return Z_OK;
+}
+
+static bool GzIsWriteMode(FileMode mode) {
+  return mode == FileMode::WRITE || mode == FileMode::APPEND;
+}
+
+// Forwarding this to zlib would corrupt the file: zlib's gzflush compresses and
+// flushes its own deflate stream, which has never seen a byte of a file the
+// shim writes, so it emits a gzip header (or a whole empty member) in the
+// middle of the members the shim already wrote. What the caller is owed is that
+// everything written so far is in the file, and every buffer the shim writes
+// out is a complete member, which satisfies that for any flush level zlib
+// defines.
+int ZEXPORT gzflush(gzFile file, int flush) {
+  Log(LogLevel::LOG_INFO, "gzflush Line ", __LINE__, ", file ",
+      static_cast<void*>(file), ", flush ", flush, "\n");
+
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzflush != nullptr ? orig_gzflush(file, flush) : Z_STREAM_ERROR;
+  }
+
+  // zlib's own checks, in zlib's order: a write-mode file and a flush value in
+  // range. Z_NO_FLUSH is in range and asks only that pending input be
+  // compressed, which is what the flush below does.
+  if (!GzIsWriteMode(gz->mode) || flush < 0 || flush > Z_FINISH) {
+    return Z_STREAM_ERROR;
+  }
+
+  if (FlushBufferedWrite(file, gz.get()) != 0) {
+    return Z_ERRNO;
+  }
+  return Z_OK;
+}
+
+// The four helpers below are write-through paths in zlib, so on a file the shim
+// owns they have to reach the shim's gzwrite rather than zlib's stream; a
+// forwarded call writes a second, interleaved member and the file decompresses
+// with the bytes out of order.
+int ZEXPORT gzputc(gzFile file, int c) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzputc != nullptr ? orig_gzputc(file, c) : -1;
+  }
+  if (!GzIsWriteMode(gz->mode)) {
+    return -1;
+  }
+
+  unsigned char ch = static_cast<unsigned char>(c);
+  return gzwrite(file, &ch, 1) == 1 ? static_cast<int>(ch) : -1;
+}
+
+int ZEXPORT gzputs(gzFile file, const char* s) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzputs != nullptr ? orig_gzputs(file, s) : -1;
+  }
+  if (!GzIsWriteMode(gz->mode) || s == nullptr) {
+    return -1;
+  }
+
+  size_t len = strlen(s);
+  // zlib's own limit: the length has to be representable in the int it returns.
+  if (len > static_cast<size_t>(INT_MAX)) {
+    return -1;
+  }
+  int written = gzwrite(file, s, static_cast<unsigned>(len));
+  return written < static_cast<int>(len) ? -1 : written;
+}
+
+z_size_t ZEXPORT gzfwrite(voidpc buf, z_size_t size, z_size_t nitems,
+                          gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzfwrite != nullptr ? orig_gzfwrite(buf, size, nitems, file)
+                                    : 0;
+  }
+  if (!GzIsWriteMode(gz->mode)) {
+    return 0;
+  }
+
+  // zlib's overflow check, and its answer of whole items written.
+  z_size_t len = nitems * size;
+  if (size != 0 && len / size != nitems) {
+    return 0;
+  }
+  z_size_t written = 0;
+  while (written < len) {
+    z_size_t remaining = len - written;
+    unsigned chunk =
+        remaining > UINT_MAX ? UINT_MAX : static_cast<unsigned>(remaining);
+    int ret = gzwrite(file, static_cast<const char*>(buf) + written, chunk);
+    if (ret <= 0) {
+      break;
+    }
+    written += static_cast<unsigned>(ret);
+  }
+  return size != 0 ? written / size : 0;
+}
+
+int ZEXPORTVA gzvprintf(gzFile file, const char* format, va_list va) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || gz->path == ZLIB) {
+    return orig_gzvprintf != nullptr ? orig_gzvprintf(file, format, va)
+                                     : Z_STREAM_ERROR;
+  }
+  if (!GzIsWriteMode(gz->mode) || format == nullptr) {
+    return Z_STREAM_ERROR;
+  }
+
+  // Format here and write the result through gzwrite, rather than flushing and
+  // handing the file to zlib: a handoff would put the rest of the file on the
+  // zlib path for the sake of one formatted string. The first pass only
+  // measures the result, so it needs its own copy of the argument list.
+  va_list va_measure;
+  va_copy(va_measure, va);
+  int len = std::vsnprintf(nullptr, 0, format, va_measure);
+  va_end(va_measure);
+  if (len < 0) {
+    return Z_STREAM_ERROR;
+  }
+  if (len == 0) {
+    return 0;
+  }
+
+  std::string formatted;
+  try {
+    // vsnprintf writes a terminator past the formatted bytes.
+    formatted.resize(static_cast<size_t>(len) + 1);
+  } catch (...) {
+    return Z_MEM_ERROR;
+  }
+  std::vsnprintf(&formatted[0], formatted.size(), format, va);
+  if (gzwrite(file, formatted.data(), static_cast<unsigned>(len)) != len) {
+    return Z_ERRNO;
+  }
+  return len;
+}
+
+int ZEXPORTVA gzprintf(gzFile file, const char* format, ...) {
+  va_list va;
+  va_start(va, format);
+  int ret = gzvprintf(file, format, va);
+  va_end(va);
+  return ret;
 }
 
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
