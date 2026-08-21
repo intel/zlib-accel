@@ -1421,6 +1421,17 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       if (!in_call) {
         SetInflatePath(inflate_settings, ZLIB);
       }
+      // A stream pinned to ZLIB cannot return to IGZIP -- igzip_stream_active
+      // above is path == IGZIP -- so any ISA-L stream it still owns is
+      // unreachable, and goes back here rather than sitting dormant until
+      // inflateEnd(). inflateResetKeep() and inflateSetDictionary() both pin
+      // streams that may own one; whichever applied the pin, this is where the
+      // state is provably out of reach. Gated on the path rather than on
+      // !in_call because the path is what makes it unreachable: a reentrant
+      // call on some other stream says nothing about this one.
+      if (inflate_settings->path == ZLIB) {
+        ReleaseInflateIgzipState(inflate_settings);
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -1451,6 +1462,11 @@ int ZEXPORT inflateEnd(z_streamp strm) {
 // interposable. Acting after the original returns puts this wrapper's state
 // work last, which is what makes the path pin inflateResetKeep() applies
 // specific to a direct call. Same shape as inflateReset2().
+//
+// Ordering is enough because the pin is a field this wrapper overwrites. That
+// is also why the ISA-L state a pin strands is released in inflate(), where the
+// path still says ZLIB, rather than by inflateResetKeep(): a nested free is not
+// something this wrapper could undo.
 int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
@@ -1488,6 +1504,9 @@ int ZEXPORT inflateReset(z_streamp strm) {
 // and returning success. Rejecting the reset outright would be worse: it fails
 // the common history-independent restart, which works, to report the rare case
 // earlier. Documented in the README.
+//
+// Any ISA-L stream the pin puts out of reach is handed back by the next
+// inflate(), not here -- see the release at the zlib fall-through.
 int ZEXPORT inflateResetKeep(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateResetKeep Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
@@ -1499,12 +1518,6 @@ int ZEXPORT inflateResetKeep(z_streamp strm) {
   const int ret = orig_inflateResetKeep(strm);
   if (ret == Z_OK) {
     auto inflate_settings = inflate_stream_settings.Get(strm);
-    // The pin makes any ISA-L stream this entry point inherits unreachable --
-    // inflate() only stays on IGZIP while the path is IGZIP -- so hand it back
-    // rather than leave it allocated for the life of the z_stream. Released
-    // before the reset so the reset does not bother resetting it, and inflate()
-    // builds a new one from a null isal_strm if inflateReset() lifts the pin.
-    ReleaseInflateIgzipState(inflate_settings);
     ResetInflateStreamState(inflate_settings);
     SetInflatePath(inflate_settings, ZLIB);
   }

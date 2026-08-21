@@ -5838,11 +5838,11 @@ static void RunInflateResetKeepClearsStreamEnd(ExecutionPath accel_path) {
 
   ASSERT_EQ(inflateResetKeep(&stream), Z_OK);
   EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
-  // The pin puts the stream out of ISA-L's reach for as long as it holds, so
-  // any ISA-L state the finished stream owned is handed back here rather than
-  // kept dormant until inflateEnd(). Trivially true on QAT and IAA, which never
-  // own one.
-  EXPECT_FALSE(InflateOwnsIgzipState(&stream));
+  // The reset itself releases nothing: what makes ISA-L state unreachable is
+  // the pin, and whether the pin holds is not settled until the next inflate()
+  // -- inflateReset() may lift it first. Trivially false on QAT and IAA, which
+  // never own an ISA-L stream.
+  EXPECT_EQ(InflateOwnsIgzipState(&stream), accel_path == IGZIP);
 
   std::vector<Bytef> again(input_length + 1024);
   stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
@@ -5860,6 +5860,10 @@ static void RunInflateResetKeepClearsStreamEnd(ExecutionPath accel_path) {
   EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
   EXPECT_EQ(stream.total_out, input_length);
   EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+  // Decoding under the pin is what settles it: the stream is on zlib for good
+  // until a reset, so the ISA-L state went back rather than staying dormant
+  // until inflateEnd().
+  EXPECT_FALSE(InflateOwnsIgzipState(&stream));
 
   // A plain reset discards the window, so the stream is offloadable again.
   ASSERT_EQ(inflateReset(&stream), Z_OK);
@@ -5881,8 +5885,8 @@ static void RunInflateResetKeepClearsStreamEnd(ExecutionPath accel_path) {
   EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
   EXPECT_EQ(stream.total_out, input_length);
   EXPECT_EQ(memcmp(third.data(), input, input_length), 0);
-  // Releasing the state above cost nothing: inflate() built a new one from a
-  // null isal_strm as soon as inflateReset() lifted the pin.
+  // The release cost nothing: inflate() built a new state from a null isal_strm
+  // as soon as inflateReset() lifted the pin.
   EXPECT_EQ(InflateOwnsIgzipState(&stream), accel_path == IGZIP);
 
   ASSERT_EQ(inflateEnd(&stream), Z_OK);
@@ -5904,6 +5908,84 @@ TEST_F(TerminalStateRegressionTest, QATInflateResetKeepClearsStreamEnd) {
 #ifdef USE_IAA
 TEST_F(TerminalStateRegressionTest, IAAInflateResetKeepClearsStreamEnd) {
   RunInflateResetKeepClearsStreamEnd(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// inflateResetKeep() followed straight by inflateReset(), with no inflate()
+// between, is the sequence a libz whose internal calls are interposable
+// produces for a plain inflateReset(): zlib's inflateReset() is
+// inflateResetKeep() plus a discarded window, so the shim's own
+// inflateResetKeep() runs first and pins, then the outer wrapper lifts the pin.
+// An application can also just call the two in that order.
+//
+// The ISA-L state has to survive it. Releasing at the pin instead would free
+// the state on every ordinary reset on such a libz -- the outer wrapper can
+// restore the path it overwrote, but not an allocation. IGZIP only: QAT and IAA
+// never own an ISA-L stream, so there would be nothing to observe.
+TEST_F(TerminalStateRegressionTest, IGZIPInflateResetKeepThenResetKeepsState) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11d3);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> uncompressed(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = uncompressed.data();
+  stream.avail_out = static_cast<uInt>(uncompressed.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  ASSERT_TRUE(InflateOwnsIgzipState(&stream));
+
+  ASSERT_EQ(inflateResetKeep(&stream), Z_OK);
+  ASSERT_EQ(inflateReset(&stream), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), UNDEFINED);
+  EXPECT_TRUE(InflateOwnsIgzipState(&stream));
+
+  // And the state that survived is usable: the next stream decodes on IGZIP
+  // rather than being rebuilt or refused.
+  std::vector<Bytef> again(input_length + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = again.data();
+  stream.avail_out = static_cast<uInt>(again.size());
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(again.data(), input, input_length), 0);
+  EXPECT_TRUE(InflateOwnsIgzipState(&stream));
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
 }
 #endif
 
