@@ -5838,6 +5838,11 @@ static void RunInflateResetKeepClearsStreamEnd(ExecutionPath accel_path) {
 
   ASSERT_EQ(inflateResetKeep(&stream), Z_OK);
   EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+  // The pin puts the stream out of ISA-L's reach for as long as it holds, so
+  // any ISA-L state the finished stream owned is handed back here rather than
+  // kept dormant until inflateEnd(). Trivially true on QAT and IAA, which never
+  // own one.
+  EXPECT_FALSE(InflateOwnsIgzipState(&stream));
 
   std::vector<Bytef> again(input_length + 1024);
   stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
@@ -5876,6 +5881,9 @@ static void RunInflateResetKeepClearsStreamEnd(ExecutionPath accel_path) {
   EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
   EXPECT_EQ(stream.total_out, input_length);
   EXPECT_EQ(memcmp(third.data(), input, input_length), 0);
+  // Releasing the state above cost nothing: inflate() built a new one from a
+  // null isal_strm as soon as inflateReset() lifted the pin.
+  EXPECT_EQ(InflateOwnsIgzipState(&stream), accel_path == IGZIP);
 
   ASSERT_EQ(inflateEnd(&stream), Z_OK);
   DestroyBlock(input);

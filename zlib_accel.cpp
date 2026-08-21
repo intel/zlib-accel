@@ -1499,6 +1499,12 @@ int ZEXPORT inflateResetKeep(z_streamp strm) {
   const int ret = orig_inflateResetKeep(strm);
   if (ret == Z_OK) {
     auto inflate_settings = inflate_stream_settings.Get(strm);
+    // The pin makes any ISA-L stream this entry point inherits unreachable --
+    // inflate() only stays on IGZIP while the path is IGZIP -- so hand it back
+    // rather than leave it allocated for the life of the z_stream. Released
+    // before the reset so the reset does not bother resetting it, and inflate()
+    // builds a new one from a null isal_strm if inflateReset() lifts the pin.
+    ReleaseInflateIgzipState(inflate_settings);
     ResetInflateStreamState(inflate_settings);
     SetInflatePath(inflate_settings, ZLIB);
   }
