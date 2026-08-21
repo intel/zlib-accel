@@ -52,6 +52,7 @@ static int (*orig_deflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_deflate)(z_streamp strm, int flush);
 static int (*orig_deflateEnd)(z_streamp strm);
 static int (*orig_deflateReset)(z_streamp strm);
+static int (*orig_deflateResetKeep)(z_streamp strm);
 static int (*orig_deflateParams)(z_streamp strm, int level, int strategy);
 static int (*orig_deflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_inflateInit_)(z_streamp strm, const char* version,
@@ -63,6 +64,8 @@ static int (*orig_inflateSetDictionary)(z_streamp strm, const Bytef* dictionary,
 static int (*orig_inflate)(z_streamp strm, int flush);
 static int (*orig_inflateEnd)(z_streamp strm);
 static int (*orig_inflateReset)(z_streamp strm);
+static int (*orig_inflateResetKeep)(z_streamp strm);
+static int (*orig_inflateReset2)(z_streamp strm, int windowBits);
 static int (*orig_inflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_compress)(Bytef* dest, uLongf* destLen, const Bytef* source,
                             uLong sourceLen);
@@ -131,6 +134,8 @@ static int init_zlib_accel(void) {
 
   LOAD_SYMBOL(orig_deflateReset, int (*)(z_streamp), "deflateReset");
 
+  LOAD_SYMBOL(orig_deflateResetKeep, int (*)(z_streamp), "deflateResetKeep");
+
   LOAD_SYMBOL(orig_deflateParams, int (*)(z_streamp, int, int),
               "deflateParams");
 
@@ -151,6 +156,10 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_inflateEnd, int (*)(z_streamp), "inflateEnd");
 
   LOAD_SYMBOL(orig_inflateReset, int (*)(z_streamp), "inflateReset");
+
+  LOAD_SYMBOL(orig_inflateResetKeep, int (*)(z_streamp), "inflateResetKeep");
+
+  LOAD_SYMBOL(orig_inflateReset2, int (*)(z_streamp, int), "inflateReset2");
 
   LOAD_SYMBOL(orig_inflateCopy, int (*)(z_streamp, z_streamp), "inflateCopy");
 
@@ -256,6 +265,12 @@ struct DeflateSettings {
   int strategy;
   ExecutionPath path = UNDEFINED;
   struct isal_zstream* isal_strm = nullptr;
+  // Set once the shim has reported Z_STREAM_END for this stream. Only an
+  // offloaded completion sets it: an accelerator finishes the stream without
+  // ever feeding zlib's own state, so zlib cannot report the terminal state
+  // afterwards and every later call would be dispatched from scratch. A
+  // ZLIB-path stream is left alone, since zlib tracks this itself.
+  bool stream_end_reached = false;
 };
 
 struct InflateSettings {
@@ -263,6 +278,8 @@ struct InflateSettings {
   int window_bits;
   ExecutionPath path = UNDEFINED;
   struct inflate_state* isal_strm = nullptr;
+  // See DeflateSettings::stream_end_reached.
+  bool stream_end_reached = false;
 };
 
 // isal_strm is a raw pointer, so destroying a settings object does not free the
@@ -328,6 +345,7 @@ class DeflateStreamSettings {
           source.level, source.method, source.window_bits, source.mem_level,
           source.strategy);
       settings->path = source.path;
+      settings->stream_end_reached = source.stream_end_reached;
       map.Set(dest, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR,
@@ -375,6 +393,7 @@ class InflateStreamSettings {
       auto settings = std::make_shared<InflateSettings>(source.window_bits);
       settings->path = source.path;
       settings->isal_strm = isal_clone;
+      settings->stream_end_reached = source.stream_end_reached;
       map.Set(dest, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR,
@@ -411,6 +430,58 @@ static void SetInflatePath(const std::shared_ptr<InflateSettings>& settings,
     return;
   }
   settings->path = new_path;
+}
+
+// Shim-side state work every deflate reset entry point performs. Only the path
+// is cleared. zlib's deflateReset keeps the compression level and strategy,
+// including any set later by deflateParams(), so the recorded level must
+// survive a reset too or path selection would disagree with the level zlib is
+// actually using. The terminal-state flag has to go, though: a reset stream is
+// ready to compress again, and leaving it set would wedge every later deflate()
+// at Z_STREAM_END.
+static void ResetDeflateStreamState(
+    const std::shared_ptr<DeflateSettings>& settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  SetDeflatePath(settings, UNDEFINED);
+  settings->stream_end_reached = false;
+
+#ifdef USE_IGZIP
+  if (settings->isal_strm != nullptr) {
+    // Keeping the recorded level is not sufficient for the ISA-L stream:
+    // isal_deflate_reset() deliberately preserves level and level_buf, and
+    // deflate() only calls InitCompressIGZIP() when isal_strm is null, so a
+    // level that deflateParams() changed since this stream was built would
+    // leave the next stream running at the old ISA-L level. Discard the stream
+    // in that case and let deflate() rebuild it from the current setting; the
+    // common reset, where the level did not change, keeps the stream and its
+    // level_buf allocation. The reverse ordering -- reset first, then
+    // deflateParams() -- is handled in deflateParams().
+    if (CompressLevelChangedIGZIP(settings->isal_strm, settings->level)) {
+      EndCompressIGZIP(settings->isal_strm);
+      settings->isal_strm = nullptr;
+    } else {
+      ResetCompressIGZIP(settings->isal_strm);
+    }
+  }
+#endif
+}
+
+// Same for the inflate side. A reset stream is ready to decode again; leaving
+// the terminal state set would wedge every later inflate() at Z_STREAM_END.
+static void ResetInflateStreamState(
+    const std::shared_ptr<InflateSettings>& settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  SetInflatePath(settings, UNDEFINED);
+  settings->stream_end_reached = false;
+  if (settings->isal_strm != nullptr) {
+#ifdef USE_IGZIP
+    ResetUncompressIGZIP(settings->isal_strm);
+#endif
+  }
 }
 
 // zlib's Z_NO_COMPRESSION (0) asks for stored, uncompressed deflate blocks. No
@@ -587,6 +658,64 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       deflate_settings->window_bits, ", total_in ", strm->total_in,
       ", total_out ", strm->total_out, ", adler ", strm->adler, "\n");
 
+  // A stream an accelerator already finished has to be refused here, above both
+  // path selection and the zlib fall-through: the offload never fed zlib's own
+  // deflate state, so orig_deflate() would see a stream still at INIT_STATE and
+  // emit a second header (or a whole empty stream) after a finished one. Reply
+  // with what zlib replies once its own state is at FINISH_STATE.
+  if (deflate_settings->stream_end_reached) {
+    // Same tests in the same order as zlib's deflate(), which validates its
+    // parameters before reporting the terminal state. strm->msg follows zlib
+    // too: it is only written where zlib rejects through ERR_RETURN, and the
+    // strings are the ones that macro would pick (z_errmsg[] in zutil.c).
+    int ret = Z_STREAM_END;
+    if (flush > Z_BLOCK || flush < 0) {
+      // The flush range is zlib's first check and a plain return, not an
+      // ERR_RETURN, so an out-of-range value leaves msg as the caller left it.
+      ret = Z_STREAM_ERROR;
+    } else if (strm->next_out == nullptr ||
+               (strm->avail_in != 0 && strm->next_in == nullptr) ||
+               flush != Z_FINISH) {
+      // Once the stream is finished no flush but Z_FINISH is accepted. zlib
+      // rejects all three of these in one ERR_RETURN.
+      strm->msg = const_cast<char*>("stream error");
+      ret = Z_STREAM_ERROR;
+    } else if (strm->avail_out == 0) {
+      strm->msg = const_cast<char*>("buffer error");
+      ret = Z_BUF_ERROR;
+    } else if (strm->avail_in != 0) {
+      // "user must not provide more input after the first FINISH".
+      strm->msg = const_cast<char*>("buffer error");
+      ret = Z_BUF_ERROR;
+    }
+    Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm), ", stream already ended, return code ", ret,
+        "\n");
+    INCREMENT_STAT(DEFLATE_STREAM_END_COUNT);
+    INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
+    return ret;
+  }
+
+  // Everything below reads next_in and next_out -- the offload hands both to a
+  // vendor library -- while zlib rejects a null pointer with data behind it
+  // before it looks at anything else. Delegate such a call so zlib produces
+  // that rejection instead of the shim dereferencing what zlib is about to
+  // refuse. zlib's parameter checks touch no stream state, so a delegated call
+  // is indistinguishable from an unshimmed one.
+  // Counted like the fall-through below rather than like an early exit: the
+  // call did reach zlib, and its rejection is an error the statistics should
+  // show.
+  if (strm->next_out == nullptr ||
+      (strm->avail_in != 0 && strm->next_in == nullptr)) {
+    if (orig_deflate == nullptr) {
+      return Z_VERSION_ERROR;
+    }
+    const int ret = orig_deflate(strm, flush);
+    INCREMENT_STAT(DEFLATE_ZLIB_COUNT);
+    INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
+    return ret;
+  }
+
   // The compression level is a property of the whole stream, not of one call,
   // so decide it here rather than discovering it when InitCompressIGZIP()
   // rejects the level. Pinning the path (rather than only clearing
@@ -756,6 +885,13 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
         }
       }
 
+      // Remember the completion the accelerator just reported: zlib's own
+      // deflate state was never fed, so nothing else records that this stream
+      // is finished.
+      if (ret == Z_STREAM_END) {
+        deflate_settings->stream_end_reached = true;
+      }
+
       Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
           static_cast<void*>(strm), ", accelerator return code ", ret,
           ", bytes_in ", input_len, ", bytes_out ", output_len, ", avail_in ",
@@ -801,41 +937,47 @@ int ZEXPORT deflateEnd(z_streamp strm) {
   return orig_deflateEnd != nullptr ? orig_deflateEnd(strm) : Z_VERSION_ERROR;
 }
 
+// zlib builds deflateReset() on top of deflateResetKeep(), so on a libz whose
+// internal calls are interposable this wrapper runs nested inside
+// orig_deflateReset(). Acting only after the original returns keeps the outer
+// wrapper's state work last, so the two orderings agree. Same shape as
+// deflateParams() and inflateReset2().
 int ZEXPORT deflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "deflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
-  auto deflate_settings = deflate_stream_settings.Get(strm);
-  if (deflate_settings != nullptr) {
-    // Only the path is cleared. zlib's deflateReset keeps the compression level
-    // and strategy, including any set later by deflateParams(), so the recorded
-    // level must survive a reset too or path selection would disagree with the
-    // level zlib is actually using.
-    SetDeflatePath(deflate_settings, UNDEFINED);
 
-#ifdef USE_IGZIP
-    if (deflate_settings->isal_strm != nullptr) {
-      // Keeping the recorded level is not sufficient for the ISA-L stream:
-      // isal_deflate_reset() deliberately preserves level and level_buf, and
-      // deflate() only calls InitCompressIGZIP() when isal_strm is null, so a
-      // level that deflateParams() changed since this stream was built would
-      // leave the next stream running at the old ISA-L level. Discard the
-      // stream in that case and let deflate() rebuild it from the current
-      // setting; the common reset, where the level did not change, keeps the
-      // stream and its level_buf allocation. The reverse ordering -- reset
-      // first, then deflateParams() -- is handled in deflateParams().
-      if (CompressLevelChangedIGZIP(deflate_settings->isal_strm,
-                                    deflate_settings->level)) {
-        EndCompressIGZIP(deflate_settings->isal_strm);
-        deflate_settings->isal_strm = nullptr;
-      } else {
-        ResetCompressIGZIP(deflate_settings->isal_strm);
-      }
-    }
-#endif
+  if (orig_deflateReset == nullptr) {
+    return Z_VERSION_ERROR;
   }
 
-  return orig_deflateReset != nullptr ? orig_deflateReset(strm)
-                                      : Z_VERSION_ERROR;
+  const int ret = orig_deflateReset(strm);
+  if (ret == Z_OK) {
+    ResetDeflateStreamState(deflate_stream_settings.Get(strm));
+  }
+  return ret;
+}
+
+// The other entry point that restarts a finished stream: deflateReset() is
+// deflateResetKeep() plus lm_init(), so an application can reach it directly
+// and a terminal state left set here would wedge the stream at Z_STREAM_END.
+// What it keeps -- the LZ77 window and hash -- only affects how zlib would
+// encode the next stream, not whether the shim may offload it: an offloaded
+// stream emits no back-references into the previous one, which is a
+// self-contained stream any decoder accepts. So no path pin here, unlike
+// inflateResetKeep().
+int ZEXPORT deflateResetKeep(z_streamp strm) {
+  Log(LogLevel::LOG_INFO, "deflateResetKeep Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), "\n");
+
+  if (orig_deflateResetKeep == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_deflateResetKeep(strm);
+  if (ret == Z_OK) {
+    ResetDeflateStreamState(deflate_stream_settings.Get(strm));
+  }
+  return ret;
 }
 
 int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
@@ -844,15 +986,19 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
 
   auto deflate_settings = deflate_stream_settings.Get(source);
 
-  // Refuse while ISA-L owns the source stream. zlib's copy duplicates only the
-  // zlib deflate state, which on an offloaded stream has never been fed, and
-  // ISA-L's state cannot be duplicated alongside it: isal_zstream::level_buf is
-  // cast to a private struct holding pointers into its own allocation, so a
-  // byte copy would leave both streams writing into one pending block. Draining
-  // that block first is no help -- those bytes belong to the prefix the two
-  // streams share, and deflateCopy() cannot hand bytes back to the caller.
-  // Failing before orig_deflateCopy leaves dest as the caller passed it, the
-  // same shape as deflateSetDictionary()'s mid-stream rejection.
+  // Refuse while ISA-L owns the source stream and has not finished it. A
+  // finished stream is copyable: ISA-L is at ZSTATE_END with all output
+  // delivered, so there is no state left to duplicate, and the terminal state
+  // the copy inherits answers every deflate() on it -- the same handling QAT
+  // and IAA already get. zlib's copy duplicates only the zlib deflate state,
+  // which on an offloaded stream has never been fed, and ISA-L's state cannot
+  // be duplicated alongside it: isal_zstream::level_buf is cast to a private
+  // struct holding pointers into its own allocation, so a byte copy would leave
+  // both streams writing into one pending block. Draining that block first is
+  // no help -- those bytes belong to the prefix the two streams share, and
+  // deflateCopy() cannot hand bytes back to the caller. Failing before
+  // orig_deflateCopy leaves dest as the caller passed it, the same shape as
+  // deflateSetDictionary()'s mid-stream rejection.
   //
   // QAT and IAA need no equivalent check: they offload with Z_FINISH only and
   // commit output only on full consumption, so they never leave a stream
@@ -861,7 +1007,8 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
   // job->total_in to available_in -- so it is worth re-checking after a QATzip
   // or QPL upgrade. A plain follow-up deflate() mishandles such a state
   // identically, so the gap would not be specific to copying.
-  if (IgzipOwnsDeflateStream(deflate_settings)) {
+  if (IgzipOwnsDeflateStream(deflate_settings) &&
+      !deflate_settings->stream_end_reached) {
     Log(LogLevel::LOG_INFO, "deflateCopy Line ", __LINE__,
         " rejected, ISA-L holds live state for source stream\n");
     return Z_STREAM_ERROR;
@@ -882,9 +1029,10 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
     // was pinned because the request was never offloadable, which is just as
     // true of the copy, and leaving the copy UNDEFINED would re-run path
     // selection on a stream that is already under way. No ISA-L stream is
-    // carried over: a live one was refused above, and one merely kept across
-    // deflateReset() is freshly reset, so deflate() rebuilds it lazily at the
-    // recorded level.
+    // carried over: a live one was refused above, one merely kept across
+    // deflateReset() is freshly reset, and one belonging to a finished stream
+    // has nothing left to give, so deflate() rebuilds it lazily at the recorded
+    // level after a reset clears the terminal state.
     if (!deflate_stream_settings.SetFromCopy(dest, *deflate_settings)) {
       // Undo zlib's half of the copy rather than hand back a destination the
       // shim does not know about: an untracked copy degrades to orig_deflate on
@@ -973,6 +1121,51 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   PrintDeflateBlockHeader(LogLevel::LOG_INFO, strm->next_in, strm->avail_in,
                           inflate_settings->window_bits);
 
+  // A stream an accelerator already carried to its end has to be refused here,
+  // above path selection and the zlib fall-through both: zlib's own inflate
+  // state never saw the compressed data, so orig_inflate() would decode the
+  // whole stream a second time. zlib reports Z_STREAM_END for every flush once
+  // it is done, consuming no input and writing no output.
+  if (inflate_settings->stream_end_reached) {
+    // zlib's inflate() validates these two before looking at its state, and
+    // unlike deflate() it does not mind avail_out == 0 once it is done. Both
+    // are plain returns there rather than ERR_RETURNs -- inflate() never sets
+    // strm->msg on a parameter rejection -- so msg is left as the caller left
+    // it. Nor is data_type written: no offloaded call can compute it, which the
+    // README documents as a limitation of every path rather than of this gate.
+    int ret = Z_STREAM_END;
+    if (strm->next_out == nullptr ||
+        (strm->next_in == nullptr && strm->avail_in != 0)) {
+      ret = Z_STREAM_ERROR;
+    }
+    Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm), ", stream already ended, return code ", ret,
+        "\n");
+    INCREMENT_STAT(INFLATE_STREAM_END_COUNT);
+    INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
+    return ret;
+  }
+
+  // The zlib-header probe below, the IAA decompressibility probe and the
+  // offload itself all read next_in, and zlib rejects a null pointer with data
+  // behind it before it looks at anything else. Delegate such a call rather
+  // than dereferencing what zlib is about to refuse; its parameter checks touch
+  // no stream state, so a delegated call is indistinguishable from an unshimmed
+  // one. This also covers a null next_out, which the IGZIP drain below would
+  // otherwise hand to ISA-L.
+  // Counted like the fall-through below rather than like an early exit, for the
+  // same reason as in deflate().
+  if (strm->next_out == nullptr ||
+      (strm->next_in == nullptr && strm->avail_in != 0)) {
+    if (orig_inflate == nullptr) {
+      return Z_VERSION_ERROR;
+    }
+    const int ret = orig_inflate(strm, flush);
+    INCREMENT_STAT(INFLATE_ZLIB_COUNT);
+    INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
+    return ret;
+  }
+
   int ret = 1;
   bool end_of_stream = true;
   bool iaa_available = false;
@@ -994,6 +1187,15 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     in_call = true;
     IGZIPHandleActiveStreamNoInput(strm, inflate_settings->isal_strm, &ret);
     in_call = false;
+    // Second site where inflate() reports a completion, so it records the
+    // terminal state too. Redundant on its own -- ISA-L's inflate_state stays
+    // in ISAL_BLOCK_FINISH and answers later calls the way zlib would. It is
+    // recorded anyway so the flag means the same thing on every path: once a
+    // stream has ended, the gate above answers for it rather than any given
+    // backend's state.
+    if (ret == Z_STREAM_END) {
+      inflate_settings->stream_end_reached = true;
+    }
     return ret;
   }
 #endif
@@ -1180,6 +1382,12 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         ret = Z_BUF_ERROR;
       }
 
+      // Remember the completion: zlib's own inflate state never saw this
+      // stream, so nothing else records that it ended.
+      if (ret == Z_STREAM_END) {
+        inflate_settings->stream_end_reached = true;
+      }
+
       Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
           static_cast<void*>(strm), ", accelerator return code ", ret,
           ", bytes_in ", input_len, ", bytes_out ", output_len, ", avail_in ",
@@ -1213,6 +1421,17 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       if (!in_call) {
         SetInflatePath(inflate_settings, ZLIB);
       }
+      // A stream pinned to ZLIB cannot return to IGZIP -- igzip_stream_active
+      // above is path == IGZIP -- so any ISA-L stream it still owns is
+      // unreachable, and goes back here rather than sitting dormant until
+      // inflateEnd(). inflateResetKeep() and inflateSetDictionary() both pin
+      // streams that may own one; whichever applied the pin, this is where the
+      // state is provably out of reach. Gated on the path rather than on
+      // !in_call because the path is what makes it unreachable: a reentrant
+      // call on some other stream says nothing about this one.
+      if (inflate_settings->path == ZLIB) {
+        ReleaseInflateIgzipState(inflate_settings);
+      }
     }
   } else {
     ret = Z_DATA_ERROR;
@@ -1238,21 +1457,122 @@ int ZEXPORT inflateEnd(z_streamp strm) {
   return orig_inflateEnd != nullptr ? orig_inflateEnd(strm) : Z_VERSION_ERROR;
 }
 
+// inflateReset() is inflateResetKeep() plus a discarded window, so this wrapper
+// may run nested inside orig_inflateReset() where libz's internal calls are
+// interposable. Acting after the original returns puts this wrapper's state
+// work last, which is what makes the path pin inflateResetKeep() applies
+// specific to a direct call. Same shape as inflateReset2().
+//
+// Ordering is enough because the pin is a field this wrapper overwrites. That
+// is also why the ISA-L state a pin strands is released in inflate(), where the
+// path still says ZLIB, rather than by inflateResetKeep(): a nested free is not
+// something this wrapper could undo.
 int ZEXPORT inflateReset(z_streamp strm) {
   Log(LogLevel::LOG_INFO, "inflateReset Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), "\n");
+
+  if (orig_inflateReset == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_inflateReset(strm);
+  if (ret == Z_OK) {
+    ResetInflateStreamState(inflate_stream_settings.Get(strm));
+  }
+  return ret;
+}
+
+// inflateResetKeep() restarts the stream but keeps the window zlib has built,
+// so like the other reset entry points it has to clear the terminal state, and
+// unlike them it also has to pin the stream to zlib. Retaining the window is
+// the only reason to call this rather than inflateReset() -- neither frees it
+// -- so a caller that does is saying the next stream may reference the previous
+// stream's bytes. That is a preset dictionary in all but name, and no backend
+// can see that history: an accelerator would decode the lookback from whatever
+// its own window happens to hold. The pin is what inflateSetDictionary() does
+// for the same reason, and inflateReset() lifts it, being the reset that
+// actually discards the history.
+//
+// What the pin cannot do is supply the history. If the previous stream was
+// offloaded, zlib's own window never received it, so a next stream that really
+// does reference those bytes fails in orig_inflate() with Z_DATA_ERROR rather
+// than decoding. That is inherent: the bytes exist only in the output the
+// accelerator already handed the caller, and whether they will be referenced is
+// unknowable while the previous stream is still being decoded. What the pin
+// buys is the failure mode -- a zlib data error on the stream that needs the
+// history, instead of a backend decoding a lookback against an unrelated window
+// and returning success. Rejecting the reset outright would be worse: it fails
+// the common history-independent restart, which works, to report the rare case
+// earlier. Documented in the README.
+//
+// Any ISA-L stream the pin puts out of reach is handed back by the next
+// inflate(), not here -- see the release at the zlib fall-through.
+int ZEXPORT inflateResetKeep(z_streamp strm) {
+  Log(LogLevel::LOG_INFO, "inflateResetKeep Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), "\n");
+
+  if (orig_inflateResetKeep == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_inflateResetKeep(strm);
+  if (ret == Z_OK) {
+    auto inflate_settings = inflate_stream_settings.Get(strm);
+    ResetInflateStreamState(inflate_settings);
+    SetInflatePath(inflate_settings, ZLIB);
+  }
+  return ret;
+}
+
+// inflateReset2() is the only zlib entry point that changes windowBits on a
+// live stream, so it is the only one that can restart a finished stream without
+// going through inflateReset(). It has to be intercepted for two reasons: the
+// recorded window_bits would otherwise go stale and path selection would keep
+// deciding on the format the stream was initialized with, and a stream left
+// marked as ended would keep returning Z_STREAM_END forever.
+//
+// zlib validates windowBits itself and leaves the stream untouched when it is
+// invalid, so mirror deflateParams() and only act once the original reports
+// success.
+int ZEXPORT inflateReset2(z_streamp strm, int windowBits) {
+  Log(LogLevel::LOG_INFO, "inflateReset2 Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), ", window_bits ", windowBits, "\n");
+
+  if (orig_inflateReset2 == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  int ret = orig_inflateReset2(strm, windowBits);
+  if (ret != Z_OK) {
+    return ret;
+  }
+
   auto inflate_settings = inflate_stream_settings.Get(strm);
   if (inflate_settings != nullptr) {
-    SetInflatePath(inflate_settings, UNDEFINED);
+    ResetInflateStreamState(inflate_settings);
+    inflate_settings->window_bits = windowBits;
+
     if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
-      ResetUncompressIGZIP(inflate_settings->isal_strm);
+      // isal_inflate_reset() deliberately preserves crc_flag and hist_bits, and
+      // inflate() only builds a new ISA-L stream when isal_strm is null, so a
+      // window or format change has to discard the stream rather than reset it
+      // -- otherwise the next call decodes the new format with the old
+      // crc_flag. The common case, where only the terminal state and path need
+      // clearing, keeps the stream. Same shape as deflateReset()'s handling of
+      // a level change.
+      if (UncompressWindowChangedIGZIP(inflate_settings->isal_strm,
+                                       windowBits)) {
+        EndUncompressIGZIP(inflate_settings->isal_strm);
+        inflate_settings->isal_strm = nullptr;
+      } else {
+        ResetUncompressIGZIP(inflate_settings->isal_strm);
+      }
 #endif
     }
   }
 
-  return orig_inflateReset != nullptr ? orig_inflateReset(strm)
-                                      : Z_VERSION_ERROR;
+  return ret;
 }
 
 int ZEXPORT inflateCopy(z_streamp dest, z_streamp source) {

@@ -123,7 +123,7 @@ inline void PrintDeflateBlockHeader(LogLevel level, uint8_t* data, uint32_t len,
 
   CompressedFormat format = GetCompressedFormat(window_bits);
   uint32_t header_length = GetHeaderLength(format);
-  if (len >= (header_length + 1)) {
+  if (data != nullptr && len >= (header_length + 1)) {
     Log(level, "Deflate block header bfinal = ",
         static_cast<int>(data[header_length] & 0b00000001),
         ", btype = ", static_cast<int>((data[header_length] & 0b00000110) >> 1),

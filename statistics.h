@@ -10,6 +10,10 @@
 
 #define VISIBLE_FOR_TESTING __attribute__((visibility("default")))
 
+// *_STREAM_END_COUNT counts the calls answered from the terminal state a stream
+// reached earlier, which no engine executes. Without it DEFLATE_COUNT and
+// INFLATE_COUNT would no longer be the sum of their per-engine counters. Keep
+// this enum and stat_names in statistics.cpp index-parallel.
 enum class Statistic : size_t {
   DEFLATE_COUNT = 0,
   DEFLATE_ERROR_COUNT,
@@ -20,6 +24,7 @@ enum class Statistic : size_t {
   DEFLATE_IGZIP_COUNT,
   DEFLATE_IGZIP_ERROR_COUNT,
   DEFLATE_ZLIB_COUNT,
+  DEFLATE_STREAM_END_COUNT,
   INFLATE_COUNT,
   INFLATE_ERROR_COUNT,
   INFLATE_QAT_COUNT,
@@ -29,6 +34,7 @@ enum class Statistic : size_t {
   INFLATE_IGZIP_COUNT,
   INFLATE_IGZIP_ERROR_COUNT,
   INFLATE_ZLIB_COUNT,
+  INFLATE_STREAM_END_COUNT,
   STATS_COUNT
 };
 
