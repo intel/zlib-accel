@@ -5932,6 +5932,13 @@ static void RunInflateResetKeepHistoryDependentStreamFails(
     ExecutionPath accel_path) {
   SetCompressPath(ZLIB, /*zlib_fallback=*/false, false, false);
   SetUncompressPath(ZLIB, /*zlib_fallback=*/false, false);
+  // The whole construction is a preset dictionary, so it needs the option that
+  // makes deflateSetDictionary a no-op turned off. It comes from the config
+  // file rather than from the path helpers, so a host that sets it would
+  // otherwise get a self-contained second stream and no history dependence at
+  // all.
+  const uint32_t saved_ignore_dictionary = GetConfig(IGNORE_ZLIB_DICTIONARY);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
 
   const size_t input_length = 64 * 1024;
   const size_t tail_length = 8 * 1024;
@@ -5975,6 +5982,8 @@ static void RunInflateResetKeepHistoryDependentStreamFails(
   ASSERT_EQ(deflate(&second_stream, Z_FINISH), Z_STREAM_END);
   second.resize(second_stream.total_out);
   ASSERT_EQ(deflateEnd(&second_stream), Z_OK);
+  // Nothing below sets a dictionary, and this is ahead of every early exit.
+  SetConfig(IGNORE_ZLIB_DICTIONARY, saved_ignore_dictionary);
 
   std::vector<Bytef> out(input_length + 1024);
 
@@ -6265,6 +6274,147 @@ TEST_F(TerminalStateRegressionTest,
 }
 #endif  // USE_IGZIP
 
+// How an application actually reaches a post-Z_STREAM_END state: several
+// members concatenated in one buffer, decoded on one z_stream with inflateReset
+// between them. The rows above cover what the gate answers; this covers what it
+// must not answer. The terminal flag is sticky by design, so a reset that
+// failed to clear it -- or a gate placed above the reset entry points -- would
+// leave every member after the first answered from the terminal state instead
+// of decoded, and the stream would report success while returning nothing.
+//
+// Each member is fed as one call over the remaining bytes rather than as its
+// own exact byte range, so what advances next_in between members is the decode
+// itself, the way a caller reading from a stream would have it. Except on IAA:
+// that path reports the whole buffer consumed on a stream that ends before the
+// end of its input (the standing TODO in UncompressIAA -- QPL's consumed count
+// is not usable at end of stream), so next_in cannot locate the next member
+// there and each member is fed its exact range instead. What is under test
+// either way is that the reset clears the terminal state.
+static void RunConcatenatedMembersDecodeOverReset(ExecutionPath accel_path,
+                                                  int window_bits,
+                                                  uint32_t seed) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+  const bool feed_exact_ranges = (accel_path == IAA);
+
+  const size_t member_length = 32 * 1024;
+  const int member_count = 3;
+  std::vector<char*> members;
+  std::vector<size_t> member_sizes;
+  std::string concatenated;
+  for (int i = 0; i < member_count; i++) {
+    // Compressed by the same backend that will decode it, so the stream is one
+    // it accepts -- the same reasoning as the inflate rows above.
+    char* member = GenerateSeededCompressibleBlock(member_length, seed + i);
+    ASSERT_NE(member, nullptr);
+    members.push_back(member);
+
+    std::string compressed;
+    size_t output_upper_bound = 0;
+    ExecutionPath compress_path = UNDEFINED;
+    ASSERT_EQ(ZlibCompress(member, member_length, &compressed, window_bits,
+                           Z_FINISH, &output_upper_bound, &compress_path),
+              Z_STREAM_END);
+    member_sizes.push_back(compressed.size());
+    concatenated += compressed;
+  }
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, window_bits), Z_OK);
+
+  Bytef* next = reinterpret_cast<Bytef*>(&concatenated[0]);
+  size_t remaining = concatenated.size();
+  std::vector<Bytef> decoded(member_length + 1024);
+  for (int i = 0; i < member_count; i++) {
+    if (i > 0) {
+      // The reset that clears the terminal state. Without it the calls below
+      // are answered by the gate and nothing is decoded.
+      ASSERT_EQ(inflateReset(&stream), Z_OK);
+    }
+    stream.next_in = next;
+    stream.avail_in =
+        static_cast<uInt>(feed_exact_ranges ? member_sizes[i] : remaining);
+    stream.next_out = decoded.data();
+    stream.avail_out = static_cast<uInt>(decoded.size());
+    const uLong total_out_before = stream.total_out;
+
+    int ret = Z_OK;
+    for (int guard = 0; guard < 128; guard++) {
+      ret = inflate(&stream, Z_NO_FLUSH);
+      ASSERT_NE(ret, Z_DATA_ERROR) << "member " << i;
+      if (ret == Z_STREAM_END) {
+        break;
+      }
+    }
+    ASSERT_EQ(ret, Z_STREAM_END) << "member " << i;
+    EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path) << "member " << i;
+    // One member per decode: a call that ran past the member boundary would
+    // leave the members after it undecodable, and zlib stops there too.
+    EXPECT_EQ(stream.total_out - total_out_before, member_length)
+        << "member " << i;
+    EXPECT_EQ(memcmp(decoded.data(), members[i], member_length), 0)
+        << "member " << i;
+
+    if (feed_exact_ranges) {
+      next += member_sizes[i];
+      remaining -= member_sizes[i];
+    } else {
+      next = stream.next_in;
+      remaining = stream.avail_in;
+    }
+  }
+  EXPECT_EQ(remaining, 0u);
+
+  // And the last member's terminal state is still reported, the concatenation
+  // having changed nothing about the stream the gate sees.
+  std::vector<Bytef> spare(4096);
+  CheckInflatePostEndRows(&stream, concatenated, spare.data(), spare.size());
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  for (char* member : members) {
+    DestroyBlock(member);
+  }
+}
+
+#ifdef USE_IGZIP
+TEST_F(TerminalStateRegressionTest, IGZIPConcatenatedZlibMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(IGZIP, 15, 0x11e5);
+}
+
+TEST_F(TerminalStateRegressionTest, IGZIPConcatenatedGzipMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(IGZIP, 31, 0x11e8);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(TerminalStateRegressionTest, QATConcatenatedZlibMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(QAT, 15, 0x11eb);
+}
+
+TEST_F(TerminalStateRegressionTest, QATConcatenatedGzipMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(QAT, 31, 0x11ee);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(TerminalStateRegressionTest, IAAConcatenatedZlibMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(IAA, 15, 0x11f1);
+}
+
+TEST_F(TerminalStateRegressionTest, IAAConcatenatedGzipMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(IAA, 31, 0x11f4);
+}
+#endif
+
+TEST_F(TerminalStateRegressionTest, ZlibPathConcatenatedZlibMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(ZLIB, 15, 0x11f7);
+}
+
+TEST_F(TerminalStateRegressionTest, ZlibPathConcatenatedGzipMembersDecode) {
+  RunConcatenatedMembersDecodeOverReset(ZLIB, 31, 0x11fa);
+}
+
 // The parity guard: on a stream that never left zlib, every row above is
 // answered by zlib itself. It passes both before and after this change, which
 // is the point -- it is what makes the accelerator rows meaningful, and it
@@ -6333,25 +6483,48 @@ TEST_F(TerminalStateRegressionTest, ZlibPathPostEndIsUnchanged) {
 // zlib-header FDICT probe, the IAA decompressibility probe, and the offload
 // itself -- all of which run before zlib gets to reject the pointer. Every row
 // has to come back with zlib's Z_STREAM_ERROR and no bytes moved.
+// Each row varies exactly one pointer: the null-next_out row keeps the input
+// side valid rather than zeroing it too, so a failure names the pointer that
+// caused it. Delegating these to zlib is also what makes msg match the
+// terminal-state gate on the same pointers -- deflate() sets "stream error"
+// through ERR_RETURN where inflate() leaves msg untouched, on a live stream and
+// a finished one alike.
 static void CheckNullPointersRejected(z_streamp stream, bool is_deflate,
                                       Bytef* buffer, size_t buffer_length,
                                       int flush) {
   const uLong total_in_before = stream->total_in;
   const uLong total_out_before = stream->total_out;
+  const uInt length = static_cast<uInt>(buffer_length);
 
-  for (int row = 0; row < 2; row++) {
-    const bool null_next_in = (row == 0);
-    stream->next_in = null_next_in ? nullptr : buffer;
-    stream->avail_in = null_next_in ? static_cast<uInt>(buffer_length) : 0;
-    stream->next_out = null_next_in ? buffer : nullptr;
-    stream->avail_out = null_next_in ? static_cast<uInt>(buffer_length) : 0;
+  struct NullPointerRow {
+    const char* label;
+    Bytef* next_in;
+    uInt avail_in;
+    Bytef* next_out;
+    uInt avail_out;
+  };
+  const NullPointerRow rows[] = {
+      {"next_in", nullptr, length, buffer, length},
+      {"next_out", buffer, length, nullptr, length},
+  };
+
+  for (const NullPointerRow& row : rows) {
+    stream->next_in = row.next_in;
+    stream->avail_in = row.avail_in;
+    stream->next_out = row.next_out;
+    stream->avail_out = row.avail_out;
+    stream->msg = const_cast<char*>(kMsgSentinel);
 
     const int ret =
         is_deflate ? deflate(stream, flush) : inflate(stream, flush);
-    EXPECT_EQ(ret, Z_STREAM_ERROR) << (null_next_in ? "next_in" : "next_out");
-    EXPECT_EQ(stream->total_in, total_in_before);
-    EXPECT_EQ(stream->total_out, total_out_before);
+    EXPECT_EQ(ret, Z_STREAM_ERROR) << row.label;
+    EXPECT_EQ(stream->total_in, total_in_before) << row.label;
+    EXPECT_EQ(stream->total_out, total_out_before) << row.label;
+    EXPECT_STREQ(stream->msg, is_deflate ? "stream error" : kMsgSentinel)
+        << row.label;
   }
+
+  stream->msg = nullptr;
 }
 
 // log_level is a runtime config, so raising it is what exercises the
