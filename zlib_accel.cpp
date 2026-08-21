@@ -665,13 +665,19 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // with what zlib replies once its own state is at FINISH_STATE.
   if (deflate_settings->stream_end_reached) {
     // Same tests in the same order as zlib's deflate(), which validates its
-    // parameters before reporting the terminal state, and the same msg strings
-    // it would set (z_errmsg[] in zutil.c).
+    // parameters before reporting the terminal state. strm->msg follows zlib
+    // too: it is only written where zlib rejects through ERR_RETURN, and the
+    // strings are the ones that macro would pick (z_errmsg[] in zutil.c).
     int ret = Z_STREAM_END;
-    if (flush != Z_FINISH || strm->next_out == nullptr ||
-        (strm->avail_in != 0 && strm->next_in == nullptr)) {
-      // Once the stream is finished no flush but Z_FINISH is accepted, and an
-      // out-of-range flush value is rejected here as well.
+    if (flush > Z_BLOCK || flush < 0) {
+      // The flush range is zlib's first check and a plain return, not an
+      // ERR_RETURN, so an out-of-range value leaves msg as the caller left it.
+      ret = Z_STREAM_ERROR;
+    } else if (strm->next_out == nullptr ||
+               (strm->avail_in != 0 && strm->next_in == nullptr) ||
+               flush != Z_FINISH) {
+      // Once the stream is finished no flush but Z_FINISH is accepted. zlib
+      // rejects all three of these in one ERR_RETURN.
       strm->msg = const_cast<char*>("stream error");
       ret = Z_STREAM_ERROR;
     } else if (strm->avail_out == 0) {
@@ -1121,11 +1127,14 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // it is done, consuming no input and writing no output.
   if (inflate_settings->stream_end_reached) {
     // zlib's inflate() validates these two before looking at its state, and
-    // unlike deflate() it does not mind avail_out == 0 once it is done.
+    // unlike deflate() it does not mind avail_out == 0 once it is done. Both
+    // are plain returns there rather than ERR_RETURNs -- inflate() never sets
+    // strm->msg on a parameter rejection -- so msg is left as the caller left
+    // it. Nor is data_type written: no offloaded call can compute it, which the
+    // README documents as a limitation of every path rather than of this gate.
     int ret = Z_STREAM_END;
     if (strm->next_out == nullptr ||
         (strm->next_in == nullptr && strm->avail_in != 0)) {
-      strm->msg = const_cast<char*>("stream error");
       ret = Z_STREAM_ERROR;
     }
     Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",

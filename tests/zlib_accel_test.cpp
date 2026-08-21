@@ -5222,6 +5222,12 @@ class TerminalStateRegressionTest : public ::testing::Test {};
 // inflate side, a null next_out outranks it on both, a null next_in with input
 // outranks the "more input after FINISH" Z_BUF_ERROR, and inflate accepts any
 // flush value where deflate rejects everything but Z_FINISH.
+// strm->msg is part of the same measurement. zlib only writes it where it
+// rejects through ERR_RETURN, so deflate() leaves it alone on the one row it
+// answers from its first parameter check -- the flush range -- as well as on
+// the row it accepts, and inflate() leaves it alone on every row, both of its
+// pointer rejections being plain returns. expected_deflate_msg is null for "not
+// written"; inflate needs no column, having no row that writes it.
 struct PostEndRow {
   const char* label;
   int flush;
@@ -5231,35 +5237,41 @@ struct PostEndRow {
   bool null_next_in;
   int expected_deflate;
   int expected_inflate;
+  const char* expected_deflate_msg;
 };
 
 static const PostEndRow kPostEndRows[] = {
     {"avail_in>0, Z_FINISH", Z_FINISH, true, false, false, false, Z_BUF_ERROR,
-     Z_STREAM_END},
+     Z_STREAM_END, "buffer error"},
     {"avail_in>0, Z_NO_FLUSH", Z_NO_FLUSH, true, false, false, false,
-     Z_STREAM_ERROR, Z_STREAM_END},
+     Z_STREAM_ERROR, Z_STREAM_END, "stream error"},
     {"avail_in=0, Z_FINISH", Z_FINISH, false, false, false, false, Z_STREAM_END,
-     Z_STREAM_END},
+     Z_STREAM_END, nullptr},
     {"avail_in=0, Z_NO_FLUSH", Z_NO_FLUSH, false, false, false, false,
-     Z_STREAM_ERROR, Z_STREAM_END},
+     Z_STREAM_ERROR, Z_STREAM_END, "stream error"},
     {"avail_in=0, Z_SYNC_FLUSH", Z_SYNC_FLUSH, false, false, false, false,
-     Z_STREAM_ERROR, Z_STREAM_END},
+     Z_STREAM_ERROR, Z_STREAM_END, "stream error"},
     {"avail_in=0, Z_BLOCK", Z_BLOCK, false, false, false, false, Z_STREAM_ERROR,
-     Z_STREAM_END},
+     Z_STREAM_END, "stream error"},
     {"avail_in=0, flush out of range", 99, false, false, false, false,
-     Z_STREAM_ERROR, Z_STREAM_END},
+     Z_STREAM_ERROR, Z_STREAM_END, nullptr},
     {"avail_in=0, Z_FINISH, avail_out=0", Z_FINISH, false, true, false, false,
-     Z_BUF_ERROR, Z_STREAM_END},
+     Z_BUF_ERROR, Z_STREAM_END, "buffer error"},
     {"avail_in>0, Z_FINISH, avail_out=0", Z_FINISH, true, true, false, false,
-     Z_BUF_ERROR, Z_STREAM_END},
+     Z_BUF_ERROR, Z_STREAM_END, "buffer error"},
     {"avail_in=0, Z_FINISH, next_out=NULL", Z_FINISH, false, false, true, false,
-     Z_STREAM_ERROR, Z_STREAM_ERROR},
+     Z_STREAM_ERROR, Z_STREAM_ERROR, "stream error"},
     {"avail_in>0, Z_FINISH, next_in=NULL", Z_FINISH, true, false, false, true,
-     Z_STREAM_ERROR, Z_STREAM_ERROR},
+     Z_STREAM_ERROR, Z_STREAM_ERROR, "stream error"},
 };
 
 static const size_t kPostEndRowCount =
     sizeof(kPostEndRows) / sizeof(kPostEndRows[0]);
+
+// Written into strm->msg before each row so "zlib left it alone" is
+// distinguishable from "zlib set it to null". A string literal, so nothing ever
+// frees it -- zlib only ever points msg at z_errmsg[] entries, never owns it.
+static const char* const kMsgSentinel = "zlib-accel test sentinel";
 
 // Every row has to leave the stream exactly as it was, so total_in and
 // total_out are checked alongside the return code: a return code that happens
@@ -5269,6 +5281,8 @@ static void CheckDeflatePostEndRows(z_streamp stream, char* input,
                                     size_t spare_length) {
   const uLong total_in_before = stream->total_in;
   const uLong total_out_before = stream->total_out;
+  // deflate() never writes data_type, on any path, so no row may either.
+  const int data_type_before = stream->data_type;
 
   for (size_t i = 0; i < kPostEndRowCount; i++) {
     const PostEndRow& row = kPostEndRows[i];
@@ -5279,10 +5293,16 @@ static void CheckDeflatePostEndRows(z_streamp stream, char* input,
     stream->next_out = row.null_next_out ? nullptr : spare;
     stream->avail_out =
         row.avail_out_zero ? 0 : static_cast<uInt>(spare_length);
+    stream->msg = const_cast<char*>(kMsgSentinel);
 
     EXPECT_EQ(deflate(stream, row.flush), row.expected_deflate) << row.label;
     EXPECT_EQ(stream->total_in, total_in_before) << row.label;
     EXPECT_EQ(stream->total_out, total_out_before) << row.label;
+    EXPECT_STREQ(stream->msg, row.expected_deflate_msg == nullptr
+                                  ? kMsgSentinel
+                                  : row.expected_deflate_msg)
+        << row.label;
+    EXPECT_EQ(stream->data_type, data_type_before) << row.label;
   }
 
   // Leave the stream holding valid pointers for whatever the caller does next.
@@ -5290,6 +5310,7 @@ static void CheckDeflatePostEndRows(z_streamp stream, char* input,
   stream->avail_in = 0;
   stream->next_out = spare;
   stream->avail_out = static_cast<uInt>(spare_length);
+  stream->msg = nullptr;
 }
 
 static void CheckInflatePostEndRows(z_streamp stream,
@@ -5297,6 +5318,15 @@ static void CheckInflatePostEndRows(z_streamp stream,
                                     size_t spare_length) {
   const uLong total_in_before = stream->total_in;
   const uLong total_out_before = stream->total_out;
+  // One expectation that holds on every path, and the reason it does differs by
+  // path: zlib recomputes data_type on each return, but from a stream it has
+  // already finished it recomputes the same value it left there (or, on the two
+  // rows it rejects, does not reach the recomputation at all), while an
+  // offloaded stream never had the field written and the gate does not start.
+  // Either way the rows must not move it -- and this catches a gate that begins
+  // guessing a value, which would be indistinguishable from a real one to a
+  // caller. See the README on why data_type is left alone when offloading.
+  const int data_type_before = stream->data_type;
   Bytef* compressed_bytes =
       reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
 
@@ -5308,16 +5338,20 @@ static void CheckInflatePostEndRows(z_streamp stream,
     stream->next_out = row.null_next_out ? nullptr : spare;
     stream->avail_out =
         row.avail_out_zero ? 0 : static_cast<uInt>(spare_length);
+    stream->msg = const_cast<char*>(kMsgSentinel);
 
     EXPECT_EQ(inflate(stream, row.flush), row.expected_inflate) << row.label;
     EXPECT_EQ(stream->total_in, total_in_before) << row.label;
     EXPECT_EQ(stream->total_out, total_out_before) << row.label;
+    EXPECT_STREQ(stream->msg, kMsgSentinel) << row.label;
+    EXPECT_EQ(stream->data_type, data_type_before) << row.label;
   }
 
   stream->next_in = compressed_bytes;
   stream->avail_in = 0;
   stream->next_out = spare;
   stream->avail_out = static_cast<uInt>(spare_length);
+  stream->msg = nullptr;
 }
 
 static void RunDeflatePostEndMatchesZlib(ExecutionPath accel_path) {
