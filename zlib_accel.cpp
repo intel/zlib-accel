@@ -691,6 +691,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     Log(LogLevel::LOG_INFO, "deflate Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", stream already ended, return code ", ret,
         "\n");
+    INCREMENT_STAT(DEFLATE_STREAM_END_COUNT);
     INCREMENT_STAT_COND(ret < 0, DEFLATE_ERROR_COUNT);
     return ret;
   }
@@ -1140,6 +1141,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
         static_cast<void*>(strm), ", stream already ended, return code ", ret,
         "\n");
+    INCREMENT_STAT(INFLATE_STREAM_END_COUNT);
     INCREMENT_STAT_COND(ret < 0, INFLATE_ERROR_COUNT);
     return ret;
   }
