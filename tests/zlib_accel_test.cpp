@@ -7755,6 +7755,49 @@ TEST_F(GzipFileTest, GzfwriteRejectsAnOverflowingRequest) {
   DestroyBlock(input);
 }
 
+// A length that does not fit in the int gzwrite and gzread return is refused
+// before either touches the buffer -- the requests below describe two gigabytes
+// the caller does not have. zlib answers 0 and -1 respectively, and gzfwrite
+// and gzfread depend on that being the answer: they cut a larger request into
+// chunks of this size, so a chunk beyond it ends their loop having transferred
+// bytes it could not report.
+TEST_F(GzipFileTest, GzwriteAndGzreadRejectALengthThatDoesNotFitInInt) {
+  EnableSomeGzCompressPath();
+  EnableSomeGzUncompressPath();
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11f1);
+  ASSERT_NE(input, nullptr);
+  const unsigned too_long =
+      static_cast<unsigned>(std::numeric_limits<int>::max()) + 1u;
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+            static_cast<int>(input_length));
+  // The refused call comes after the payload rather than before it: on a file
+  // zlib serves, zlib latches the failure and refuses everything that follows,
+  // so a good call after a refused one is not behavior to assert on either
+  // side. In this order the content check below still covers the refusal
+  // leaving nothing buffered behind it.
+  EXPECT_EQ(gzwrite(fp, input, too_long), 0);
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  std::vector<char> output(input_length, 0);
+  ASSERT_EQ(gzread(fp, output.data(), static_cast<unsigned>(output.size())),
+            static_cast<int>(input_length));
+  EXPECT_EQ(memcmp(input, output.data(), input_length), 0);
+  EXPECT_EQ(gzread(fp, output.data(), too_long), -1);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+  DestroyBlock(input);
+}
+
 class ShardedMapTest : public ::testing::Test {};
 
 TEST_F(ShardedMapTest, BasicSetAndGet) {

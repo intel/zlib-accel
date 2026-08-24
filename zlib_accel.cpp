@@ -2519,6 +2519,15 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
                               configs[USE_QAT_COMPRESS] ||
                               configs[USE_IGZIP_COMPRESS];
   if (gz->path != ZLIB && accelerator_selected) {
+    // zlib's own limit: the length has to be representable in the int this
+    // returns. Refused before anything is buffered, so the next write does not
+    // emit data from a call that reported writing none. A file on the zlib path
+    // is refused by zlib itself instead, which also latches the error gzerror
+    // reports.
+    if (len > static_cast<unsigned>(INT_MAX)) {
+      return 0;
+    }
+
     gz->AllocateBuffers();
     gz->data_buf_size = 256 << 10;
     gz->io_buf_size = 512 << 10;
@@ -2696,8 +2705,14 @@ z_size_t ZEXPORT gzfwrite(voidpc buf, z_size_t size, z_size_t nitems,
   z_size_t written = 0;
   while (written < len) {
     z_size_t remaining = len - written;
-    unsigned chunk =
-        remaining > UINT_MAX ? UINT_MAX : static_cast<unsigned>(remaining);
+    // INT_MAX, not UINT_MAX: gzwrite answers in an int, so a larger chunk it
+    // wrote in full could only report a negative count, which the check below
+    // reads as a failure -- ending the loop with zero items after every byte
+    // had reached the file. zlib refuses such a length outright, for the same
+    // reason.
+    const z_size_t max_chunk = static_cast<z_size_t>(INT_MAX);
+    unsigned chunk = remaining > max_chunk ? static_cast<unsigned>(max_chunk)
+                                           : static_cast<unsigned>(remaining);
     int ret = gzwrite(file, static_cast<const char*>(buf) + written, chunk);
     if (ret <= 0) {
       break;
@@ -2779,6 +2794,12 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
                               configs[USE_QAT_UNCOMPRESS] ||
                               configs[USE_IGZIP_UNCOMPRESS];
   if (gz->path != ZLIB && accelerator_selected) {
+    // zlib's own limit, as in gzwrite: the length has to be representable in
+    // the int this returns, and a file on the zlib path is refused by zlib.
+    if (len > static_cast<unsigned>(INT_MAX)) {
+      return -1;
+    }
+
     gz->AllocateBuffers();
     gz->data_buf_size = 512 << 10;
     gz->io_buf_size = 512 << 10;
@@ -3028,8 +3049,11 @@ z_size_t ZEXPORT gzfread(voidp buf, z_size_t size, z_size_t nitems,
   z_size_t read_total = 0;
   while (read_total < len) {
     z_size_t remaining = len - read_total;
-    unsigned chunk =
-        remaining > UINT_MAX ? UINT_MAX : static_cast<unsigned>(remaining);
+    // INT_MAX, not UINT_MAX, for the same reason as gzfwrite: gzread answers in
+    // an int and refuses anything larger.
+    const z_size_t max_chunk = static_cast<z_size_t>(INT_MAX);
+    unsigned chunk = remaining > max_chunk ? static_cast<unsigned>(max_chunk)
+                                           : static_cast<unsigned>(remaining);
     int ret = gzread(file, static_cast<char*>(buf) + read_total, chunk);
     if (ret <= 0) {
       break;
