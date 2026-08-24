@@ -7640,9 +7640,9 @@ TEST_F(GzipFileTest, ReadHelpersServeTheAcceleratedFile) {
 
 // gzungetc hands back a byte that need not be one that was read, and may be
 // called before any read, so it cannot be a step back in the shim's buffer. The
-// byte it stores is data like any other: a read returns it first, and the file
-// is no longer at its end.
-TEST_F(GzipFileTest, GzungetcPushesOneByteBack) {
+// bytes it stores are data like any other: a read returns them first, and the
+// file is no longer at its end.
+TEST_F(GzipFileTest, GzungetcPushesBytesBack) {
   SetCompressPath(ZLIB, false, false, false);
   EnableSomeGzUncompressPath();
 
@@ -7672,11 +7672,9 @@ TEST_F(GzipFileTest, GzungetcPushesOneByteBack) {
   // longer at its end.
   ASSERT_EQ(gzungetc('Q', fp), 'Q');
   EXPECT_EQ(gzeof(fp), 0);
-  if (GetGzipFileExecutionPath(fp) != ZLIB) {
-    // The shim keeps room for the one byte zlib guarantees, so a second push
-    // before that byte is read is refused -- which zlib permits.
-    EXPECT_EQ(gzungetc('R', fp), -1);
-  }
+  // A second push is accepted, and the two come back in reverse order.
+  ASSERT_EQ(gzungetc('R', fp), 'R');
+  EXPECT_EQ(gzgetc(fp), 'R');
   EXPECT_EQ(gzgetc(fp), 'Q');
   EXPECT_EQ(gzgetc(fp), -1);
   EXPECT_NE(gzeof(fp), 0);
@@ -7752,6 +7750,47 @@ TEST_F(GzipFileTest, GzfwriteRejectsAnOverflowingRequest) {
   EXPECT_EQ(memcmp(input, uncompressed, input_length), 0);
 
   delete[] uncompressed;
+  DestroyBlock(input);
+}
+
+// zlib guarantees a push of at least a buffer's worth of bytes immediately
+// after the file is opened, with nothing read yet, so push-back cannot be
+// bounded at one byte. A caller pushing back a prefix it has peeked at relies
+// on this.
+TEST_F(GzipFileTest, GzungetcAcceptsSeveralPushesBeforeAnyRead) {
+  SetCompressPath(ZLIB, false, false, false);
+  EnableSomeGzUncompressPath();
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11ef);
+  ASSERT_NE(input, nullptr);
+  ASSERT_EQ(ZlibCompressGzipFile(input, input_length), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  ASSERT_EQ(gzungetc('A', fp), 'A');
+  ASSERT_EQ(gzungetc('B', fp), 'B');
+  ASSERT_EQ(gzungetc('C', fp), 'C');
+  EXPECT_EQ(gzeof(fp), 0);
+
+  // One read spanning all three pushes and the start of the file: the pushed
+  // bytes come first, most recent first, and the file's own data follows.
+  char output[8];
+  memset(output, 0, sizeof(output));
+  ASSERT_EQ(gzread(fp, output, 5), 5);
+  EXPECT_EQ(memcmp(output, "CBA", 3), 0);
+  EXPECT_EQ(memcmp(output + 3, input, 2), 0);
+
+  // The pushes displaced nothing: the rest of the file follows those two bytes.
+  std::vector<char> rest(input_length - 2, 0);
+  ASSERT_EQ(gzread(fp, rest.data(), static_cast<unsigned>(rest.size())),
+            static_cast<int>(rest.size()));
+  EXPECT_EQ(memcmp(rest.data(), input + 2, rest.size()), 0);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
   DestroyBlock(input);
 }
 

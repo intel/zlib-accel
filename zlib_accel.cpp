@@ -17,6 +17,7 @@
 #include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "config/config.h"
 #include "logging.h"
@@ -1990,7 +1991,7 @@ struct GzipFile {
     path = UNDEFINED;
     use_zlib_for_decompression = false;
     reached_eof = false;
-    pushback = -1;
+    pushback.clear();
 
     data_buf_pos = 0;
     data_buf_content = 0;
@@ -2034,12 +2035,16 @@ struct GzipFile {
   // later gzsetparams. Reset() keeps it, matching zlib, whose reset paths
   // preserve the level too.
   int level = Z_DEFAULT_COMPRESSION;
-  // A byte handed back by gzungetc, or -1 for none. It cannot be expressed as a
-  // step back in data_buf: the byte pushed need not be the byte read, and there
-  // need not have been a read at all. gzread serves it ahead of its own
-  // buffers. One byte is what zlib guarantees; a second push before a read may
-  // fail, which is what this does.
-  int pushback = -1;
+  // Bytes handed back by gzungetc, most recently pushed last. They cannot be
+  // expressed as a step back in data_buf: the byte pushed need not be the byte
+  // read, and there need not have been a read at all. gzread serves them ahead
+  // of its own buffers, in reverse order of pushing.
+  //
+  // A stack rather than a single byte because zlib guarantees a push of at
+  // least the output buffer size right after the file is opened, and bounding
+  // this at one byte broke callers that rely on that. zlib may refuse a push
+  // once its own buffer is full; nothing requires it to, so this never does.
+  std::vector<unsigned char> pushback;
 
   // For gzwrite
   // data_buf --(compress)--> io_buf --(write)--> file
@@ -2938,18 +2943,27 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
     return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
   }
 
-  // A byte pushed back by gzungetc is the first thing the next read returns;
-  // the rest of the request comes from the file as usual.
-  if (gz->pushback >= 0 && len > 0 && buf != nullptr) {
-    *static_cast<char*>(buf) = static_cast<char>(gz->pushback);
-    gz->pushback = -1;
-    if (len == 1) {
-      return 1;
+  // Bytes pushed back by gzungetc are the first thing the next read returns,
+  // most recent first; the rest of the request comes from the file as usual.
+  //
+  // A length that does not fit in the int this returns is refused further down,
+  // by the shim or by zlib, and reads nothing -- so it must not pop bytes here
+  // either, or a refused read would consume the push-back zlib keeps.
+  if (len <= static_cast<unsigned>(INT_MAX) && !gz->pushback.empty() &&
+      len > 0 && buf != nullptr) {
+    unsigned served = 0;
+    while (served < len && !gz->pushback.empty()) {
+      static_cast<char*>(buf)[served++] =
+          static_cast<char>(gz->pushback.back());
+      gz->pushback.pop_back();
     }
-    int ret =
-        GzreadOwnedFile(file, gz.get(), static_cast<char*>(buf) + 1, len - 1);
-    // The pushed byte reached the caller even if the rest of the read did not.
-    return ret > 0 ? ret + 1 : 1;
+    if (served == len) {
+      return static_cast<int>(served);
+    }
+    int ret = GzreadOwnedFile(file, gz.get(), static_cast<char*>(buf) + served,
+                              len - served);
+    // The pushed bytes reached the caller even if the rest of the read did not.
+    return ret > 0 ? ret + static_cast<int>(served) : static_cast<int>(served);
   }
 
   return GzreadOwnedFile(file, gz.get(), buf, len);
@@ -2987,18 +3001,25 @@ int ZEXPORT gzungetc(int c, gzFile file) {
   if (gz == nullptr || gz->path == ZLIB) {
     return orig_gzungetc != nullptr ? orig_gzungetc(c, file) : -1;
   }
-  // zlib's own refusals: a file that is not being read, a byte that is not one,
-  // and a push onto a byte that has not been read back yet.
-  if (gz->mode != FileMode::READ || c < 0 || gz->pushback >= 0) {
+  // zlib's own refusals: a file that is not being read, and a byte that is not
+  // one.
+  if (gz->mode != FileMode::READ || c < 0) {
     return -1;
   }
 
-  // Only the pushback byte changes. reached_eof records that the file itself
+  // Only the pushback stack changes. reached_eof records that the file itself
   // has been read to its end, which is still true and is what stops gzread from
-  // reading it again; gzeof is the one that has to account for this byte, and
-  // it does so by looking at the pushback rather than at that flag.
-  gz->pushback = static_cast<int>(static_cast<unsigned char>(c));
-  return gz->pushback;
+  // reading it again; gzeof is the one that has to account for these bytes, and
+  // it does so by looking at the stack rather than at that flag.
+  const unsigned char ch = static_cast<unsigned char>(c);
+  try {
+    gz->pushback.push_back(ch);
+  } catch (...) {
+    // An allocation failure must not throw out of an exported C symbol; a
+    // refused push is a return value zlib already defines.
+    return -1;
+  }
+  return static_cast<int>(ch);
 }
 
 char* ZEXPORT gzgets(gzFile file, char* buf, int len) {
@@ -3186,11 +3207,11 @@ int ZEXPORT gzeof(gzFile file) {
   // would silently truncate a "while (!gzeof(file)) gzread(...)" loop, so match
   // gzread's own view of whether more data is available (see the
   // file_data_remaining/data_remaining checks in its loop above).
-  // A byte pushed back by gzungetc counts as data too: it is the next thing a
+  // Bytes pushed back by gzungetc count as data too: they are the next thing a
   // read returns.
   bool data_remaining = (gz->data_buf_content - gz->data_buf_pos) > 0 ||
                         (gz->io_buf_content - gz->io_buf_pos) > 0 ||
-                        gz->pushback >= 0;
+                        !gz->pushback.empty();
   return gz->reached_eof && !data_remaining;
 }
 
