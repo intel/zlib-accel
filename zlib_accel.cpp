@@ -3074,7 +3074,11 @@ char* ZEXPORT gzgets(gzFile file, char* buf, int len) {
     }
   }
   // Nothing read at all means end of file, which zlib reports as no string
-  // rather than an empty one.
+  // rather than an empty one. len == 1 lands here too, and zlib.h's claim that
+  // such a call still terminates the buffer is not what zlib does: it computes
+  // len - 1 bytes to copy, skips the copy loop when that is zero, and returns
+  // NULL because nothing was copied. Follow the implementation, not the
+  // comment.
   if (copied == 0) {
     return nullptr;
   }
