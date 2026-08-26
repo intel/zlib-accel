@@ -3,8 +3,10 @@
 
 #include "../zlib_accel.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -7462,6 +7464,37 @@ TEST_F(GzipFileTest, GzopenRejectsBadModeWithoutTouchingTheFile) {
   EXPECT_EQ(gzopen(missing, "b"), nullptr);
   EXPECT_FALSE(std::filesystem::exists(missing));
   remove(missing);
+}
+
+// gzdopen does no mode validation of its own -- the fd is already open, so
+// there is nothing to protect and it takes zlib's answer. What it must not do
+// is register the NULL that answer can be: an entry keyed by NULL is what every
+// gz* entry point finds when the application passes NULL, in place of the
+// unregistered-file handling.
+TEST_F(GzipFileTest, GzdopenRefusedModeRegistersNothing) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  int fd = open(filename, O_WRONLY | O_CREAT, 0666);
+  ASSERT_GE(fd, 0);
+
+  // Both of zlib's reasons for refusing a mode string: '+' asks for one file
+  // read and written at once, and "b" names no direction at all.
+  EXPECT_EQ(gzdopen(fd, "wb+"), nullptr);
+  EXPECT_EQ(gzdopen(fd, "b"), nullptr);
+
+  // A registered NULL would answer these from that entry's state instead.
+  std::vector<uint8_t> buf(64, 0);
+  EXPECT_EQ(gzwrite(nullptr, buf.data(), static_cast<unsigned>(buf.size())), 0);
+  EXPECT_EQ(gzread(nullptr, buf.data(), static_cast<unsigned>(buf.size())), -1);
+  EXPECT_EQ(gzflush(nullptr, Z_SYNC_FLUSH), Z_STREAM_ERROR);
+  EXPECT_EQ(gzclose(nullptr), Z_STREAM_ERROR);
+
+  // zlib leaves an fd whose mode it refused open, so this is still ours.
+  EXPECT_EQ(close(fd), 0);
+  remove(filename);
 }
 
 // Reads a file back through the shim and leaves it in place, unlike
