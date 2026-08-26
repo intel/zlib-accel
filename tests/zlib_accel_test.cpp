@@ -7214,6 +7214,65 @@ static size_t GzFileSize(const char* filename) {
   return ec ? 0 : static_cast<size_t>(size);
 }
 
+// zlib folds append into its own write mode right after opening the file, which
+// is why its gzclose_w accepts a file opened "ab" and why GzCloseModeMatches
+// has to accept it too. Everything the shared close path does then runs on an
+// appended file: the buffered tail is flushed, the file is truncated back to
+// the size recorded before zlib's own close, and the entry is unregistered. A
+// close that got any of that wrong on this mode would take the members already
+// in the file with it.
+TEST_F(GzipFileTest, GzcloseWClosesAppendedFile) {
+  EnableSomeGzCompressPath();
+  SetUncompressPath(ZLIB, false, false);
+
+  const size_t first_length = 64 << 10;
+  char* first = GenerateSeededCompressibleBlock(first_length, /*seed=*/0x11f2);
+  ASSERT_NE(first, nullptr);
+  // Over data_buf_size (256 KiB), so the append leaves a tail in the shim's
+  // buffer for the close to flush instead of writing all of it from gzwrite.
+  const size_t second_length = 300 << 10;
+  char* second =
+      GenerateSeededCompressibleBlock(second_length, /*seed=*/0x11f3);
+  ASSERT_NE(second, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, first, static_cast<unsigned>(first_length)),
+            static_cast<int>(first_length));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+  const size_t size_after_first = GzFileSize(filename);
+  ASSERT_GT(size_after_first, 0u);
+
+  fp = gzopen(filename, "ab");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, second, static_cast<unsigned>(second_length)),
+            static_cast<int>(second_length));
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+  // Not an ASSERT: the content check below is still worth running, but a zlib
+  // path here means nothing was left buffered and the case proves nothing.
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+#endif
+  EXPECT_EQ(gzclose_w(fp), Z_OK);
+  EXPECT_GT(GzFileSize(filename), size_after_first);
+
+  // The appended members decode after the first one, with nothing lost between.
+  const size_t total_length = first_length + second_length;
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(total_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, total_length);
+  EXPECT_EQ(memcmp(first, uncompressed, first_length), 0);
+  EXPECT_EQ(memcmp(second, uncompressed + first_length, second_length), 0);
+
+  delete[] uncompressed;
+  DestroyBlock(second);
+  DestroyBlock(first);
+}
+
 // Writes the whole payload through the shim and returns the size of the file it
 // produced. set_level >= 0 asks for the level through gzsetparams once the file
 // is open, which is the request the mode string cannot express. 0 on any
