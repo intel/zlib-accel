@@ -2471,6 +2471,10 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 // for more input. The gzwrite loop needs this, and so does every entry point
 // that has to make the bytes written so far visible in the file before it acts
 // (gzclose, gzflush, gzsetparams, and the handoff to zlib in gzvprintf).
+//
+// Failures are distinguishable, because gzflush has to report them in zlib's
+// terms: Z_STREAM_ERROR for the missing-symbol guard below, which never touches
+// errno, and 1 from CompressAndWrite, which fails on the write and does.
 static int FlushBufferedWrite(gzFile file, GzipFile* gz) {
   if (gz->data_buf_content == 0) {
     return 0;
@@ -2482,7 +2486,7 @@ static int FlushBufferedWrite(gzFile file, GzipFile* gz) {
   if (orig_deflate == nullptr || orig_deflateReset == nullptr) {
     Log(LogLevel::LOG_ERROR, "FlushBufferedWrite Line ", __LINE__,
         " a required zlib symbol is unresolved, cannot flush\n");
-    return 1;
+    return Z_STREAM_ERROR;
   }
 
   int ret = CompressAndWrite(file, gz);
@@ -2650,7 +2654,13 @@ int ZEXPORT gzflush(gzFile file, int flush) {
     return Z_STREAM_ERROR;
   }
 
-  if (FlushBufferedWrite(file, gz.get()) != 0) {
+  // Z_ERRNO says the caller can read errno, so it is only right for a failed
+  // write; a flush that could not run at all reports itself.
+  int flush_ret = FlushBufferedWrite(file, gz.get());
+  if (flush_ret == Z_STREAM_ERROR) {
+    return Z_STREAM_ERROR;
+  }
+  if (flush_ret != 0) {
     return Z_ERRNO;
   }
   return Z_OK;
