@@ -7441,6 +7441,47 @@ TEST_F(GzipFileTest, GzsetparamsRejectsReadFile) {
   DestroyBlock(input);
 }
 
+// Everything that flushes the shim's buffer has to report a failed write the
+// way zlib does, as Z_ERRNO -- the code that tells the caller errno describes
+// what happened. /dev/full makes that deterministic: every write to it fails
+// with ENOSPC, so one file exercises all three entry points that flush.
+TEST_F(GzipFileTest, FlushFailureReportsZErrno) {
+#if !defined(USE_IGZIP) && !defined(USE_QAT) && !defined(USE_IAA)
+  GTEST_SKIP() << "no backend compiled in, so the file is pinned to zlib and "
+                  "these calls are zlib's to answer";
+#endif
+  if (access("/dev/full", W_OK) != 0) {
+    GTEST_SKIP() << "/dev/full is not available";
+  }
+  EnableSomeGzCompressPath();
+
+  int fd = open("/dev/full", O_WRONLY);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  // Over data_buf_size, so the buffer fills and gzwrite has to flush it. The
+  // write fails, so it reports having written nothing and the data stays
+  // buffered for the calls below to trip over.
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11f4);
+  ASSERT_NE(input, nullptr);
+  EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)), 0);
+
+  EXPECT_EQ(gzflush(fp, Z_SYNC_FLUSH), Z_ERRNO);
+  // The level has to differ from the one the file was opened with, or there is
+  // nothing to flush for and zlib itself would not flush either.
+  EXPECT_EQ(gzsetparams(fp, 1, Z_DEFAULT_STRATEGY), Z_ERRNO);
+  // Which is the other half: asking for the level the file already has changes
+  // nothing, so it must not flush, and it succeeds even here. That the request
+  // above is still a change proves the failed call recorded nothing.
+  EXPECT_EQ(gzsetparams(fp, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY), Z_OK);
+  EXPECT_EQ(gzclose_w(fp), Z_ERRNO);
+
+  DestroyBlock(input);
+}
+
 // The shim opens the file itself, before zlib ever validates the mode string,
 // so a mode zlib refuses must not reach open(2): O_TRUNC would empty a file
 // plain zlib leaves untouched, and O_CREAT would create one it never creates.

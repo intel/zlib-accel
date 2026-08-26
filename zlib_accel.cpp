@@ -2469,12 +2469,13 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
 
 // Compress and write out everything data_buf holds, leaving the buffer ready
 // for more input. The gzwrite loop needs this, and so does every entry point
-// that has to make the bytes written so far visible in the file before it acts
-// (gzclose, gzflush, gzsetparams, and the handoff to zlib in gzvprintf).
+// that has to make the bytes written so far visible in the file before it acts:
+// gzsetparams, gzflush, and the close family through GzCloseCommon.
 //
-// Failures are distinguishable, because gzflush has to report them in zlib's
-// terms: Z_STREAM_ERROR for the missing-symbol guard below, which never touches
-// errno, and 1 from CompressAndWrite, which fails on the write and does.
+// The two failures are distinguishable, because callers have to report them in
+// zlib's terms: Z_STREAM_ERROR for the missing-symbol guard below, which never
+// touches errno, and 1 from CompressAndWrite, which fails on the write and so
+// leaves an errno the caller can read.
 static int FlushBufferedWrite(gzFile file, GzipFile* gz) {
   if (gz->data_buf_content == 0) {
     return 0;
@@ -2577,6 +2578,10 @@ gzwrite_end:
   return written_bytes;
 }
 
+static bool GzIsWriteMode(FileMode mode) {
+  return mode == FileMode::WRITE || mode == FileMode::APPEND;
+}
+
 // Without interception the level the application asks for here is recorded by
 // zlib and honored by nobody: the shim compresses through its own streams, so
 // subsequent writes keep the level the file was opened with. Same class of
@@ -2594,18 +2599,37 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
     return orig_gzsetparams(file, level, strategy);
   }
 
-  // Forward first: zlib's own checks (write mode, no sticky error, not a
-  // transparent file) decide the return value, and zlib has to record the level
-  // too, since it is the one that compresses if this file is later handed back.
+  // Data still buffered was compressed at the old level, so it has to go out as
+  // a member of its own before the new one takes effect -- and before zlib
+  // records it, because zlib applies a parameter change only once the flush
+  // that precedes it has succeeded. Forwarding first would leave zlib holding
+  // the new level and this file the old one on a flush that fails.
+  //
+  // Both guards are load-bearing. A file zlib refuses must not be flushed, and
+  // the mode is the only refusal reachable here: a transparent or level-0 file
+  // is pinned to ZLIB when it is opened, so it never gets past the check above.
+  // And zlib skips the flush entirely when the request changes nothing, so
+  // without the second guard a no-op call could report a failure zlib does not
+  // have. Only the level is compared, for the reason given below: zlib does not
+  // flush for a strategy it is not going to act on either.
+  if (GzIsWriteMode(gz->mode) && level != gz->level) {
+    // Z_ERRNO is what zlib returns for an error writing the flushed data; a
+    // flush that could not run at all reports itself instead.
+    const int flush_ret = FlushBufferedWrite(file, gz.get());
+    if (flush_ret == Z_STREAM_ERROR) {
+      return Z_STREAM_ERROR;
+    }
+    if (flush_ret != 0) {
+      return Z_ERRNO;
+    }
+  }
+
+  // zlib's own checks (write mode, no sticky error, not a transparent file)
+  // decide the return value, and zlib has to record the level too, since it is
+  // the one that compresses if this file is later handed back.
   const int ret = orig_gzsetparams(file, level, strategy);
   if (ret != Z_OK) {
     return ret;
-  }
-
-  // Data still buffered was written under the old level, so it has to go out as
-  // a member of its own before the new level is recorded.
-  if (FlushBufferedWrite(file, gz.get()) != 0) {
-    return Z_STREAM_ERROR;
   }
 
   gz->level = level;
@@ -2625,10 +2649,6 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
   }
 
   return Z_OK;
-}
-
-static bool GzIsWriteMode(FileMode mode) {
-  return mode == FileMode::WRITE || mode == FileMode::APPEND;
 }
 
 // Forwarding this to zlib would corrupt the file: zlib's gzflush compresses and
@@ -3172,12 +3192,19 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
       truncate_ret = truncate(file_path, file_size);
     }
 
-    if (write_ret != 0) {
+    // Same distinction gzsetparams and gzflush make: Z_ERRNO wherever errno
+    // describes the failure, which is what zlib's own gzclose_w reports when
+    // the flush it does before closing cannot be written. The truncate that
+    // removes the bytes that close appended sets errno too. Only a flush that
+    // could not run at all reports itself, having left errno alone.
+    if (write_ret == Z_STREAM_ERROR) {
       ret = Z_STREAM_ERROR;
+    } else if (write_ret != 0) {
+      ret = Z_ERRNO;
     } else if (close_ret != Z_OK) {
       ret = close_ret;
     } else if (truncate_ret != 0) {
-      ret = Z_STREAM_ERROR;
+      ret = Z_ERRNO;
     }
   } else {
     ret = orig_close(file);
