@@ -2575,8 +2575,17 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
       }
     }
   } else {
-    written_bytes = GzwriteZlibCompress(file, buf, len, gz->path == ZLIB);
-    gz->path = ZLIB;
+    // The pin says zlib owns this file's output, either because the request was
+    // never offloadable or because zlib wrote part of it. A write nobody
+    // performed confers neither, so leave the path alone in that case:
+    // recording it would make the next call read the leftover path as a pin and
+    // write through zlib with use_zlib_compress still off, so two identical
+    // writes would get two different answers.
+    const bool pinned = gz->path == ZLIB;
+    written_bytes = GzwriteZlibCompress(file, buf, len, pinned);
+    if (pinned || configs[USE_ZLIB_COMPRESS]) {
+      gz->path = ZLIB;
+    }
   }
 
 gzwrite_end:

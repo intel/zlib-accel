@@ -7344,6 +7344,38 @@ TEST_F(GzipFileTest, GzopenLevelZeroPinsToZlib) {
   DestroyBlock(input);
 }
 
+// A pin means zlib owns the file's output, and a write that never happened is
+// not a reason to grant one. With every compress engine off, the first gzwrite
+// is refused; if it records the zlib path anyway, the second one reads that
+// leftover path as a pin and writes through zlib with use_zlib_compress still
+// off, so two identical calls get two different answers. Both writes are
+// refused here whatever the build, so this runs against zlib with no backend
+// compiled in rather than skipping.
+TEST_F(GzipFileTest, GzwriteRefusesEveryWriteWithNoEngineEnabled) {
+  SetConfig(USE_IAA_COMPRESS, 0);
+  SetConfig(USE_QAT_COMPRESS, 0);
+  SetConfig(USE_IGZIP_COMPRESS, 0);
+  SetConfig(USE_ZLIB_COMPRESS, 0);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  // Not "wb0": level 0 pins the file at gzopen, and a pinned write is meant to
+  // reach zlib whatever the config says.
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+
+  const char data[] = "no engine can take this";
+  const unsigned len = static_cast<unsigned>(sizeof(data) - 1);
+  EXPECT_EQ(gzwrite(fp, data, len), 0);
+  EXPECT_EQ(GetGzipFileExecutionPath(fp), UNDEFINED);
+  EXPECT_EQ(gzwrite(fp, data, len), 0);
+  EXPECT_EQ(GetGzipFileExecutionPath(fp), UNDEFINED);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  EXPECT_EQ(GzFileSize(filename), 0u);
+  remove(filename);
+}
+
 // The rest of the level range is only observable as a difference in ratio, and
 // only on IGZIP: QAT and IAA take no compression level at all, so a level is
 // recorded for them and cannot be honored.
