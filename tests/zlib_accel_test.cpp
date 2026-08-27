@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <new>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -55,7 +56,7 @@ std::string GenerateRandomString(size_t length) {
 }
 
 char* GenerateCompressibleBlock(size_t length, int ratio = 4) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -83,7 +84,7 @@ char* GenerateCompressibleBlock(size_t length, int ratio = 4) {
 }
 
 char* GenerateIncompressibleBlock(size_t length) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -95,7 +96,9 @@ char* GenerateIncompressibleBlock(size_t length) {
 }
 
 char* GenerateZeroBlock(size_t length) {
-  char* buf = (char*)calloc(length, sizeof(char));
+  // The () is what calloc's zeroing becomes; without it the block is
+  // uninitialized and nothing here would say so.
+  char* buf = new (std::nothrow) char[length]();
   if (!buf) {
     return nullptr;
   }
@@ -129,7 +132,7 @@ void GenerateSeededBytes(char* out, size_t length, uint32_t* state) {
 
 char* GenerateSeededCompressibleBlock(size_t length, uint32_t seed,
                                       int ratio = 4) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -158,7 +161,10 @@ char* GenerateSeededCompressibleBlock(size_t length, uint32_t seed,
   return buf;
 }
 
-void DestroyBlock(char* buf) { free(buf); }
+// Releases anything the suite hands out, so every producer here and in
+// test_utils.cpp has to allocate the way this releases. It used to free() while
+// ZlibUncompress() returned new[] memory, which ASAN halts on.
+void DestroyBlock(char* buf) { delete[] buf; }
 
 int ZlibCompressUtility(const char* input, size_t input_length,
                         std::string* output, size_t* output_upper_bound) {
