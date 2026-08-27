@@ -6969,8 +6969,8 @@ class GzipFileTest : public ::testing::Test {
 };
 
 // gzeof has to answer for files the shim handed to zlib as well as the ones it
-// decompressed itself. gz->reached_eof is only ever set by the accelerator read
-// loop, so on the zlib path it stays false forever and gzeof must defer to
+// decompressed itself. gz->read_past_end is only ever set by the accelerator
+// read loop, so on the zlib path it stays false forever and gzeof must defer to
 // orig_gzeof. Assert on the return value rather than looping until gzeof is
 // true: without the fix the loop form hangs instead of failing.
 TEST_F(GzipFileTest, GzeofReportsEofOnZlibPath) {
@@ -7921,6 +7921,51 @@ TEST_F(GzipFileTest, GzungetcAcceptsSeveralPushesBeforeAnyRead) {
   ASSERT_EQ(gzread(fp, rest.data(), static_cast<unsigned>(rest.size())),
             static_cast<int>(rest.size()));
   EXPECT_EQ(memcmp(rest.data(), input + 2, rest.size()), 0);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+  DestroyBlock(input);
+}
+
+// zlib sets its end-of-file indicator only for a read that tried to go past the
+// end of the file and came up short, which zlib.h spells out: a request served
+// by exactly the bytes that were left leaves gzeof false, and gzungetc clears
+// the indicator because there is a byte to read again. "The file has no more
+// data" is a different question, and answering that one instead reports end of
+// file a call early. Every assertion here holds for zlib itself, so with no
+// backend compiled in the case runs against zlib as its own oracle.
+TEST_F(GzipFileTest, GzeofReportsEofOnlyAfterAShortRead) {
+  SetCompressPath(ZLIB, false, false, false);
+  EnableSomeGzUncompressPath();
+
+  const size_t input_length = 8192;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x11f6);
+  ASSERT_NE(input, nullptr);
+  ASSERT_EQ(ZlibCompressGzipFile(input, input_length), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  // Exactly the length of the file, so the read is satisfied in full and has no
+  // occasion to look past its end.
+  std::vector<char> output(input_length, 0);
+  ASSERT_EQ(gzread(fp, output.data(), static_cast<unsigned>(output.size())),
+            static_cast<int>(input_length));
+  EXPECT_EQ(memcmp(input, output.data(), input_length), 0);
+  EXPECT_EQ(gzeof(fp), 0);
+
+  // A pushed-back byte is data, and reading it is another request served in
+  // full, so neither the push nor the read that consumes it ends the file.
+  ASSERT_EQ(gzungetc('Q', fp), 'Q');
+  EXPECT_EQ(gzeof(fp), 0);
+  ASSERT_EQ(gzgetc(fp), 'Q');
+  EXPECT_EQ(gzeof(fp), 0);
+
+  // This is the read that comes up short, and the only one that ends the file.
+  char tail = 0;
+  EXPECT_EQ(gzread(fp, &tail, 1), 0);
+  EXPECT_NE(gzeof(fp), 0);
 
   EXPECT_EQ(gzclose(fp), Z_OK);
   remove(filename);

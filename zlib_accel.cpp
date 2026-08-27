@@ -1991,6 +1991,7 @@ struct GzipFile {
     path = UNDEFINED;
     use_zlib_for_decompression = false;
     reached_eof = false;
+    read_past_end = false;
     pushback.clear();
 
     data_buf_pos = 0;
@@ -2030,6 +2031,14 @@ struct GzipFile {
   // decompressed with zlib
   bool use_zlib_for_decompression = false;
   bool reached_eof = false;
+  // The end-of-file indicator gzeof reports, which is not the same fact as
+  // reached_eof above. That one says the file itself has been read to its end,
+  // and is what stops gzread from reading it again. This one says a read asked
+  // for bytes and came up short, which is the only thing zlib sets its own
+  // indicator for -- so a file read to its end by a request that was satisfied
+  // exactly is not at end of file yet, and gzungetc clears this while leaving
+  // reached_eof alone.
+  bool read_past_end = false;
   FileMode mode = FileMode::NONE;
   // The level the application asked for, through the gzopen mode string or a
   // later gzsetparams. Reset() keeps it, matching zlib, whose reset paths
@@ -2949,6 +2958,12 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
           gz->io_buf_content = io_buf_remaining;
           gz->io_buf_pos = 0;
         } else {
+          // The request wanted more and there is nothing left anywhere: this is
+          // the read that came up short, which is what sets the end-of-file
+          // indicator gzeof reports. A read error takes the goto above instead
+          // and does not set it, matching zlib, which records that as an error
+          // rather than as end of file.
+          gz->read_past_end = true;
           more_data = false;
         }
       }
@@ -3037,10 +3052,10 @@ int ZEXPORT gzungetc(int c, gzFile file) {
     return -1;
   }
 
-  // Only the pushback stack changes. reached_eof records that the file itself
-  // has been read to its end, which is still true and is what stops gzread from
-  // reading it again; gzeof is the one that has to account for these bytes, and
-  // it does so by looking at the stack rather than at that flag.
+  // reached_eof stays as it is: the file itself really has been read to its
+  // end, and that is what stops gzread from reading it again. The end-of-file
+  // indicator is a different fact and this clears it, as zlib's own gzungetc
+  // does -- there is a byte to read again, so no read has come up short.
   const unsigned char ch = static_cast<unsigned char>(c);
   try {
     gz->pushback.push_back(ch);
@@ -3049,6 +3064,7 @@ int ZEXPORT gzungetc(int c, gzFile file) {
     // refused push is a return value zlib already defines.
     return -1;
   }
+  gz->read_past_end = false;
   return static_cast<int>(ch);
 }
 
@@ -3237,23 +3253,21 @@ int ZEXPORT gzclose_w(gzFile file) {
 
 int ZEXPORT gzeof(gzFile file) {
   auto gz = gzip_files.Get(file);
-  // reached_eof is only maintained by the accelerator read path in gzread. Once
-  // a file is on the zlib path, zlib owns its end-of-file state, so ask zlib
-  // rather than reporting a flag that will never be set.
+  // read_past_end is only maintained by the accelerator read path in gzread.
+  // Once a file is on the zlib path, zlib owns its end-of-file state, so ask
+  // zlib rather than reporting a flag that will never be set.
   if (gz == nullptr || gz->path == ZLIB) {
     return orig_gzeof != nullptr ? orig_gzeof(file) : 0;
   }
-  // reached_eof only records that a read of the file came up short; the buffers
-  // may still hold data gzread has not handed back yet. Reporting EOF here
-  // would silently truncate a "while (!gzeof(file)) gzread(...)" loop, so match
-  // gzread's own view of whether more data is available (see the
-  // file_data_remaining/data_remaining checks in its loop above).
-  // Bytes pushed back by gzungetc count as data too: they are the next thing a
-  // read returns.
-  bool data_remaining = (gz->data_buf_content - gz->data_buf_pos) > 0 ||
-                        (gz->io_buf_content - gz->io_buf_pos) > 0 ||
-                        !gz->pushback.empty();
-  return gz->reached_eof && !data_remaining;
+  // zlib's indicator, and zlib.h is specific about what sets it: a read that
+  // tried to go past the end of the input and came up short, which is why it
+  // stays false after a request satisfied by exactly the bytes that were left.
+  // Answering "no data available" instead would report end of file both a call
+  // early and while the buffers still hold data gzread has not handed back --
+  // the latter silently truncating a "while (!gzeof(file)) gzread(...)" loop.
+  // A short read cannot happen with data still buffered, so this one flag
+  // covers both.
+  return gz->read_past_end;
 }
 
 ExecutionPath GetGzipFileExecutionPath(gzFile file) {
