@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -660,6 +661,20 @@ void RunDummyQATJob() {
                  &execution_path);
   delete[] uncompressed;
   DestroyBlock(input);
+}
+
+// A zero block that is not zeros still round-trips, so every case that takes
+// one would pass on uninitialized memory and the parameterized sweep would
+// quietly lose its most compressible payload.  Nothing else in the suite looks
+// at the contents of a generated block, so state the one generator whose
+// contents are part of its contract.  Draws no randomness, so it leaves the
+// payload sequence the parameterized cases share alone.
+TEST(GeneratedBlockTest, ZeroBlockIsZeroed) {
+  const size_t length = 4096;
+  char* buf = GenerateBlock(length, zero_block);
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(static_cast<size_t>(std::count(buf, buf + length, '\0')), length);
+  DestroyBlock(buf);
 }
 
 class ZlibTest
