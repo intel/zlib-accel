@@ -52,6 +52,11 @@ int ZlibUncompress(const char* input, size_t input_length, size_t output_length,
   z_stream stream;
   memset(&stream, 0, sizeof(z_stream));
 
+  // Nothing is owned by the caller unless this returns Z_STREAM_END, so every
+  // error return below leaves *uncompressed null rather than handing back a
+  // buffer no caller checks the status before releasing.
+  *uncompressed = nullptr;
+
   int st = inflateInit2(&stream, window_bits);
   if (st != Z_OK) {
     inflateEnd(&stream);
@@ -80,6 +85,8 @@ int ZlibUncompress(const char* input, size_t input_length, size_t output_length,
         (st == Z_OK && input_chunk == (input_chunks - 1)) ||
         (st != Z_OK && st != Z_STREAM_END)) {
       inflateEnd(&stream);
+      delete[] *uncompressed;
+      *uncompressed = nullptr;
       return st;
     }
   }

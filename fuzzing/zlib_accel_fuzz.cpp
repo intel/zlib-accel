@@ -54,7 +54,7 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
     return;
   }
 
-  char* uncompressed;
+  char* uncompressed = nullptr;
   size_t uncompressed_length;
   size_t input_consumed;
   execution_path = UNDEFINED;
@@ -63,6 +63,8 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
                        window_bits_uncompress, flush_uncompress, 1,
                        &execution_path);
 
+  // ZlibUncompress only hands back a buffer on Z_STREAM_END, so the failure
+  // return above owns nothing; a mismatch after it does.
   if (ret != Z_STREAM_END) {
     *fuzz_ret = 1;
     return;
@@ -70,6 +72,7 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
 
   if (memcmp(uncompressed, input, uncompressed_length) != 0) {
     *fuzz_ret = 1;
+    delete[] uncompressed;
     return;
   }
 
