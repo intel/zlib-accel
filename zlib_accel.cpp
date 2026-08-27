@@ -2991,6 +2991,21 @@ gzread_end:
   return read_bytes;
 }
 
+// One byte for a caller that has already looked the file up and checked it: the
+// body of gzread for a length of one, without the registry lookup. gzgets reads
+// a character at a time, and going back through gzgetc and gzread costs two
+// lookups per character -- a hash, a concurrent-map find under an accessor and
+// a shared_ptr copy each -- for a file it has in hand.
+static int GzGetcOwned(gzFile file, GzipFile* gz) {
+  if (!gz->pushback.empty()) {
+    const unsigned char pushed = gz->pushback.back();
+    gz->pushback.pop_back();
+    return static_cast<int>(pushed);
+  }
+  unsigned char ch = 0;
+  return GzreadOwnedFile(file, gz, &ch, 1) == 1 ? static_cast<int>(ch) : -1;
+}
+
 int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   auto gz = gzip_files.Get(file);
   if (gz == nullptr) {
@@ -3042,8 +3057,7 @@ int ZEXPORT gzgetc(gzFile file) {
     return -1;
   }
 
-  unsigned char ch = 0;
-  return gzread(file, &ch, 1) == 1 ? static_cast<int>(ch) : -1;
+  return GzGetcOwned(file, gz.get());
 }
 
 // zlib exports both the macro above and this plain function, for callers that
@@ -3087,9 +3101,11 @@ char* ZEXPORT gzgets(gzFile file, char* buf, int len) {
   }
 
   // Up to a newline, which is kept, or len - 1 bytes, whichever comes first.
+  // Through the helper rather than gzgetc, so the file is looked up once for
+  // the whole line instead of twice per character.
   int copied = 0;
   while (copied < len - 1) {
-    int c = gzgetc(file);
+    int c = GzGetcOwned(file, gz.get());
     if (c < 0) {
       break;
     }
