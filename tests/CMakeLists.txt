@@ -23,10 +23,22 @@ add_executable(zlib_accel_test
     ../utils.cpp
 )
 
-add_custom_target(run
-    COMMAND ./zlib_accel_test
-    DEPENDS zlib_accel_test
-)
+if(ASAN)
+    # LeakSanitizer runs at exit under ASAN, and a vendor library holds
+    # allocations it never releases; lsan.supp names them so the run can still
+    # fail on a leak that is ours.
+    add_custom_target(run
+        COMMAND ${CMAKE_COMMAND} -E env
+                LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp
+                ./zlib_accel_test
+        DEPENDS zlib_accel_test
+    )
+else()
+    add_custom_target(run
+        COMMAND ./zlib_accel_test
+        DEPENDS zlib_accel_test
+    )
+endif()
 
 if(COVERAGE)
     add_custom_target(coverage
