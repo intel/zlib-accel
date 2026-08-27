@@ -5083,9 +5083,17 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(GetDeflateExecutionPath(&source), ZLIB);
   const size_t source_produced = source_output.size() - source.avail_out;
 
+  // zlib's deflateCopy overwrites the destination z_stream wholesale, so the
+  // destination's own zlib state is orphaned rather than freed -- stock zlib
+  // does this with no shim loaded.  Keep the pointer so the test can hand it
+  // back afterwards; deflateEnd refuses any other z_stream address, because the
+  // state points back at the stream it was initialized with.
+  struct internal_state* orphaned_state = dest.state;
+
   ASSERT_EQ(deflateCopy(&dest, &source), Z_OK);
   EXPECT_EQ(GetDeflateExecutionPath(&dest), ZLIB);
   EXPECT_FALSE(DeflateOwnsIgzipState(&dest));
+  ASSERT_NE(dest.state, orphaned_state);
 
   // Finishing on the copy proves the release did not disturb the state the copy
   // is meant to continue from: the prefix the source emitted plus the tail the
@@ -5097,6 +5105,8 @@ TEST_F(StreamCopyRegressionTest,
   dest.avail_out = static_cast<uInt>(dest_output.size());
   ASSERT_EQ(deflate(&dest, Z_FINISH), Z_STREAM_END);
   const size_t dest_produced = dest_output.size() - dest.avail_out;
+  ASSERT_EQ(deflateEnd(&dest), Z_OK);
+  dest.state = orphaned_state;
   ASSERT_EQ(deflateEnd(&dest), Z_OK);
   // The source is abandoned with its stream unfinished, which is exactly the
   // case zlib reports Z_DATA_ERROR for; the copy carried the tail.
@@ -5183,9 +5193,14 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(GetInflateExecutionPath(&source), ZLIB);
   const size_t source_produced = source.total_out;
 
+  // As on the deflate side, the copy orphans the destination's own zlib state,
+  // which only this z_stream address can release.
+  struct internal_state* orphaned_state = dest.state;
+
   ASSERT_EQ(inflateCopy(&dest, &source), Z_OK);
   EXPECT_EQ(GetInflateExecutionPath(&dest), ZLIB);
   EXPECT_FALSE(InflateOwnsIgzipState(&dest));
+  ASSERT_NE(dest.state, orphaned_state);
 
   // As on the deflate side, the copy has to be able to finish the stream the
   // source was partway through.
@@ -5205,6 +5220,8 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(dest_produced, input_length - source_produced);
   EXPECT_EQ(memcmp(dest_output.data(), input + source_produced, dest_produced),
             0);
+  ASSERT_EQ(inflateEnd(&dest), Z_OK);
+  dest.state = orphaned_state;
   ASSERT_EQ(inflateEnd(&dest), Z_OK);
   ASSERT_EQ(inflateEnd(&source), Z_OK);
 
