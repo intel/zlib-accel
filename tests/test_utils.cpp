@@ -52,9 +52,9 @@ int ZlibUncompress(const char* input, size_t input_length, size_t output_length,
   z_stream stream;
   memset(&stream, 0, sizeof(z_stream));
 
-  // Nothing is owned by the caller unless this returns Z_STREAM_END, so every
-  // error return below leaves *uncompressed null rather than handing back a
-  // buffer no caller checks the status before releasing.
+  // The caller owns a buffer on Z_STREAM_END and on the Z_OK partial return,
+  // and nothing on any error, which leaves *uncompressed null rather than
+  // handing back a buffer no caller checks the status before releasing.
   *uncompressed = nullptr;
 
   int st = inflateInit2(&stream, window_bits);
@@ -81,12 +81,24 @@ int ZlibUncompress(const char* input, size_t input_length, size_t output_length,
 
     st = inflate(&stream, flush);
     *execution_path = GetInflateExecutionPath(&stream);
-    if ((st == Z_STREAM_END && input_chunk < (input_chunks - 1)) ||
-        (st == Z_OK && input_chunk == (input_chunks - 1)) ||
-        (st != Z_OK && st != Z_STREAM_END)) {
+
+    // Z_OK on the last chunk means the input held less than a whole stream, so
+    // the prefix that came back is the result the caller asked for rather than
+    // a failure. Report its size and hand it over; the other two stop
+    // conditions are errors and own nothing.
+    bool partial_progress = (st == Z_OK && input_chunk == (input_chunks - 1));
+    bool premature_end =
+        (st == Z_STREAM_END && input_chunk < (input_chunks - 1));
+    bool failed = (st != Z_OK && st != Z_STREAM_END);
+    if (partial_progress || premature_end || failed) {
+      if (partial_progress) {
+        *uncompressed_length = stream.total_out;
+        *input_consumed = stream.total_in;
+      } else {
+        delete[] *uncompressed;
+        *uncompressed = nullptr;
+      }
       inflateEnd(&stream);
-      delete[] *uncompressed;
-      *uncompressed = nullptr;
       return st;
     }
   }
