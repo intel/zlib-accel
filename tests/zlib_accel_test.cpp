@@ -8082,6 +8082,52 @@ static std::string PositionStampedPayload(size_t records) {
   return payload;
 }
 
+// gzopen64 is not a 64-bit variant of anything: in zlib it is the same function
+// as gzopen, with the same signature and no offset argument. It exists only so
+// the rename zlib.h performs under _FILE_OFFSET_BITS=64 has a symbol to land
+// on.
+//
+// Leaving it unexported took the shim off the path entirely for any application
+// built that way, and did so invisibly: zlib opened the file, the shim never
+// learned of it, every other entry point delegated, and the file was correct
+// end to end and merely unaccelerated. Correctness therefore cannot detect the
+// bug. Read-ahead can. The shim pulls 512 KiB of compressed input per gzread
+// where zlib's input buffer holds 16 KiB, so after one small gzread of a file
+// larger than 16 KiB compressed, zlib cannot have consumed more than 16 KiB and
+// the shim has consumed the lot. gzoffset reports which of the two happened.
+TEST_F(GzipFileTest, Gzopen64RegistersTheFileWithTheShim) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(24000);
+  const char* filename = "file.gz";
+  remove(filename);
+
+  gzFile fp = gzopen64(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, payload.data(), static_cast<unsigned>(payload.size())),
+            static_cast<int>(payload.size()));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  // Between the two buffer sizes, so the comparison below can tell them apart.
+  const auto compressed = std::filesystem::file_size(filename);
+  ASSERT_GT(compressed, static_cast<uintmax_t>(16 << 10));
+  ASSERT_LT(compressed, static_cast<uintmax_t>(512 << 10));
+
+  fp = gzopen64(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  char buf[24];
+  ASSERT_EQ(gzread(fp, buf, sizeof(buf)), static_cast<int>(sizeof(buf)));
+  EXPECT_EQ(memcmp(buf, payload.data(), sizeof(buf)), 0);
+  EXPECT_EQ(gztell(fp), static_cast<z_off_t>(sizeof(buf)));
+  // Plain zlib cannot report more than the 16 KiB it is able to hold, so this
+  // is only reachable with the file registered and the shim doing the reading.
+  EXPECT_GT(gzoffset(fp), static_cast<z_off_t>(16 << 10));
+
+  ASSERT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
 TEST_F(GzipFileTest, GztellCountsBytesOnBothSides) {
   EnableSomeGzCompressPath();
   EnableShimOwnedGzReads();

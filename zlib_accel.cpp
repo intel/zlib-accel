@@ -2408,6 +2408,22 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   return file;
 }
 
+// zlib's gzopen64 is not a 64-bit variant of anything: it is the same function
+// as gzopen, with the same signature and no offset argument at all (zlib.h),
+// and both symbols in libz are thunks onto the same internal gz_open. The "64"
+// exists only so that the rename zlib.h performs under _FILE_OFFSET_BITS=64
+// (zconf.h, Z_WANT64) has a symbol to land on.
+//
+// Leaving it unintercepted was safe but silent: the rename happens in the
+// application's translation unit, so a program built that way calls gzopen64,
+// never registers the file with the shim, and runs correctly on plain zlib with
+// no sign that acceleration was lost. Forwarding is all that is needed --
+// gzopen above opens the descriptor itself, with O_LARGEFILE where the platform
+// has it. There is no gzdopen64 in libz, so this has no counterpart.
+gzFile ZEXPORT gzopen64(const char* path, const char* mode) {
+  return gzopen(path, mode);
+}
+
 gzFile ZEXPORT gzdopen(int fd, const char* mode) {
   if (orig_gzdopen == nullptr) {
     return nullptr;
