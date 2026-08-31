@@ -2244,44 +2244,32 @@ static void InitStreamRegistries() {
   gzip_files.Init();
 }
 
-// Ask zlib, once per read-mode open, whether this file is a gzip member at all.
-//
-// The shim deliberately has no magic-number test of its own: two
-// implementations of "is this a gzip header" would drift, and zlib already has
-// one in gz_look(). gzdirect() is the public way to reach it. That call is
-// guarded inside zlib by how == LOOK && x.have == 0, so it reads at most once
-// for the life of the file
-// -- which is what makes this affordable, and is also why gzdirect needs no
-// interception for a file that got here: after this call zlib answers from
-// state it already has, so every later gzdirect the application makes is
-// truthful and costs nothing. A descriptor that cannot be rewound never gets
-// here; see GzPeekAtOpen, which is the case gzdirect does have to answer for.
-//
-// A file that is not a gzip member is not the shim's business. Hand it to zlib
-// and stay out of the way: zlib has already buffered the bytes and switched
-// itself to copy-through, so it reads the file correctly with no help. The same
-// applies to an empty file and to a file too short to hold a header.
-// The same question, asked by the shim, for a descriptor that cannot be
-// rewound. Borrowing zlib's answer is not possible there: zlib's look reads
-// 8 KB, and on a pipe those bytes cannot be put back, so they would sit in
-// zlib's private buffer with the shim reading the file from behind them.
+// Two requests no backend can serve, and neither needs the file looked at: no
+// uncompress accelerator is configured, or the mode string already pinned this
+// file to zlib (a level digit no backend can serve, which zlib parses in read
+// mode too). Both mean zlib is going to read the file, which is why this has to
+// be settled before anything is spent on the header test -- a file zlib reads
+// must keep both its bytes and its full-sized buffers.
+static bool GzUncompressAcceleratorSelected() {
+  return configs[USE_IAA_UNCOMPRESS] || configs[USE_QAT_UNCOMPRESS] ||
+         configs[USE_IGZIP_UNCOMPRESS];
+}
+
+// The header test asked by the shim rather than by zlib, for a descriptor that
+// cannot be rewound. Borrowing zlib's answer is not possible there: zlib's look
+// reads up to 8 KB, and on a pipe those bytes cannot be put back, so they would
+// sit in zlib's private buffer with the shim reading the file from behind them.
 //
 // So the shim takes two bytes of its own. On a pipe that costs nothing, because
 // putting them back never arises -- the bytes are wanted by whoever reads next,
 // and the shim is that reader either way. It is also far less blocking than
-// zlib's own look: two bytes rather than a 16 KB buffer.
+// zlib's own look.
 //
-// This is the second use of the magic-number test below in gzread, not a second
+// This is the second use of the magic-number test in gzread below, not a second
 // implementation of it. It is also what forces gzdirect to be intercepted: zlib
 // has not looked, so zlib cannot answer.
 static void GzPeekAtOpen(GzipFile* gz) {
-  // zlib is going to read this pipe, so zlib must have every byte of it. Take
-  // nothing and leave it alone. Same two reasons as the seekable case below:
-  // nothing to offload to, or a mode string that already pinned the file.
-  const bool accelerator_selected = configs[USE_IAA_UNCOMPRESS] ||
-                                    configs[USE_QAT_UNCOMPRESS] ||
-                                    configs[USE_IGZIP_UNCOMPRESS];
-  if (!accelerator_selected || gz->path == ZLIB) {
+  if (!GzUncompressAcceleratorSelected() || gz->path == ZLIB) {
     gz->path = ZLIB;
     return;
   }
@@ -2316,6 +2304,22 @@ static void GzPeekAtOpen(GzipFile* gz) {
   gz->shim_owns_reads = true;
 }
 
+// Ask zlib, once per read-mode open, whether this file is a gzip member at all.
+//
+// The shim deliberately has no magic-number test of its own for a file it can
+// rewind: two implementations of "is this a gzip header" would drift, and zlib
+// already has one in gz_look(). gzdirect() is the public way to reach it. That
+// call is guarded inside zlib by how == LOOK && x.have == 0, so it reads at
+// most once for the life of the file
+// -- which is what makes this affordable, and is also why gzdirect needs no
+// interception for a file that got here: after this call zlib answers from
+// state it already has, so every later gzdirect the application makes is
+// truthful and costs nothing.
+//
+// A file that is not a gzip member is not the shim's business. Hand it to zlib
+// and stay out of the way: zlib has already buffered the bytes and switched
+// itself to copy-through, so it reads the file correctly with no help. The same
+// applies to an empty file and to a file too short to hold a header.
 static void GzLookAtOpen(gzFile file, GzipFile* gz) {
   if (gz->mode != FileMode::READ) {
     return;
@@ -2332,25 +2336,39 @@ static void GzLookAtOpen(gzFile file, GzipFile* gz) {
     return;
   }
 
-  if (orig_gzdirect == nullptr) {
-    return;
-  }
-
-  if (orig_gzdirect(file) != 0) {
-    // Not a gzip member. zlib owns it from here.
+  // Settled before the look, not after it: see GzUncompressAcceleratorSelected.
+  if (!GzUncompressAcceleratorSelected() || gz->path == ZLIB) {
     gz->path = ZLIB;
     return;
   }
 
-  // A real gzip member, but only rewind if the shim is actually going to read
-  // it. Two ways it will not: no uncompress accelerator is configured, or the
-  // mode string already pinned the file to zlib (a level digit no backend can
-  // serve, which zlib parses in read mode too). In both cases zlib reads the
-  // file, and it must keep the bytes it has just buffered.
-  const bool accelerator_selected = configs[USE_IAA_UNCOMPRESS] ||
-                                    configs[USE_QAT_UNCOMPRESS] ||
-                                    configs[USE_IGZIP_UNCOMPRESS];
-  if (!accelerator_selected || gz->path == ZLIB) {
+  if (orig_gzdirect == nullptr) {
+    return;
+  }
+
+  // Shrink the look before it happens. gz_look sizes both of its buffers from
+  // `want` and reads `want` bytes to judge the header by, and `want` is
+  // settable through public gzbuffer -- which zlib refuses once its buffers
+  // exist, so this must come before the gzdirect below and zlib.h says so. zlib
+  // does a genuine look either way and sets its own how/direct; no private
+  // state is touched.
+  //
+  // Measured on this host, per file open for reading at the same time: 31,776
+  // bytes of zlib buffers and inflate state at the default, 8,736 at 512, and a
+  // 512-byte read of the descriptor instead of 8,192. Smaller sizes save little
+  // more -- 7,232 bytes at zlib's floor of 8 -- and cost a great deal on the
+  // one path that still goes through zlib's buffer: a transparent file read a
+  // byte at a time is 21x slower at 8 and 2x slower at 512.
+  //
+  // It matters that this is below the test above. zlib inflating a whole file
+  // through an 8-byte input buffer is 85x slower, and that is exactly the file
+  // the test above has already sent to zlib.
+  if (orig_gzbuffer != nullptr) {
+    orig_gzbuffer(file, 512);
+  }
+
+  if (orig_gzdirect(file) != 0) {
+    // Not a gzip member. zlib owns it from here.
     gz->path = ZLIB;
     return;
   }
@@ -3311,19 +3329,20 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
 
   int ret = 1;
   uint32_t read_bytes = 0;
-  bool accelerator_selected = configs[USE_IAA_UNCOMPRESS] ||
-                              configs[USE_QAT_UNCOMPRESS] ||
-                              configs[USE_IGZIP_UNCOMPRESS];
-  // shim_owns_reads is checked first and on its own: the descriptor was rewound
-  // after the open-time header look, so zlib's buffered copy of the header
-  // describes a position the file is no longer at. Handing this file to
+  const bool accelerator_selected = GzUncompressAcceleratorSelected();
+  // First arm: not a gzip member, on a descriptor the shim had to test itself,
+  // so there is nothing to decompress. Handled here rather than by returning
+  // early so that the tail below still counts the bytes towards gztell, and so
+  // that a pending gzseek above still runs ahead of it.
+  //
+  // Second arm: shim_owns_reads is checked on its own, before the path and
+  // config, because the descriptor was moved at open -- rewound after zlib's
+  // look, or read from by the peek. zlib's buffered copy of the header
+  // describes a position the file is no longer at, so handing this file to
   // orig_gzread would serve those bytes twice and then fail the checksum. The
   // configuration may still change which decompressor runs -- the fallback
   // below uses the shim's own inflate stream -- but never who reads the
   // descriptor.
-  // Not a gzip member, on a descriptor the shim had to test itself. Handled
-  // here rather than by returning early so that the tail below still counts the
-  // bytes towards gztell, and so that a pending gzseek above still runs first.
   if (gz->transparent_read) {
     read_bytes = GzreadTransparent(gz, buf, len);
   } else if (gz->shim_owns_reads ||
