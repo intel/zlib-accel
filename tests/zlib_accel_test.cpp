@@ -8128,6 +8128,271 @@ TEST_F(GzipFileTest, Gzopen64RegistersTheFileWithTheShim) {
   remove(filename);
 }
 
+// ---------------------------------------------------------------------------
+// Non-seekable descriptors.
+//
+// A pipe cannot be rewound, so the shim cannot borrow zlib's header look for
+// it: the 8 KB zlib reads to do the look would be stranded in zlib's private
+// buffer with the shim reading the descriptor from behind them. The shim
+// therefore takes two bytes of its own and keeps them. Every test below writes
+// far less than a pipe's 64 KiB capacity, so nothing blocks on an unread pipe.
+
+// Fills a pipe with plain bytes and returns the read end, write end closed.
+static int PipeOfPlainBytes(const std::string& bytes) {
+  int fds[2];
+  if (pipe(fds) != 0) return -1;
+  if (write(fds[1], bytes.data(), bytes.size()) !=
+      static_cast<ssize_t>(bytes.size())) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  close(fds[1]);
+  return fds[0];
+}
+
+// The same, but the bytes are a gzip member written through the shim.
+static int PipeOfGzipBytes(const std::string& payload) {
+  int fds[2];
+  if (pipe(fds) != 0) return -1;
+  gzFile w = gzdopen(fds[1], "wb6");
+  if (w == nullptr) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  const bool ok =
+      gzwrite(w, payload.data(), static_cast<unsigned>(payload.size())) ==
+      static_cast<int>(payload.size());
+  gzclose(w);
+  if (!ok) {
+    close(fds[0]);
+    return -1;
+  }
+  return fds[0];
+}
+
+// The case that already worked and must keep working: the peek says gzip, its
+// two bytes go back in at the front of io_buf, and the read loop reads on top
+// of them. If those bytes were lost the header would be truncated and the read
+// would fail outright.
+TEST_F(GzipFileTest, GzipPipeIsReadThroughTheAccelerator) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  const int fd = PipeOfGzipBytes(payload);
+  ASSERT_NE(fd, -1);
+
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+  std::string got(payload.size(), '\0');
+  ASSERT_EQ(gzread(fp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(payload.size()));
+  EXPECT_EQ(got, payload);
+  // The peek said gzip, so this is not a transparent file.
+  EXPECT_EQ(gzdirect(fp), 0);
+  EXPECT_EQ(gztell(fp), static_cast<z_off_t>(payload.size()));
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// The peek only sits at the front of io_buf for the first refill, so a stream
+// bigger than io_buf is where it could be double-counted or lost at the
+// boundary. A pipe holds 64 KiB, so this one needs a writer running alongside
+// the reader -- which is also the shape a pipe is actually used in.
+TEST_F(GzipFileTest, LargeGzipPipeSurvivesBufferRefills) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  // Poorly compressible, so the compressed stream is larger than the shim's
+  // 512 KiB io_buf and the read loop has to refill at least once.
+  const size_t size = 1 << 20;
+  std::string payload;
+  payload.reserve(size);
+  uint32_t x = 0x12345678;
+  for (size_t i = 0; i < size; i++) {
+    x = x * 1664525u + 1013904223u;
+    payload.push_back(static_cast<char>(x >> 24));
+  }
+
+  int fds[2];
+  ASSERT_EQ(pipe(fds), 0);
+  std::thread writer([&] {
+    gzFile w = gzdopen(fds[1], "wb6");
+    if (w == nullptr) {
+      close(fds[1]);
+      return;
+    }
+    gzwrite(w, payload.data(), static_cast<unsigned>(payload.size()));
+    gzclose(w);
+  });
+
+  gzFile fp = gzdopen(fds[0], "rb");
+  ASSERT_NE(fp, nullptr);
+  std::string got;
+  got.reserve(payload.size());
+  std::vector<char> buf(64 << 10);
+  int n;
+  while ((n = gzread(fp, buf.data(), static_cast<unsigned>(buf.size()))) > 0) {
+    got.append(buf.data(), static_cast<size_t>(n));
+  }
+  writer.join();
+
+  EXPECT_EQ(n, 0);
+  ASSERT_EQ(got.size(), payload.size());
+  EXPECT_EQ(got, payload);
+  EXPECT_EQ(gzdirect(fp), 0);
+  EXPECT_EQ(gztell(fp), static_cast<z_off_t>(payload.size()));
+  int err = 0;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// The defect: with nothing known about the descriptor the shim assumed gzip and
+// tried to inflate plain text, so gzread returned -1 on a pipe plain zlib reads
+// without difficulty.
+TEST_F(GzipFileTest, NonGzipPipeIsCopiedThrough) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string plain = "not gzip at all, just text on a pipe\n";
+  const int fd = PipeOfPlainBytes(plain);
+  ASSERT_NE(fd, -1);
+
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+  char buf[128];
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(gzread(fp, buf, sizeof(buf)), static_cast<int>(plain.size()));
+  EXPECT_EQ(std::string(buf, plain.size()), plain);
+  // Asked for more than there was, which is the only thing zlib's end-of-file
+  // indicator is set by.
+  EXPECT_EQ(gzeof(fp), 1);
+  EXPECT_EQ(gzdirect(fp), 1);
+  EXPECT_EQ(gztell(fp), static_cast<z_off_t>(plain.size()));
+  int err = 0;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// The second defect. Without an intercepted gzdirect, zlib is still in its LOOK
+// state on a descriptor the shim is reading, so an application gzdirect makes
+// zlib look right then -- pulling up to 8 KB out of the pipe into zlib's buffer
+// and punching a hole in the front of the shim's input. The read after it is
+// what proves nothing was taken.
+TEST_F(GzipFileTest, GzdirectBeforeFirstReadDoesNotConsumeThePipe) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  const int fd = PipeOfGzipBytes(payload);
+  ASSERT_NE(fd, -1);
+
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzdirect(fp), 0);
+  std::string got(payload.size(), '\0');
+  ASSERT_EQ(gzread(fp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(payload.size()));
+  EXPECT_EQ(got, payload);
+  EXPECT_EQ(gzdirect(fp), 0);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// One byte is why the peek loops instead of trusting a single read: 0x1f alone
+// is not a header, and zlib -- whose own load loops until its buffer is full --
+// calls this transparent. An empty pipe is the same conclusion with no bytes.
+TEST_F(GzipFileTest, ShortAndEmptyPipesAreTransparent) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const int fd = PipeOfPlainBytes(std::string(1, '\x1f'));
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+  unsigned char buf[8] = {0};
+  ASSERT_EQ(gzread(fp, buf, sizeof(buf)), 1);
+  EXPECT_EQ(buf[0], 0x1f);
+  EXPECT_EQ(gzdirect(fp), 1);
+  EXPECT_EQ(gzeof(fp), 1);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+
+  const int empty_fd = PipeOfPlainBytes("");
+  ASSERT_NE(empty_fd, -1);
+  gzFile empty = gzdopen(empty_fd, "rb");
+  ASSERT_NE(empty, nullptr);
+  EXPECT_EQ(gzread(empty, buf, sizeof(buf)), 0);
+  EXPECT_EQ(gzdirect(empty), 1);
+  EXPECT_EQ(gzeof(empty), 1);
+  int err = 0;
+  gzerror(empty, &err);
+  EXPECT_EQ(err, Z_OK);
+  EXPECT_EQ(gzclose(empty), Z_OK);
+}
+
+// gzdirect is gated on the shim having done the peek, so a seekable file keeps
+// answering from zlib's own cached look exactly as before. Both answers,
+// because delegating the wrong way round would be invisible in only one of
+// them.
+TEST_F(GzipFileTest, GzdirectOnSeekableFilesStillComesFromZlib) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, payload.data(), static_cast<unsigned>(payload.size())),
+            static_cast<int>(payload.size()));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzdirect(fp), 0);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+
+  // The same file with no gzip header, which zlib reads by copying through.
+  {
+    std::ofstream plain(filename, std::ios::binary | std::ios::trunc);
+    plain << "plain text in a file called .gz\n";
+  }
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzdirect(fp), 1);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
+// zlib's forward seek on a transparent file is not one behaviour but two, and
+// which one you get depends on whether a read has happened. Before the first
+// read zlib is still in LOOK, so the seek is lazy and succeeds, and the read
+// that follows pays for it by reading and discarding -- which a pipe permits.
+// After the first read zlib is in COPY, where gzseek64 lseeks the descriptor
+// directly, and a pipe refuses that. Both halves are measured against plain
+// zlib by the conformance suite's O12 check.
+TEST_F(GzipFileTest, ForwardSeekOnATransparentPipeFollowsZlib) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string plain = "0123456789ABCDEF";
+  int fd = PipeOfPlainBytes(plain);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzseek(fp, 4, SEEK_SET), 4);
+  char buf[8];
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(gzread(fp, buf, 4), 4);
+  EXPECT_EQ(std::string(buf, 4), "4567");
+  EXPECT_EQ(gztell(fp), 8);
+  // Now a read has happened, so the same seek becomes an lseek on a pipe.
+  EXPECT_EQ(gzseek(fp, 12, SEEK_SET), -1);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
 TEST_F(GzipFileTest, GztellCountsBytesOnBothSides) {
   EnableSomeGzCompressPath();
   EnableShimOwnedGzReads();

@@ -2152,6 +2152,20 @@ struct GzipFile {
   // those bytes a second time and then fail. Reads stay with the shim for the
   // life of the file; only the choice of decompressor may still change.
   bool shim_owns_reads = false;
+  // The header bytes of a descriptor that could not be rewound, and how many of
+  // them are really there -- 0, 1 or 2. On a pipe the bytes cannot be put back,
+  // so the shim keeps them and hands them to the read loop instead. They cannot
+  // live in io_buf: that is allocated lazily, on the first read.
+  unsigned char peek[2] = {0, 0};
+  uint8_t peek_len = 0;
+  // Set when the shim, rather than zlib, ran the header test. This is what
+  // gzdirect answers from, and gating on it keeps the seekable case exactly as
+  // it was: there zlib has looked and answers for itself.
+  bool shim_peeked = false;
+  // The peek said this is not a gzip member, so there is nothing to decompress
+  // and the shim copies bytes through -- zlib's COPY mode, for the one case
+  // where zlib cannot be left to do it.
+  bool transparent_read = false;
   // The mirror image: this file was handed to zlib at open and every call on it
   // has been forwarded since, so zlib's own position and error state are the
   // complete and correct ones and the position entry points below just
@@ -2237,27 +2251,88 @@ static void InitStreamRegistries() {
 // one in gz_look(). gzdirect() is the public way to reach it. That call is
 // guarded inside zlib by how == LOOK && x.have == 0, so it reads at most once
 // for the life of the file
-// -- which is what makes this affordable, and is also why gzdirect itself needs
-// no interception: after this call zlib answers from state it already has, so
-// every later gzdirect the application makes is truthful and costs nothing.
+// -- which is what makes this affordable, and is also why gzdirect needs no
+// interception for a file that got here: after this call zlib answers from
+// state it already has, so every later gzdirect the application makes is
+// truthful and costs nothing. A descriptor that cannot be rewound never gets
+// here; see GzPeekAtOpen, which is the case gzdirect does have to answer for.
 //
 // A file that is not a gzip member is not the shim's business. Hand it to zlib
 // and stay out of the way: zlib has already buffered the bytes and switched
 // itself to copy-through, so it reads the file correctly with no help. The same
 // applies to an empty file and to a file too short to hold a header.
+// The same question, asked by the shim, for a descriptor that cannot be
+// rewound. Borrowing zlib's answer is not possible there: zlib's look reads
+// 8 KB, and on a pipe those bytes cannot be put back, so they would sit in
+// zlib's private buffer with the shim reading the file from behind them.
+//
+// So the shim takes two bytes of its own. On a pipe that costs nothing, because
+// putting them back never arises -- the bytes are wanted by whoever reads next,
+// and the shim is that reader either way. It is also far less blocking than
+// zlib's own look: two bytes rather than a 16 KB buffer.
+//
+// This is the second use of the magic-number test below in gzread, not a second
+// implementation of it. It is also what forces gzdirect to be intercepted: zlib
+// has not looked, so zlib cannot answer.
+static void GzPeekAtOpen(GzipFile* gz) {
+  // zlib is going to read this pipe, so zlib must have every byte of it. Take
+  // nothing and leave it alone. Same two reasons as the seekable case below:
+  // nothing to offload to, or a mode string that already pinned the file.
+  const bool accelerator_selected = configs[USE_IAA_UNCOMPRESS] ||
+                                    configs[USE_QAT_UNCOMPRESS] ||
+                                    configs[USE_IGZIP_UNCOMPRESS];
+  if (!accelerator_selected || gz->path == ZLIB) {
+    gz->path = ZLIB;
+    return;
+  }
+
+  // Loop rather than one read. zlib's gz_load loops until its buffer is full or
+  // the input ends, so zlib always has two bytes to judge a header by; a single
+  // read that came back with one byte would call a real gzip pipe transparent
+  // where zlib calls it gzip.
+  while (gz->peek_len < sizeof(gz->peek)) {
+    const ssize_t got =
+        read(gz->fd, gz->peek + gz->peek_len, sizeof(gz->peek) - gz->peek_len);
+    if (got == 0) {
+      // Fewer than two bytes in the whole file. Not a header, and nothing more
+      // is coming -- the same conclusion zlib reaches.
+      break;
+    }
+    if (got < 0) {
+      // EINTR is not retried, matching gz_load and the error latch the rest of
+      // the read path already implements: the failure sticks to the file.
+      GzSetError(gz, Z_ERRNO, strerror(errno));
+      break;
+    }
+    gz->peek_len += static_cast<uint8_t>(got);
+  }
+
+  gz->shim_peeked = true;
+  gz->transparent_read =
+      !(gz->peek_len == 2 && gz->peek[0] == 0x1f && gz->peek[1] == 0x8b);
+  // Both ways round: bytes have left the descriptor, so zlib must never read it
+  // again. That is the existing invariant, unchanged in meaning -- only the
+  // reason the descriptor moved is new.
+  gz->shim_owns_reads = true;
+}
+
 static void GzLookAtOpen(gzFile file, GzipFile* gz) {
-  if (gz->mode != FileMode::READ || orig_gzdirect == nullptr) {
+  if (gz->mode != FileMode::READ) {
     return;
   }
 
   // Where the file is now is both zlib's state->start and the position to put
   // the descriptor back to afterwards. A descriptor that cannot be seeked
-  // cannot be put back, so it cannot be looked at either: doing the look anyway
-  // would leave the 8 KB zlib read stranded in zlib's buffer, unreachable by
-  // the shim. Skip it and keep the existing behaviour rather than quietly
-  // moving every pipe onto zlib and taking its acceleration away.
+  // cannot be put back, so zlib's look cannot be borrowed for it and the shim
+  // runs its own test instead. -1 stays in start, which is what gzseek and
+  // gzrewind refuse on.
   gz->start = lseek(gz->fd, 0, SEEK_CUR);
   if (gz->start == static_cast<off_t>(-1)) {
+    GzPeekAtOpen(gz);
+    return;
+  }
+
+  if (orig_gzdirect == nullptr) {
     return;
   }
 
@@ -3124,6 +3199,51 @@ int ZEXPORTVA gzprintf(gzFile file, const char* format, ...) {
   return ret;
 }
 
+// zlib's COPY mode: the file is not a gzip member, so there is nothing to
+// decompress and the bytes are simply handed through. zlib does this itself for
+// every file it looked at, which is why the shim has no need of it -- except
+// for a descriptor that could not be rewound, where the shim did the looking
+// and now holds bytes zlib will never see.
+//
+// No push-back handling: the callers of GzreadOwnedFile drain it before they
+// get here, which is the same arrangement the accelerator path relies on.
+static int GzreadTransparent(GzipFile* gz, voidp buf, unsigned len) {
+  unsigned read_bytes = 0;
+
+  // The header bytes the peek took. They were never anything but file content.
+  if (gz->peek_len > 0) {
+    const unsigned from_peek = gz->peek_len < len ? gz->peek_len : len;
+    memcpy(buf, gz->peek, from_peek);
+    // Whatever was not asked for stays at the front for the next call.
+    if (from_peek < gz->peek_len) {
+      memmove(gz->peek, gz->peek + from_peek, gz->peek_len - from_peek);
+    }
+    gz->peek_len -= static_cast<uint8_t>(from_peek);
+    read_bytes = from_peek;
+  }
+
+  while (read_bytes < len && !gz->reached_eof) {
+    const ssize_t got =
+        read(gz->fd, static_cast<char*>(buf) + read_bytes, len - read_bytes);
+    if (got == 0) {
+      gz->reached_eof = true;
+      break;
+    }
+    if (got < 0) {
+      GzSetError(gz, Z_ERRNO, strerror(errno));
+      return -1;
+    }
+    read_bytes += static_cast<unsigned>(got);
+  }
+
+  // Came up short of what was asked for, which is the one thing zlib sets its
+  // end-of-file indicator for.
+  if (read_bytes < len) {
+    gz->read_past_end = true;
+  }
+  return static_cast<int>(read_bytes);
+}
+
 static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
   // Check every symbol this function may need before touching any state. The
   // accelerator path can hand the rest of the file to zlib at any point, and a
@@ -3201,7 +3321,13 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
   // configuration may still change which decompressor runs -- the fallback
   // below uses the shim's own inflate stream -- but never who reads the
   // descriptor.
-  if (gz->shim_owns_reads || (gz->path != ZLIB && accelerator_selected)) {
+  // Not a gzip member, on a descriptor the shim had to test itself. Handled
+  // here rather than by returning early so that the tail below still counts the
+  // bytes towards gztell, and so that a pending gzseek above still runs first.
+  if (gz->transparent_read) {
+    read_bytes = GzreadTransparent(gz, buf, len);
+  } else if (gz->shim_owns_reads ||
+             (gz->path != ZLIB && accelerator_selected)) {
     if (!accelerator_selected) {
       gz->use_zlib_for_decompression = true;
     }
@@ -3214,6 +3340,18 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
     gz->AllocateBuffers();
     gz->data_buf_size = 512 << 10;
     gz->io_buf_size = 512 << 10;
+
+    // The header bytes GzPeekAtOpen took off a non-seekable descriptor. They
+    // could not be put back, so they go in at the front of io_buf and the loop
+    // below reads on top of them: read() appends at io_buf_content, so this is
+    // just the buffer starting out holding its first two bytes. They cannot be
+    // stored here at open time because io_buf does not exist until now.
+    if (gz->peek_len > 0) {
+      memcpy(gz->io_buf, gz->peek, gz->peek_len);
+      gz->io_buf_content = gz->peek_len;
+      gz->io_buf_pos = 0;
+      gz->peek_len = 0;
+    }
 
     bool more_data = true;
     while (read_bytes < len && more_data) {
@@ -3739,6 +3877,24 @@ int ZEXPORT gzeof(gzFile file) {
   return gz->read_past_end;
 }
 
+// Intercepted for one case only: a descriptor the shim had to run the header
+// test on itself, because it could not be rewound. There zlib has not looked
+// and cannot answer -- worse, an application gzdirect would make zlib look
+// right then, pulling up to 8 KB out of the pipe into zlib's private buffer and
+// punching a hole in the front of the shim's input.
+//
+// Everything else delegates, which is the whole point of the shim_peeked gate.
+// A seekable file already has zlib's own cached answer, and it is the true one
+// in all four cases (see GzLookAtOpen); a write-mode file keeps whatever zlib
+// reports for "wT". Neither is touched here.
+int ZEXPORT gzdirect(gzFile file) {
+  auto gz = gzip_files.Get(file);
+  if (gz == nullptr || !gz->shim_peeked) {
+    return orig_gzdirect != nullptr ? orig_gzdirect(file) : 0;
+  }
+  return gz->transparent_read ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Position and error state.
 //
@@ -3833,6 +3989,37 @@ static z_off64_t GzSeekOwned(GzipFile* gz, z_off64_t offset, int whence) {
     offset += gz->pending_skip;
   }
   gz->pending_skip = 0;
+
+  // A transparent file is not compressed, so seeking in it needs no inflating:
+  // zlib's gzseek64 has a fast path that lseeks the descriptor and is done
+  // (gzlib.c), forward and backward alike. That path is guarded by how == COPY,
+  // which is worth being exact about, because it makes zlib's answer depend on
+  // whether anything has been read yet:
+  //
+  //   before the first read  how is still LOOK, so the seek is lazy and
+  //                          succeeds; the next read pays for it by reading and
+  //                          discarding, which works on a pipe
+  //   after the first read   how is COPY, so the lseek is attempted, and a pipe
+  //                          refuses it
+  //
+  // io_started is the shim's equivalent: it flips at the top of the first read,
+  // the same moment zlib's look runs. Measured rather than assumed -- the
+  // conformance suite's O11/O12 pipe seeks are what turned this asymmetry up.
+  if (gz->transparent_read && gz->io_started && gz->pos + offset >= 0) {
+    const off_t held = static_cast<off_t>(gz->peek_len) +
+                       static_cast<off_t>(gz->pushback.size());
+    if (lseek(gz->fd, static_cast<off_t>(offset) - held, SEEK_CUR) ==
+        static_cast<off_t>(-1)) {
+      return -1;
+    }
+    gz->peek_len = 0;
+    gz->pushback.clear();
+    gz->reached_eof = false;
+    gz->read_past_end = false;
+    GzSetError(gz, Z_OK, nullptr);
+    gz->pos += offset;
+    return gz->pos;
+  }
 
   if (offset < 0) {
     // Backwards. Only a reader can go there, and only by starting over: the
