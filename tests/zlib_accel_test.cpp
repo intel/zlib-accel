@@ -8620,11 +8620,12 @@ TEST_F(GzipFileTest, GzerrorLatchesAndGzclearerrClearsIt) {
   EXPECT_EQ(errnum, Z_OK);
 
   std::vector<char> output(input_length + 512, 0);
-  int total = 0;
   int ret = 0;
+  // Drain to the failure. How many bytes arrive first is deliberately not
+  // asserted: it depends on which path decompresses the member, and this
+  // test is about the error latch, not about byte counts.
   while ((ret = gzread(fp, output.data(),
                        static_cast<unsigned>(output.size()))) > 0) {
-    total += ret;
   }
   EXPECT_EQ(ret, -1);
 
