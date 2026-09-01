@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -7473,19 +7474,38 @@ TEST_F(GzipFileTest, GzsetparamsRejectsReadFile) {
   DestroyBlock(input);
 }
 
-// Everything that flushes the shim's buffer has to report a failed write the
-// way zlib does, as Z_ERRNO -- the code that tells the caller errno describes
-// what happened. /dev/full makes that deterministic: every write to it fails
-// with ENOSPC, so one file exercises all three entry points that flush.
+// Put gzwrite on the shim's own buffered route. What decides that is the config
+// flag, not whether a backend was compiled in: with a compress flag set, the
+// shim keeps the file and drives its own deflate stream, falling back to zlib's
+// deflate for the compression itself when no accelerator is present. Without a
+// flag, gzwrite hands the whole file to zlib and the shim's write buffer --
+// with the seek gap it holds and the flush that empties it -- does not exist to
+// be tested. So these tests run everywhere, including CI's no-accelerator
+// build.
+static void EnableShimOwnedGzWrites() {
+  SetConfig(USE_IAA_COMPRESS, 0);
+  SetConfig(USE_QAT_COMPRESS, 1);
+  SetConfig(USE_IGZIP_COMPRESS, 0);
+  SetConfig(USE_ZLIB_COMPRESS, 1);
+}
+
+// What every write-side call answers once a write has already failed. /dev/full
+// makes that deterministic: every write to it fails with ENOSPC, so one file
+// exercises all three entry points that flush.
+//
+// The answers are not all the same, and they are not all Z_ERRNO. zlib latches
+// Z_ERRNO -- errno describes what happened -- and gzerror reports it, but
+// gzflush and gzsetparams both refuse outright on a latched error and return
+// Z_STREAM_ERROR instead of passing the code through. gzsetparams does so even
+// when the level asked for is the one the file already has, because zlib checks
+// the latch before it checks whether anything would change. Only the close
+// hands the latched code back. Measured in bare zlib 1.3 with no shim loaded,
+// one call at a time.
 TEST_F(GzipFileTest, FlushFailureReportsZErrno) {
-#if !defined(USE_IGZIP) && !defined(USE_QAT) && !defined(USE_IAA)
-  GTEST_SKIP() << "no backend compiled in, so the file is pinned to zlib and "
-                  "these calls are zlib's to answer";
-#endif
   if (access("/dev/full", W_OK) != 0) {
     GTEST_SKIP() << "/dev/full is not available";
   }
-  EnableSomeGzCompressPath();
+  EnableShimOwnedGzWrites();
 
   int fd = open("/dev/full", O_WRONLY);
   ASSERT_NE(fd, -1);
@@ -7501,14 +7521,19 @@ TEST_F(GzipFileTest, FlushFailureReportsZErrno) {
   ASSERT_NE(input, nullptr);
   EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)), 0);
 
-  EXPECT_EQ(gzflush(fp, Z_SYNC_FLUSH), Z_ERRNO);
-  // The level has to differ from the one the file was opened with, or there is
-  // nothing to flush for and zlib itself would not flush either.
-  EXPECT_EQ(gzsetparams(fp, 1, Z_DEFAULT_STRATEGY), Z_ERRNO);
-  // Which is the other half: asking for the level the file already has changes
-  // nothing, so it must not flush, and it succeeds even here. That the request
-  // above is still a change proves the failed call recorded nothing.
-  EXPECT_EQ(gzsetparams(fp, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY), Z_OK);
+  // The failure itself is Z_ERRNO, and that is the code the file is holding.
+  int err = Z_OK;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+
+  // But these two refuse on the latch rather than reporting it.
+  EXPECT_EQ(gzflush(fp, Z_SYNC_FLUSH), Z_STREAM_ERROR);
+  EXPECT_EQ(gzsetparams(fp, 1, Z_DEFAULT_STRATEGY), Z_STREAM_ERROR);
+  // Including when the level asked for is the one the file already has, which
+  // would otherwise be a no-op: the latch is checked first.
+  EXPECT_EQ(gzsetparams(fp, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY),
+            Z_STREAM_ERROR);
+  // The close is the one call that hands the latched code back.
   EXPECT_EQ(gzclose_w(fp), Z_ERRNO);
 
   DestroyBlock(input);
@@ -8074,8 +8099,13 @@ static void EnableShimOwnedGzReads() {
 static std::string PositionStampedPayload(size_t records) {
   std::string payload;
   payload.reserve(records * 16);
-  char record[17];
   for (size_t i = 0; i < records; i++) {
+    // "[off" + 8 digits + "]" is 13 characters, and the record is zeroed first
+    // so that the three bytes after it are ones this function chose rather than
+    // whatever was on the stack -- the append below takes all 16. Keeping them
+    // NUL also keeps snprintf's terminator in place, which is what lets a test
+    // read 16 bytes and compare the result as a C string.
+    char record[17] = {0};
     snprintf(record, sizeof(record), "[off%08zu]", i * 16);
     payload.append(record, 16);
   }
@@ -8705,6 +8735,329 @@ TEST_F(GzipFileTest, GzbufferAcceptsOnlyBeforeAnyIo) {
   ASSERT_EQ(gzwrite(fp, payload.data(), static_cast<unsigned>(payload.size())),
             static_cast<int>(payload.size()));
   EXPECT_EQ(gzbuffer(fp, 16384), -1);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
+// ---------------------------------------------------------------------------
+// The header test happens on demand, not at open.
+//
+// zlib performs no I/O at all inside gzopen or gzdopen: it decides nothing
+// about the file until the first read. Reading two bytes at open to run the
+// shim's own header test broke that in two visible ways, and these are those
+// two ways.
+// ---------------------------------------------------------------------------
+
+// gzdopen on a pipe that is empty but still has a writer must return, because a
+// single-threaded program is allowed to wrap the read end first and write to it
+// afterwards. An open-time read blocks there and the program never gets control
+// back.
+//
+// The open runs on a thread only so the test can survive its own failure: if
+// the open does block, the write below unblocks it and the join succeeds, and
+// the expectation reports it. Run inline, a regression here would hang the
+// suite.
+TEST_F(GzipFileTest, GzdopenOnAPipeWithNoDataYetDoesNotBlock) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  int fds[2];
+  ASSERT_EQ(pipe(fds), 0);
+
+  const std::string payload = PositionStampedPayload(64);
+  gzFile fp = nullptr;
+  std::promise<void> opened;
+  std::future<void> opened_future = opened.get_future();
+  std::thread opener([&] {
+    fp = gzdopen(fds[0], "rb");
+    opened.set_value();
+  });
+
+  const bool returned_before_any_data =
+      opened_future.wait_for(std::chrono::seconds(5)) ==
+      std::future_status::ready;
+
+  // Written whether or not the open came back, so the thread is always
+  // joinable.
+  gzFile wp = gzdopen(fds[1], "wb6");
+  ASSERT_NE(wp, nullptr);
+  ASSERT_EQ(gzwrite(wp, payload.data(), static_cast<unsigned>(payload.size())),
+            static_cast<int>(payload.size()));
+  ASSERT_EQ(gzclose(wp), Z_OK);
+  opener.join();
+
+  EXPECT_TRUE(returned_before_any_data);
+  ASSERT_NE(fp, nullptr);
+
+  // And the header test still runs when it is needed, so the deferral costs the
+  // file nothing.
+  std::string got(payload.size(), '\0');
+  ASSERT_EQ(gzread(fp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(payload.size()));
+  EXPECT_EQ(got, payload);
+  EXPECT_EQ(gzdirect(fp), 0);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// A non-blocking descriptor with nothing on it yet. An open-time read comes
+// back EAGAIN, which the peek's error path latches as Z_ERRNO -- so the file is
+// broken before the application has asked it for anything, and plain zlib
+// reports no such error.
+TEST_F(GzipFileTest, GzdopenOnANonBlockingPipeLatchesNoError) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  int fds[2];
+  ASSERT_EQ(pipe(fds), 0);
+  ASSERT_EQ(fcntl(fds[0], F_SETFL, O_NONBLOCK), 0);
+
+  gzFile fp = gzdopen(fds[0], "rb");
+  ASSERT_NE(fp, nullptr);
+  int err = Z_OK;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+  // Nothing has been read, so the gzbuffer opportunity is still open. This is
+  // the same fact from the other side: zlib refuses gzbuffer once it has
+  // allocated, and it allocates when it looks.
+  EXPECT_EQ(gzbuffer(fp, 8192), 0);
+
+  // The whole member goes in before the first read, so no read below meets an
+  // empty pipe and O_NONBLOCK never comes into it.
+  const std::string payload = PositionStampedPayload(64);
+  gzFile wp = gzdopen(fds[1], "wb6");
+  ASSERT_NE(wp, nullptr);
+  ASSERT_EQ(gzwrite(wp, payload.data(), static_cast<unsigned>(payload.size())),
+            static_cast<int>(payload.size()));
+  ASSERT_EQ(gzclose(wp), Z_OK);
+
+  std::string got(payload.size(), '\0');
+  ASSERT_EQ(gzread(fp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(payload.size()));
+  EXPECT_EQ(got, payload);
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// The other half of ForwardSeekOnATransparentPipeFollowsZlib, and the reason
+// the lazy peek changes which flag gates that seek. gzdirect is the one call
+// that makes zlib look without the application having read anything: after it
+// zlib is in COPY, so gzseek lseeks the descriptor and a pipe refuses it. Keyed
+// on "has any read happened" the shim would instead take the lazy path and
+// return the offset, disagreeing with zlib on the same call sequence.
+TEST_F(GzipFileTest, GzdirectThenSeekOnATransparentPipeIsRefused) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const int fd = PipeOfPlainBytes("0123456789ABCDEF");
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  EXPECT_EQ(gzdirect(fp), 1);
+  EXPECT_EQ(gzseek(fp, 4, SEEK_SET), -1);
+  // Refused, not damaged: the file still reads from where it was.
+  char buf[8] = {0};
+  ASSERT_EQ(gzread(fp, buf, 4), 4);
+  EXPECT_EQ(std::string(buf, 4), "0123");
+  EXPECT_EQ(gzclose(fp), Z_OK);
+}
+
+// ---------------------------------------------------------------------------
+// Boundary cases the shim used to answer differently from zlib.
+// ---------------------------------------------------------------------------
+
+// zlib's gz_read and gz_write both return 0 for a zero-length request before
+// they allocate anything and before they serve a pending seek. So a zero-length
+// call is not the start of I/O: gzbuffer is still legal after it, and a
+// promised seek is still outstanding. Measured in bare zlib with no shim
+// loaded.
+TEST_F(GzipFileTest, ZeroLengthIoIsNotTheStartOfIo) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  ASSERT_EQ(ZlibCompressGzipFile(payload.data(), payload.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  char buf[17] = {0};
+  EXPECT_EQ(gzread(fp, buf, 0), 0);
+  EXPECT_EQ(gzbuffer(fp, 8192), 0);
+
+  // And it leaves a promised seek alone rather than paying for it.
+  EXPECT_EQ(gzseek(fp, 32, SEEK_SET), 32);
+  EXPECT_EQ(gzread(fp, buf, 0), 0);
+  EXPECT_EQ(gztell(fp), 32);
+  ASSERT_EQ(gzread(fp, buf, 16), 16);
+  EXPECT_STREQ(buf, "[off00000032]");
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+
+  fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzwrite(fp, "", 0), 0);
+  EXPECT_EQ(gzbuffer(fp, 8192), 0);
+  // The pending seek survives it here too, so the zeros land at the close and
+  // not one call early.
+  EXPECT_EQ(gzseek(fp, 16, SEEK_CUR), 16);
+  EXPECT_EQ(gzwrite(fp, "", 0), 0);
+  EXPECT_EQ(gztell(fp), 16);
+  ASSERT_EQ(gzwrite(fp, payload.data(), static_cast<unsigned>(payload.size())),
+            static_cast<int>(payload.size()));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  std::string got(16 + payload.size(), 'x');
+  ASSERT_EQ(gzread(fp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(got.size()));
+  EXPECT_EQ(got, std::string(16, '\0') + payload);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
+// zlib's gzungetc calls gz_look, which allocates, so the gzbuffer opportunity
+// is gone afterwards even though the caller has read nothing. Measured against
+// libz 1.3 rather than read off the vendored copy: that gz_look call arrived in
+// 1.2.12 and the copy predates it.
+TEST_F(GzipFileTest, GzungetcEndsTheGzbufferOpportunity) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  ASSERT_EQ(ZlibCompressGzipFile(payload.data(), payload.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzbuffer(fp, 8192), 0);
+  ASSERT_EQ(gzungetc('X', fp), 'X');
+  EXPECT_EQ(gzbuffer(fp, 16384), -1);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
+// zlib's gzflush checks the flush value along with the mode and the error
+// latch, all before it fills a pending seek. Filling first means a rejected
+// call has already changed the file: the zeros are in it and the call still
+// returns Z_STREAM_ERROR, so nothing tells the caller that happened.
+//
+// The gap is deliberately bigger than the shim's 256 KiB write buffer, because
+// that is what makes the difference reach the file. A small gap is buffered and
+// the file on disk looks the same either way.
+TEST_F(GzipFileTest, GzflushRejectsBadFlushBeforeFillingASeek) {
+  EnableShimOwnedGzWrites();
+  SetUncompressPath(ZLIB, false, false);
+
+  const z_off_t gap = 4 << 20;
+  const char* filename = "file.gz";
+  remove(filename);
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, "head", 4), 4);
+  ASSERT_EQ(gzflush(fp, Z_SYNC_FLUSH), Z_OK);
+  const auto size_before = std::filesystem::file_size(filename);
+
+  ASSERT_EQ(gzseek(fp, gap, SEEK_CUR), gap + 4);
+  EXPECT_EQ(gzflush(fp, Z_FINISH + 1), Z_STREAM_ERROR);
+  EXPECT_EQ(std::filesystem::file_size(filename), size_before);
+  EXPECT_EQ(gzflush(fp, -1), Z_STREAM_ERROR);
+  EXPECT_EQ(std::filesystem::file_size(filename), size_before);
+
+  // The seek is still owed, so a flush zlib accepts pays it.
+  EXPECT_EQ(gzflush(fp, Z_SYNC_FLUSH), Z_OK);
+  EXPECT_GT(std::filesystem::file_size(filename), size_before);
+  EXPECT_EQ(gztell(fp), gap + 4);
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  gzFile rp = gzopen(filename, "rb");
+  ASSERT_NE(rp, nullptr);
+  std::string got(static_cast<size_t>(gap) + 4, 'x');
+  ASSERT_EQ(gzread(rp, &got[0], static_cast<unsigned>(got.size())),
+            static_cast<int>(got.size()));
+  EXPECT_EQ(got, "head" + std::string(static_cast<size_t>(gap), '\0'));
+  EXPECT_EQ(gzclose(rp), Z_OK);
+  remove(filename);
+}
+
+// /dev/full accepts an open and fails every write with ENOSPC, which is the one
+// way to reach a write failure at close without a filesystem to fill up.
+//
+// gzclose has to report it. zlib's gzclose_w takes state->err as its return
+// value, so a disk-full at close comes back as an error there; dropping the
+// return of the zero-fill instead produces a short file and Z_OK, which is
+// silent truncation.
+//
+// The gap is over the shim's 256 KiB write buffer for the same reason as in
+// GzflushRejectsBadFlushBeforeFillingASeek: below that, the zero-fill buffers
+// cleanly and it is the close's own flush that meets the failure.
+TEST_F(GzipFileTest, GzcloseReportsAZeroFillThatCouldNotBeWritten) {
+  EnableShimOwnedGzWrites();
+
+  const int fd = open("/dev/full", O_WRONLY);
+  if (fd == -1) {
+    GTEST_SKIP() << "/dev/full is not available";
+  }
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, "head", 4), 4);
+  ASSERT_EQ(gzseek(fp, 4 << 20, SEEK_CUR), (4 << 20) + 4);
+  EXPECT_NE(gzclose(fp), Z_OK);
+}
+
+// A file that started on an accelerator and then fell back to zlib for the rest
+// of its life -- gzsetparams to level 0 is the supported way there. From that
+// point zlib does the writing and zlib latches the failures, so the shim's own
+// error field stays clean and gzerror would report Z_OK for a write that did
+// not happen. Mirroring zlib's latch back is what makes the answer true again.
+TEST_F(GzipFileTest, GzerrorReportsAFailedWriteZlibPerformed) {
+  EnableSomeGzCompressPath(/*zlib_fallback=*/false);
+
+  const int fd = open("/dev/full", O_WRONLY);
+  if (fd == -1) {
+    GTEST_SKIP() << "/dev/full is not available";
+  }
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzsetparams(fp, 0, Z_DEFAULT_STRATEGY), Z_OK);
+
+  // Large enough that zlib's own buffer fills and it really writes, rather than
+  // holding everything until the close.
+  const std::string payload = PositionStampedPayload(1 << 16);
+  const int written =
+      gzwrite(fp, payload.data(), static_cast<unsigned>(payload.size()));
+  EXPECT_LT(written, static_cast<int>(payload.size()));
+
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_NE(err, Z_OK);
+  EXPECT_NE(message, nullptr);
+  EXPECT_NE(gzclose(fp), Z_OK);
+}
+
+// The 32-bit position calls are not casts of the 64-bit ones: zlib narrows with
+// a round trip and answers -1 for an offset that does not fit. That is
+// unreachable where z_off_t is already 64 bits, so what this pins down is that
+// the two families still agree -- the check was added around live code.
+TEST_F(GzipFileTest, NarrowAndWidePositionCallsAgree) {
+  EnableSomeGzCompressPath();
+  EnableShimOwnedGzReads();
+
+  const std::string payload = PositionStampedPayload(64);
+  ASSERT_EQ(ZlibCompressGzipFile(payload.data(), payload.size()), Z_OK);
+
+  const char* filename = "file.gz";
+  gzFile fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_EQ(gzseek(fp, 32, SEEK_SET), gzseek64(fp, 32, SEEK_SET));
+  char buf[17] = {0};
+  ASSERT_EQ(gzread(fp, buf, 16), 16);
+  EXPECT_EQ(gztell(fp), gztell64(fp));
+  EXPECT_EQ(gztell(fp), 48);
+  EXPECT_EQ(gzoffset(fp), gzoffset64(fp));
+  EXPECT_GT(gzoffset(fp), 0);
   EXPECT_EQ(gzclose(fp), Z_OK);
   remove(filename);
 }

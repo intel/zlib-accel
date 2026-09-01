@@ -2158,9 +2158,18 @@ struct GzipFile {
   // live in io_buf: that is allocated lazily, on the first read.
   unsigned char peek[2] = {0, 0};
   uint8_t peek_len = 0;
-  // Set when the shim, rather than zlib, ran the header test. This is what
-  // gzdirect answers from, and gating on it keeps the seekable case exactly as
-  // it was: there zlib has looked and answers for itself.
+  // Set at open for a descriptor that cannot be rewound and that an accelerator
+  // is configured for: the shim, rather than zlib, is going to have to run the
+  // header test on this file. It says nothing about whether that has happened
+  // yet, and it stays true for the life of the file, which is what makes it the
+  // gate gzdirect can be gated on -- the seekable case is untouched, because
+  // there zlib has looked and answers for itself.
+  bool shim_must_peek = false;
+  // Set once that test has actually run, which is the moment the descriptor
+  // moved. It is deliberately not done at open: zlib performs no I/O until the
+  // first read, and a read inside gzdopen deadlocks the single-threaded program
+  // that wraps a pipe's read end before writing to it. So this is also the
+  // shim's stand-in for zlib's how != LOOK.
   bool shim_peeked = false;
   // The peek said this is not a gzip member, so there is nothing to decompress
   // and the shim copies bytes through -- zlib's COPY mode, for the one case
@@ -2213,6 +2222,41 @@ static void GzSetError(GzipFile* gz, int err, const char* text) {
 // such tolerance. Both asymmetries are zlib's (gzread.c, gzwrite.c).
 static bool GzReadableAfterError(const GzipFile* gz) {
   return gz->err == Z_OK || gz->err == Z_BUF_ERROR;
+}
+
+// zlib's error latch copied into the shim's.
+//
+// Needed wherever the shim hands a write to zlib and zlib is the one that
+// fails. The failure is then recorded in zlib's gz_state, while gzerror below
+// answers from the shim's latch for every file the shim registered -- so
+// without this the shim goes on reporting Z_OK for a write that did not happen,
+// and gzclose says the same. The files at risk are the ones that did not start
+// on the zlib path and were moved onto it later: gzsetparams to a level no
+// backend can serve, or a mid-write fallback. A file zlib owned from the moment
+// it was opened never gets here, because zlib_owns_file makes its gzerror
+// delegate.
+//
+// One direction only. zlib's Z_OK is not copied over the shim's latch, so this
+// can add an error but never clear one.
+//
+// The message is taken verbatim rather than through GzSetError: zlib has
+// already prefixed it with the same file name that helper would add.
+static void GzMirrorZlibError(gzFile file, GzipFile* gz) {
+  if (orig_gzerror == nullptr) {
+    return;
+  }
+  int err = Z_OK;
+  const char* text = orig_gzerror(file, &err);
+  if (err == Z_OK) {
+    return;
+  }
+  gz->err = err;
+  try {
+    gz->msg = text != nullptr ? text : "";
+  } catch (...) {
+    // Only the text is lost; the code is the part callers branch on.
+    gz->msg.clear();
+  }
 }
 
 class GzipFiles {
@@ -2268,9 +2312,31 @@ static bool GzUncompressAcceleratorSelected() {
 // This is the second use of the magic-number test in gzread below, not a second
 // implementation of it. It is also what forces gzdirect to be intercepted: zlib
 // has not looked, so zlib cannot answer.
-static void GzPeekAtOpen(GzipFile* gz) {
+//
+// Split in two along the line of what needs the descriptor. Deciding *that* the
+// shim will have to look costs nothing and is settled at open, below; the
+// looking itself waits, because zlib performs no I/O at all until the first
+// read and a read from inside gzdopen is a behaviour change with teeth. A
+// single-threaded program that wraps a pipe's read end and only then writes to
+// it would deadlock in gzdopen, and a non-blocking descriptor would latch
+// EAGAIN before the application had asked for anything.
+static void GzDecideOwnershipAtOpen(GzipFile* gz) {
   if (!GzUncompressAcceleratorSelected() || gz->path == ZLIB) {
     gz->path = ZLIB;
+    return;
+  }
+  gz->shim_must_peek = true;
+  // Settled here even though no byte has moved yet. The shim is the only reader
+  // this descriptor is going to have: it is about to take the header bytes off
+  // it, and they cannot be put back for zlib to find.
+  gz->shim_owns_reads = true;
+}
+
+// The look itself, run at the first moment the answer is actually needed -- the
+// first read, or an application gzdirect. Idempotent, and a no-op for every
+// file that is not the non-rewindable case.
+static void GzEnsurePeeked(GzipFile* gz) {
+  if (!gz->shim_must_peek || gz->shim_peeked) {
     return;
   }
 
@@ -2298,10 +2364,6 @@ static void GzPeekAtOpen(GzipFile* gz) {
   gz->shim_peeked = true;
   gz->transparent_read =
       !(gz->peek_len == 2 && gz->peek[0] == 0x1f && gz->peek[1] == 0x8b);
-  // Both ways round: bytes have left the descriptor, so zlib must never read it
-  // again. That is the existing invariant, unchanged in meaning -- only the
-  // reason the descriptor moved is new.
-  gz->shim_owns_reads = true;
 }
 
 // Ask zlib, once per read-mode open, whether this file is a gzip member at all.
@@ -2332,7 +2394,7 @@ static void GzLookAtOpen(gzFile file, GzipFile* gz) {
   // gzrewind refuse on.
   gz->start = lseek(gz->fd, 0, SEEK_CUR);
   if (gz->start == static_cast<off_t>(-1)) {
-    GzPeekAtOpen(gz);
+    GzDecideOwnershipAtOpen(gz);
     return;
   }
 
@@ -2881,6 +2943,15 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
     return 0;
   }
 
+  // A write of nothing is where zlib stops: gz_write returns before it
+  // allocates its buffers and before it fills a pending seek, so neither the
+  // gzbuffer opportunity below nor the gap is touched. Confirmed in bare zlib,
+  // no shim: gzwrite(f, "", 0) returns 0 and the gzbuffer after it is still
+  // accepted.
+  if (len == 0) {
+    return 0;
+  }
+
   // Past every refusal above, so this write is going to happen: from here on
   // gzbuffer is too late, exactly as it is in zlib.
   gz->io_started = true;
@@ -2958,6 +3029,12 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
     if (pinned || configs[USE_ZLIB_COMPRESS]) {
       gz->path = ZLIB;
     }
+    // zlib performed this write, so a failure of it is latched in zlib's state
+    // and not in this file's. Without copying it across, gzerror and gzclose
+    // would report Z_OK for data that never reached the file.
+    if (written_bytes < len) {
+      GzMirrorZlibError(file, gz.get());
+    }
   }
 
 gzwrite_end:
@@ -2994,20 +3071,33 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
     return orig_gzsetparams(file, level, strategy);
   }
 
+  // zlib's refusals, in zlib's order: a write-mode file, a clean error latch,
+  // and not a transparent one. They have to be answered from the shim's own
+  // state and cannot be delegated, because on this path the shim did the
+  // writing and so the shim holds the latch -- zlib's own state never saw the
+  // failure and would answer Z_OK for a file that is broken. Transparency is
+  // not checked because it is not reachable: a "wT" or level-0 file is pinned
+  // to ZLIB when it is opened and left above.
+  //
+  // Measured in bare zlib 1.3: after a write that failed, gzsetparams returns
+  // Z_STREAM_ERROR and not the latched code, and it does so even when the level
+  // asked for is the one the file already has -- the latch is checked before
+  // the no-change shortcut.
+  if (!GzIsWriteMode(gz->mode) || gz->err != Z_OK) {
+    return Z_STREAM_ERROR;
+  }
+
   // Data still buffered was compressed at the old level, so it has to go out as
   // a member of its own before the new one takes effect -- and before zlib
   // records it, because zlib applies a parameter change only once the flush
   // that precedes it has succeeded. Forwarding first would leave zlib holding
   // the new level and this file the old one on a flush that fails.
   //
-  // Both guards are load-bearing. A file zlib refuses must not be flushed, and
-  // the mode is the only refusal reachable here: a transparent or level-0 file
-  // is pinned to ZLIB when it is opened, so it never gets past the check above.
-  // And zlib skips the flush entirely when the request changes nothing, so
-  // without the second guard a no-op call could report a failure zlib does not
-  // have. Only the level is compared, for the reason given below: zlib does not
-  // flush for a strategy it is not going to act on either.
-  if (GzIsWriteMode(gz->mode) && level != gz->level) {
+  // The guard is load-bearing: zlib skips the flush entirely when the request
+  // changes nothing, so without it a no-op call could report a failure zlib
+  // does not have. Only the level is compared, for the reason given below --
+  // zlib does not flush for a strategy it is not going to act on either.
+  if (level != gz->level) {
     // Z_ERRNO is what zlib returns for an error writing the flushed data; a
     // flush that could not run at all reports itself instead.
     const int flush_ret = FlushBufferedWrite(file, gz.get());
@@ -3024,6 +3114,9 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
   // the one that compresses if this file is later handed back.
   const int ret = orig_gzsetparams(file, level, strategy);
   if (ret != Z_OK) {
+    // zlib refused, and if the reason was a flush of its own that failed, the
+    // error is in its latch rather than this file's.
+    GzMirrorZlibError(file, gz.get());
     return ret;
   }
 
@@ -3062,17 +3155,30 @@ int ZEXPORT gzflush(gzFile file, int flush) {
     return orig_gzflush != nullptr ? orig_gzflush(file, flush) : Z_STREAM_ERROR;
   }
 
+  // A flush zlib is going to refuse writes nothing at all: zlib checks the
+  // flush value before it fills a pending seek (gzflush, gzwrite.c). Measured
+  // in bare zlib, no shim: gzwrite "head", flush, gzseek +4096, then
+  // gzflush(999) returns Z_STREAM_ERROR and leaves the file at 20 bytes -- the
+  // next valid flush is what lands the gap, taking it to 45. So the gap is only
+  // filled once this call is known to be one zlib would have carried out.
+  const bool flush_is_valid = flush >= 0 && flush <= Z_FINISH;
+
   // A gap left by a forward seek has to be filled before the flush, or it would
   // land after the data that follows it -- and it has to happen on this side of
   // the delegation below, because the skip is in the shim's state and zlib's
   // own flush knows nothing about it. Same reasoning as in GzCloseCommon.
-  if (gz->pending_skip > 0 && GzIsWriteMode(gz->mode) && gz->err == Z_OK &&
-      GzWriteZeros(file, gz.get()) != 0) {
+  if (flush_is_valid && gz->pending_skip > 0 && GzIsWriteMode(gz->mode) &&
+      gz->err == Z_OK && GzWriteZeros(file, gz.get()) != 0) {
     return gz->err;
   }
 
   if (gz->path == ZLIB) {
-    return orig_gzflush != nullptr ? orig_gzflush(file, flush) : Z_STREAM_ERROR;
+    const int ret =
+        orig_gzflush != nullptr ? orig_gzflush(file, flush) : Z_STREAM_ERROR;
+    // zlib performed the flush, so a failure of it is latched over there and
+    // this file's own latch would otherwise keep saying Z_OK.
+    GzMirrorZlibError(file, gz.get());
+    return ret;
   }
 
   // zlib's own checks, in zlib's order: a write-mode file and a flush value in
@@ -3080,8 +3186,7 @@ int ZEXPORT gzflush(gzFile file, int flush) {
   // compressed, which is what the flush below does.
   // A latched error is Z_STREAM_ERROR here, not the latched code itself
   // (gzflush, gzwrite.c:562).
-  if (!GzIsWriteMode(gz->mode) || gz->err != Z_OK || flush < 0 ||
-      flush > Z_FINISH) {
+  if (!GzIsWriteMode(gz->mode) || gz->err != Z_OK || !flush_is_valid) {
     return Z_STREAM_ERROR;
   }
 
@@ -3289,9 +3394,27 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
   Log(LogLevel::LOG_INFO, "gzread Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", buf ", buf, ", len ", len, "\n");
 
+  // A read of nothing is where zlib stops: gz_read returns before it looks at
+  // the header, allocates, or serves a pending seek, so the gzbuffer
+  // opportunity below survives it. Confirmed in bare zlib, no shim: gzread(f,
+  // buf, 0) returns 0 and the gzbuffer after it is still accepted.
+  if (len == 0) {
+    return 0;
+  }
+
   // Past every refusal above, so this read is going to happen: from here on
   // gzbuffer is too late, exactly as it is in zlib.
   gz->io_started = true;
+
+  // The header test, for a descriptor that could not be rewound and so had to
+  // be tested by the shim. This is the first point at which the answer is
+  // needed and the first at which zlib would have read anything either. It has
+  // to run before the skip below, which reads through this same function and
+  // would otherwise decide transparency on the strength of an untested file.
+  GzEnsurePeeked(gz);
+  if (!GzReadableAfterError(gz)) {
+    return -1;
+  }
 
   // A gzseek that has been promised but not performed: the bytes it moved over
   // have to be read and discarded before this read can be served. zlib does
@@ -3360,7 +3483,7 @@ static int GzreadOwnedFile(gzFile file, GzipFile* gz, voidp buf, unsigned len) {
     gz->data_buf_size = 512 << 10;
     gz->io_buf_size = 512 << 10;
 
-    // The header bytes GzPeekAtOpen took off a non-seekable descriptor. They
+    // The header bytes GzEnsurePeeked took off a non-seekable descriptor. They
     // could not be put back, so they go in at the front of io_buf and the loop
     // below reads on top of them: read() appends at io_buf_content, so this is
     // just the buffer starting out holding its first two bytes. They cannot be
@@ -3659,6 +3782,13 @@ int ZEXPORT gzungetc(int c, gzFile file) {
     return -1;
   }
 
+  // zlib's gzungetc runs its header look if nothing has been read yet, which
+  // allocates and so closes the one-time gzbuffer window. Measured in bare
+  // zlib, no shim: gzopen then gzungetc then gzbuffer returns -1, where gzopen
+  // then gzbuffer returns 0. That call arrived in zlib 1.2.12, so it is a
+  // behaviour to check for rather than to read off an older copy of the source.
+  gz->io_started = true;
+
   // reached_eof stays as it is: the file itself really has been read to its
   // end, and that is what stops gzread from reading it again. The end-of-file
   // indicator is a different fact and this clears it, as zlib's own gzungetc
@@ -3796,8 +3926,18 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
   // anything -- whichever engine ends up compressing the zeros. And this has to
   // run before the Unset below, because it writes through gzwrite, which would
   // otherwise no longer recognize the file and hand it to zlib.
-  if (gz->pending_skip > 0 && GzIsWriteMode(gz->mode)) {
-    GzWriteZeros(file, gz.get());
+  //
+  // The result is kept. zlib's gzclose_w records a failed fill in the code it
+  // returns and closes the file anyway (gzwrite.c), and dropping it here would
+  // mean a full disk produced a short file and a Z_OK from gzclose -- the one
+  // report an application has that its data is safe. Weakest of the failures
+  // below, in zlib's order: anything that goes wrong later replaces it.
+  int zeros_ret = Z_OK;
+  if (gz->pending_skip > 0 && GzIsWriteMode(gz->mode) &&
+      GzWriteZeros(file, gz.get()) != 0) {
+    // gzwrite latched the reason on the way out; Z_ERRNO is the fallback for a
+    // failure that somehow left no latch, since gzwrite is what failed.
+    zeros_ret = gz->err != Z_OK ? gz->err : Z_ERRNO;
   }
 
   // Unregister up front, before orig_close frees the gzFile. Unsetting after
@@ -3810,7 +3950,7 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
       static_cast<void*>(file), ", buffered ", gz->data_buf_content, ", path ",
       static_cast<int>(gz->path), "\n");
 
-  int ret = 0;
+  int ret = zeros_ret;
   if (gz->path != ZLIB &&
       (gz->mode == FileMode::WRITE || gz->mode == FileMode::APPEND)) {
     // Compress any remaining buffered data.
@@ -3823,7 +3963,17 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
         readlink(("/proc/self/fd/" + std::to_string(gz->fd)).c_str(), file_path,
                  MAXPATHLEN - 1);
     if (readlink_ret == -1) {
-      ret = orig_close(file);
+      // Same precedence as the chain below, so that bailing out here does not
+      // silently drop a failed flush or a failed gap fill: the close reports
+      // itself if it failed, otherwise whichever write failure came first.
+      const int close_ret = orig_close(file);
+      if (close_ret != Z_OK) {
+        ret = close_ret;
+      } else if (write_ret == Z_STREAM_ERROR) {
+        ret = Z_STREAM_ERROR;
+      } else if (write_ret != 0) {
+        ret = Z_ERRNO;
+      }
       Log(LogLevel::LOG_ERROR, "GzCloseCommon Line ", __LINE__,
           ", readlink_ret return error \n");
       return ret;
@@ -3852,8 +4002,12 @@ static int GzCloseCommon(gzFile file, FileMode required_mode,
     } else if (truncate_ret != 0) {
       ret = Z_ERRNO;
     }
+    // Nothing later went wrong, so ret keeps whatever the gap fill left in it.
   } else {
-    ret = orig_close(file);
+    const int close_ret = orig_close(file);
+    if (close_ret != Z_OK) {
+      ret = close_ret;
+    }
   }
   Log(LogLevel::LOG_INFO, "GzCloseCommon Line ", __LINE__, ", file ",
       static_cast<void*>(file), ", return code ", ret, ", buffered processed ",
@@ -3902,15 +4056,21 @@ int ZEXPORT gzeof(gzFile file) {
 // right then, pulling up to 8 KB out of the pipe into zlib's private buffer and
 // punching a hole in the front of the shim's input.
 //
-// Everything else delegates, which is the whole point of the shim_peeked gate.
-// A seekable file already has zlib's own cached answer, and it is the true one
-// in all four cases (see GzLookAtOpen); a write-mode file keeps whatever zlib
-// reports for "wT". Neither is touched here.
+// Everything else delegates, which is the whole point of the shim_must_peek
+// gate. A seekable file already has zlib's own cached answer, and it is the
+// true one in all four cases (see GzLookAtOpen); a write-mode file keeps
+// whatever zlib reports for "wT". Neither is touched here.
+//
+// The gate is shim_must_peek and not shim_peeked because the peek is lazy: on a
+// file the shim owns the test may not have run yet, and this call is one of the
+// two things that makes it run. zlib's gzdirect looks for the same reason, so
+// the I/O this does is I/O zlib would also have done.
 int ZEXPORT gzdirect(gzFile file) {
   auto gz = gzip_files.Get(file);
-  if (gz == nullptr || !gz->shim_peeked) {
+  if (gz == nullptr || !gz->shim_must_peek) {
     return orig_gzdirect != nullptr ? orig_gzdirect(file) : 0;
   }
+  GzEnsurePeeked(gz.get());
   return gz->transparent_read ? 1 : 0;
 }
 
@@ -3928,6 +4088,21 @@ int ZEXPORT gzdirect(gzFile file) {
 // went to zlib there has every call on it forwarded, so zlib's own state is the
 // complete and correct one and these entry points delegate untouched.
 // ---------------------------------------------------------------------------
+
+// Every one of zlib's three plain-int position functions is its 64-bit
+// counterpart with the result put through this exact test (gzseek, gztell and
+// gzoffset in gzlib.c): an answer that does not survive the narrowing is not
+// reported as a smaller number, it is reported as a failure. A bare cast would
+// hand back a truncated offset instead, and the plain and 64-bit entry points
+// would then disagree about the same file.
+//
+// On a build where z_off_t is already 64 bits this never fires, which is
+// exactly why it has to be written down rather than left to the cast: the
+// platform that needs it is not the one this is developed on.
+static z_off_t GzNarrowOffset(z_off64_t value) {
+  return value == static_cast<z_off_t>(value) ? static_cast<z_off_t>(value)
+                                              : -1;
+}
 
 // zlib's gzrewind is gz_reset plus an lseek back to where the file was opened
 // (gzlib.c:361), so this has to put back the same set of things: the
@@ -4021,10 +4196,16 @@ static z_off64_t GzSeekOwned(GzipFile* gz, z_off64_t offset, int whence) {
   //   after the first read   how is COPY, so the lseek is attempted, and a pipe
   //                          refuses it
   //
-  // io_started is the shim's equivalent: it flips at the top of the first read,
-  // the same moment zlib's look runs. Measured rather than assumed -- the
-  // conformance suite's O11/O12 pipe seeks are what turned this asymmetry up.
-  if (gz->transparent_read && gz->io_started && gz->pos + offset >= 0) {
+  // transparent_read carries that distinction on its own, because the header
+  // test is lazy: it is only ever set by GzEnsurePeeked, so it cannot be true
+  // before the test has run, and the test runs at exactly the moments zlib's
+  // look does -- the first read, or an application gzdirect. So a false here
+  // means "zlib is still in LOOK" and the lazy path below is the matching one.
+  // It is deliberately not io_started, which is now a different event: gzdirect
+  // moves zlib to COPY without any application-visible I/O, and gating on
+  // io_started would take the lazy path there and disagree. Measured rather
+  // than assumed -- the conformance suite's O11/O12 pipe seeks turned this up.
+  if (gz->transparent_read && gz->pos + offset >= 0) {
     const off_t held = static_cast<off_t>(gz->peek_len) +
                        static_cast<off_t>(gz->pushback.size());
     if (lseek(gz->fd, static_cast<off_t>(offset) - held, SEEK_CUR) ==
@@ -4081,7 +4262,7 @@ z_off_t ZEXPORT gzseek(gzFile file, z_off_t offset, int whence) {
     return orig_gzseek != nullptr ? orig_gzseek(file, offset, whence) : -1;
   }
   // zlib's gzseek is gzseek64 with the result narrowed the same way (gzlib.c).
-  return static_cast<z_off_t>(GzSeekOwned(gz.get(), offset, whence));
+  return GzNarrowOffset(GzSeekOwned(gz.get(), offset, whence));
 }
 
 z_off64_t ZEXPORT gztell64(gzFile file) {
@@ -4103,7 +4284,7 @@ z_off_t ZEXPORT gztell(gzFile file) {
   if (gz->mode == FileMode::NONE) {
     return -1;
   }
-  return static_cast<z_off_t>(gz->pos + gz->pending_skip);
+  return GzNarrowOffset(gz->pos + gz->pending_skip);
 }
 
 // Where the *compressed* file is positioned, which zlib reports as the
@@ -4138,7 +4319,7 @@ z_off_t ZEXPORT gzoffset(gzFile file) {
   if (gz == nullptr || gz->zlib_owns_file) {
     return orig_gzoffset != nullptr ? orig_gzoffset(file) : -1;
   }
-  return static_cast<z_off_t>(GzOffsetOwned(gz.get()));
+  return GzNarrowOffset(GzOffsetOwned(gz.get()));
 }
 
 const char* ZEXPORT gzerror(gzFile file, int* errnum) {
