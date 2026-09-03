@@ -6811,6 +6811,29 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
   SetConfig(MAP_SHARDS, saved_shards);
 }
 
+// The log path is handed back through an out-parameter rather than parked in a
+// global, so a caller that asks for it gets what the config file names, and a
+// config file that names none leaves the caller's string alone.
+TEST_F(ConfigLoaderTest, LogFilePathHandedBack) {
+  std::string file_content;
+  std::string log_file;
+  EXPECT_TRUE(
+      LoadConfigFile(file_content, "../../config/default_config", &log_file));
+  EXPECT_EQ(log_file, "/tmp/zlib-accel.log");
+
+  const char* config_path = "/tmp/no_log_file_config";
+  std::ofstream config_file(config_path);
+  config_file << "log_level=1\n";
+  config_file.close();
+  std::string untouched = "unchanged";
+  EXPECT_TRUE(LoadConfigFile(file_content, config_path, &untouched));
+  EXPECT_EQ(untouched, "unchanged");
+  std::remove(config_path);
+
+  // Restore config from the official config file.
+  LoadConfigFile(file_content);
+}
+
 // The shim keeps per-stream state in maps keyed by z_streamp, and every entry
 // point that consumes that state has to cope with the entry being absent: a
 // stream that was never initialized at all, one whose *Init failed, or a
