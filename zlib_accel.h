@@ -23,4 +23,10 @@ ExecutionPath GetGzipFileExecutionPath(gzFile file);
 bool DeflateOwnsIgzipState(z_streamp strm);
 bool InflateOwnsIgzipState(z_streamp strm);
 
+// True once IAA has rejected a block of this stream for referencing a match
+// beyond its 4 kB history buffer. Tests need it because the record deliberately
+// survives inflateReset(), and nothing else about the stream reveals that it is
+// being kept. Always false in a build without IAA support.
+bool InflateIAAWindowRejected(z_streamp strm);
+
 #pragma GCC visibility pop

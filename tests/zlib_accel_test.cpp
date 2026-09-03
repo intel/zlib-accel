@@ -6773,6 +6773,287 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
   SetConfig(MAP_SHARDS, saved_shards);
 }
 
+#ifdef USE_IAA
+// IAA's decompressor has a fixed 4 kB history buffer, so it cannot decode a
+// stream whose producer used a larger window -- zlib's default is 32 kB. QPL
+// reports that as QPL_STS_BAD_DIST_ERR, and it is the one decompress failure
+// that predicts the next call: the window belongs to the compressor, not to the
+// block. IsIAADecompressible() cannot see it for raw deflate or gzip, where
+// there is no header to read the window out of, so the only way to know is to
+// be told once and remember.
+class IAAWindowRejectionTest : public ::testing::Test {};
+
+// Run one whole stream through strm and check the bytes. Returns the last
+// inflate() code so the caller can assert on it, or Z_DATA_ERROR if the output
+// came back wrong.
+int InflateWholeStream(z_streamp strm, const std::string& compressed,
+                       const char* expected, size_t expected_length) {
+  std::vector<Bytef> output(expected_length + 1024);
+  strm->next_in =
+      reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+  strm->avail_in = static_cast<uInt>(compressed.size());
+  strm->next_out = output.data();
+  strm->avail_out = static_cast<uInt>(output.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(strm, Z_NO_FLUSH);
+    if (ret != Z_OK && ret != Z_BUF_ERROR) {
+      break;
+    }
+  }
+  if (ret != Z_STREAM_END) {
+    return ret;
+  }
+  if (strm->total_out != expected_length ||
+      memcmp(output.data(), expected, expected_length) != 0) {
+    return Z_DATA_ERROR;
+  }
+  return Z_STREAM_END;
+}
+
+// Every case below except the first needs QPL to get far enough into a job to
+// report the oversized window. Without a usable device it fails at job
+// initialization instead, which leaves the flag correctly clear -- so the test
+// would be asserting the opposite of what it means to. Probe with a stream IAA
+// can definitely decode: a short one, whose matches cannot reach back 4 kB
+// because the whole payload is smaller than that.
+bool IAAHardwareDecompressWorks() {
+  const size_t input_length = 2048;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x4144);
+  if (input == nullptr) {
+    return false;
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  int ret = ZlibCompress(input, input_length, &compressed, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path);
+  DestroyBlock(input);
+  if (ret != Z_STREAM_END) {
+    return false;
+  }
+
+  std::vector<uint8_t> output(input_length + 1024);
+  uint32_t input_len = static_cast<uint32_t>(compressed.size());
+  uint32_t output_len = static_cast<uint32_t>(output.size());
+  bool end_of_stream = false;
+  ret = UncompressIAA(reinterpret_cast<uint8_t*>(&compressed[0]), &input_len,
+                      output.data(), &output_len, qpl_path_hardware,
+                      /*window_bits=*/-15, &end_of_stream);
+  return ret == 0 && end_of_stream && output_len == input_length;
+}
+
+// The contract UncompressIAA() now offers its callers, checked on QPL's
+// software path so that it holds on a host with no device: the software path
+// rejects an oversized window for the same reason and with the same status.
+TEST_F(IAAWindowRejectionTest, UncompressIAAReportsOversizedWindow) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e11);
+  ASSERT_NE(input, nullptr);
+
+  // Two encodings of the same bytes. GenerateSeededCompressibleBlock() repeats
+  // a string every 8192 bytes, so with zlib's full window the first is
+  // guaranteed to contain a match distance IAA cannot reach; restricted to 4
+  // kB, the second cannot contain one.
+  std::string wide;
+  std::string narrow;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &wide, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &narrow, -12, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  std::vector<uint8_t> output(input_length + 1024);
+  uint32_t input_len = static_cast<uint32_t>(wide.size());
+  uint32_t output_len = static_cast<uint32_t>(output.size());
+  bool end_of_stream = false;
+  bool window_too_large = false;
+  EXPECT_NE(UncompressIAA(reinterpret_cast<uint8_t*>(&wide[0]), &input_len,
+                          output.data(), &output_len, qpl_path_software,
+                          /*window_bits=*/-15, &end_of_stream,
+                          /*detect_gzip_ext=*/false, &window_too_large),
+            0);
+  EXPECT_TRUE(window_too_large);
+
+  // A stream IAA can follow decodes, and leaves the flag alone. Never setting
+  // it to false is what lets a caller pass one bool through a whole stream.
+  input_len = static_cast<uint32_t>(narrow.size());
+  output_len = static_cast<uint32_t>(output.size());
+  end_of_stream = false;
+  bool narrow_window_too_large = false;
+  EXPECT_EQ(UncompressIAA(reinterpret_cast<uint8_t*>(&narrow[0]), &input_len,
+                          output.data(), &output_len, qpl_path_software,
+                          /*window_bits=*/-12, &end_of_stream,
+                          /*detect_gzip_ext=*/false, &narrow_window_too_large),
+            0);
+  EXPECT_FALSE(narrow_window_too_large);
+  EXPECT_TRUE(end_of_stream);
+  EXPECT_EQ(output_len, input_length);
+  EXPECT_EQ(memcmp(output.data(), input, input_length), 0);
+
+  // Omitting the out-parameter has to stay legal: most callers do not care
+  // which failure they got.
+  input_len = static_cast<uint32_t>(wide.size());
+  output_len = static_cast<uint32_t>(output.size());
+  end_of_stream = false;
+  EXPECT_NE(UncompressIAA(reinterpret_cast<uint8_t*>(&wide[0]), &input_len,
+                          output.data(), &output_len, qpl_path_software,
+                          /*window_bits=*/-15, &end_of_stream),
+            0);
+
+  DestroyBlock(input);
+}
+
+// The point of the whole change. A rejection has to outlive inflateReset(),
+// because a reset is exactly what the callers that matter do between documents:
+// Lucene resets its Inflater once per stored field. Clearing the flag on reset
+// would forget the lesson before it was ever acted on.
+TEST_F(IAAWindowRejectionTest, StreamFlagSurvivesInflateReset) {
+  if (!IAAHardwareDecompressWorks()) {
+    GTEST_SKIP() << "no usable IAA device: QPL cannot reach the point where it "
+                    "reports an oversized history window";
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IAA, /*zlib_fallback=*/true, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e12);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+  EXPECT_FALSE(InflateIAAWindowRejected(&stream));
+
+  // The rejection costs one submission and then falls through to zlib, so the
+  // bytes are still right.
+  EXPECT_EQ(InflateWholeStream(&stream, compressed, input, input_length),
+            Z_STREAM_END);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+
+  ASSERT_EQ(inflateReset(&stream), Z_OK);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+  // inflateReset() clears the path, so a stream that had forgotten the
+  // rejection would be dispatched to IAA again here.
+  EXPECT_EQ(GetInflateExecutionPath(&stream), UNDEFINED);
+  EXPECT_EQ(InflateWholeStream(&stream, compressed, input, input_length),
+            Z_STREAM_END);
+  EXPECT_NE(GetInflateExecutionPath(&stream), IAA);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+
+  // inflateReset2() restarts the stream in a new format, and is the other way
+  // back to an undefined path.
+  ASSERT_EQ(inflateReset2(&stream, -15), Z_OK);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+// A copy decodes the rest of the same stream, so it inherits the verdict. The
+// settings are rebuilt member by member in SetFromCopy(), not assigned, so this
+// is the kind of field that gets silently dropped.
+TEST_F(IAAWindowRejectionTest, StreamFlagPropagatesThroughInflateCopy) {
+  if (!IAAHardwareDecompressWorks()) {
+    GTEST_SKIP() << "no usable IAA device: QPL cannot reach the point where it "
+                    "reports an oversized history window";
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IAA, /*zlib_fallback=*/true, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e13);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream source;
+  memset(&source, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&source, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&source, compressed, input, input_length),
+            Z_STREAM_END);
+  ASSERT_TRUE(InflateIAAWindowRejected(&source));
+
+  z_stream dest;
+  memset(&dest, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateCopy(&dest, &source), Z_OK);
+  EXPECT_TRUE(InflateIAAWindowRejected(&dest));
+  // And the copy keeps it across its own reset, like the original.
+  ASSERT_EQ(inflateReset(&dest), Z_OK);
+  EXPECT_TRUE(InflateIAAWindowRejected(&dest));
+  EXPECT_EQ(InflateWholeStream(&dest, compressed, input, input_length),
+            Z_STREAM_END);
+  EXPECT_NE(GetInflateExecutionPath(&dest), IAA);
+
+  ASSERT_EQ(inflateEnd(&dest), Z_OK);
+  ASSERT_EQ(inflateEnd(&source), Z_OK);
+  DestroyBlock(input);
+}
+
+// A stream IAA can serve must not be tarred by another stream's rejection: the
+// flag is per stream, and there is no process-wide counter behind it.
+TEST_F(IAAWindowRejectionTest, RejectionDoesNotAffectOtherStreams) {
+  if (!IAAHardwareDecompressWorks()) {
+    GTEST_SKIP() << "no usable IAA device: QPL cannot reach the point where it "
+                    "reports an oversized history window";
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IAA, /*zlib_fallback=*/true, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e14);
+  ASSERT_NE(input, nullptr);
+
+  std::string wide;
+  std::string narrow;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &wide, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &narrow, -12, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream rejected;
+  memset(&rejected, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&rejected, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&rejected, wide, input, input_length),
+            Z_STREAM_END);
+  ASSERT_TRUE(InflateIAAWindowRejected(&rejected));
+
+  z_stream served;
+  memset(&served, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&served, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&served, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_FALSE(InflateIAAWindowRejected(&served));
+  EXPECT_EQ(GetInflateExecutionPath(&served), IAA);
+
+  ASSERT_EQ(inflateEnd(&served), Z_OK);
+  ASSERT_EQ(inflateEnd(&rejected), Z_OK);
+  DestroyBlock(input);
+}
+#endif  // USE_IAA
+
 // The shim keeps per-stream state in maps keyed by z_streamp, and every entry
 // point that consumes that state has to cope with the entry being absent: a
 // stream that was never initialized at all, one whose *Init failed, or a
