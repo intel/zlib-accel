@@ -24,6 +24,10 @@ add_executable(zlib_accel_test
 )
 
 if(ASAN)
+    target_sources(zlib_accel_test PRIVATE asan_suppressions.cpp)
+endif()
+
+if(ASAN)
     # LeakSanitizer runs at exit under ASAN, and a vendor library holds
     # allocations it never releases; lsan.supp names them so the run can still
     # fail on a leak that is ours.
