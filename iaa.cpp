@@ -197,7 +197,8 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
 
 int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
                   uint32_t* output_length, qpl_path_t execution_path,
-                  int window_bits, bool* end_of_stream, bool detect_gzip_ext) {
+                  int window_bits, bool* end_of_stream, bool detect_gzip_ext,
+                  bool* window_too_large) {
   Log(LogLevel::LOG_INFO, "UncompressIAA() Line ", __LINE__, " input_length ",
       *input_length, "\n");
 
@@ -235,6 +236,14 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
 
   qpl_status status = qpl_execute_job(job);
   if (status != QPL_STS_OK && status != QPL_STS_MORE_OUTPUT_NEEDED) {
+    // QPL_STS_BAD_DIST_ERR means the stream referenced a match further back
+    // than IAA's 4 kB history buffer. Unlike the other failures this one is not
+    // about this call: it says the producer used a larger window, and every
+    // remaining block of the same stream will be rejected for the same reason.
+    // Report it separately so the caller can stop submitting.
+    if (status == QPL_STS_BAD_DIST_ERR && window_too_large != nullptr) {
+      *window_too_large = true;
+    }
     Log(LogLevel::LOG_ERROR, "UncompressIAA() Line ", __LINE__,
         " qpl_execute_job status ", status, "\n");
     return 1;
