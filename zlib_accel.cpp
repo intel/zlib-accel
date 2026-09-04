@@ -1,16 +1,49 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// libz exports gzseek64, gztell64 and gzoffset64 alongside their plain-named
-// counterparts, and an application built with -D_FILE_OFFSET_BITS=64 calls the
-// 64-bit names, so the shim has to define both sets or the pair would disagree
-// about where a file is positioned. zlib.h only declares them when asked
-// (zconf.h:506), and this is the ask. Note it is _LARGEFILE64_SOURCE, not
-// _FILE_OFFSET_BITS: the latter would additionally rename gzseek to gzseek64
-// here and leave the plain names undefined.
+// libz exports gzopen64, gzseek64, gztell64 and gzoffset64 alongside their
+// plain-named counterparts, and an application built with
+// -D_FILE_OFFSET_BITS=64 calls the 64-bit names, so the shim has to define both
+// sets or the pair would disagree about where a file is positioned. zlib.h only
+// declares them when asked (zconf.h:506), and this is the ask.
+//
+// zlib offers two large-file mechanisms and they are not interchangeable, which
+// zlib.h says in its own words at the top of the block: "provide 64-bit offset
+// functions if _LARGEFILE64_SOURCE defined, and/or change the regular functions
+// to 64 bits if _FILE_OFFSET_BITS is 64". _LARGEFILE64_SOURCE is *additive*: it
+// declares the *64 names next to the plain ones. _FILE_OFFSET_BITS=64 is
+// *substitutive*: it renames the plain names into the *64 names and skips the
+// branch that would have declared the plain prototypes. This file has to DEFINE
+// both sets as separate functions, so only the additive one can be used here.
+//
+// What is at stake is linkage, not only offset width. There is no extern "C"
+// anywhere in this file: every symbol gets C linkage by matching a declaration
+// zlib.h already made inside its own extern "C" block. An interceptor that
+// zlib.h does not declare is compiled as ordinary C++, comes out as (for
+// gzseek64) _Z8gzseek64P8gzFile_sli, and cannot be interposed by LD_PRELOAD --
+// with no compile error, no link error and no sign at runtime.
+//
+// The line below is not what prevents that here, and the note is worth leaving
+// rather than implying otherwise: on glibc, features.h defines
+// _LARGEFILE64_SOURCE itself whenever _GNU_SOURCE is set, every C++ front end
+// predefines _GNU_SOURCE, and features.h is reached before zconf.h tests the
+// macro. So Z_LARGE64 is on either way -- checked, including that an explicit
+// #undef here does not stick, because features.h re-establishes it afterwards.
+// The line stays because the requirement belongs in the file that has it
+// instead of resting on a C++ front end's choice of feature macros, and because
+// a C translation unit would genuinely need it (gcc -x c leaves
+// _LARGEFILE64_SOURCE unset).
 #define _LARGEFILE64_SOURCE 1
 
 #include "zlib_accel.h"
+
+// Guarding on Z_WANT64 rather than on _FILE_OFFSET_BITS directly: Z_WANT64 is
+// what zconf.h:510 derives, so it is true exactly when the rename is about to
+// happen, and it also covers the Z_PREFIX_SET spelling at zlib.h:1870.
+#ifdef Z_WANT64
+#error \
+    "zlib_accel.cpp must not be compiled with -D_FILE_OFFSET_BITS=64. zlib.h then renames gzopen to gzopen64 (and gzseek, gztell, gzoffset likewise), and this file has to DEFINE both names, so the rename collapses each pair onto one symbol. Large-file support for the shim comes from _LARGEFILE64_SOURCE above, which declares both sets without renaming either. Applications may use _FILE_OFFSET_BITS freely -- that is what the gzopen64/gzseek64/gztell64/gzoffset64 interceptors are for."
+#endif
 
 #include <dlfcn.h>
 #include <fcntl.h>
