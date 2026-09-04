@@ -8093,6 +8093,115 @@ static void EnableShimOwnedGzReads() {
   SetConfig(USE_ZLIB_UNCOMPRESS, 1);
 }
 
+// The two mode-mismatch refusals. They live here rather than beside the other
+// head-of-gzwrite checks because reaching the code that used to be wrong needs
+// the file on the shim's route, and the helper that arranges that is the one
+// directly above.
+//
+// A write to a read-mode file: zlib refuses it and returns 0, leaving nothing
+// latched. The shim used to accept it, and the cost was not the return value --
+// the buffer it copies into is the same one the read path serves out of, so the
+// four bytes came back from the next gzread ahead of the file's own contents.
+// That is what the third assertion covers, and it is the one that failed.
+TEST_F(GzipFileTest, GzwriteOnAReadModeFileIsRefusedAndChangesNothing) {
+  // Both halves are load-bearing, and EnableSomeGzCompressPath is not enough
+  // for the first: on a build with no backend compiled in it clears every
+  // compress flag, so gzwrite hands the call straight to zlib and never reaches
+  // the branch that was wrong. The flag has to be set for the shim to keep the
+  // write, and the read file has to be the shim's for gz->path to be anything
+  // other than ZLIB. Checked by mutation -- with EnableSomeGzCompressPath here,
+  // this test passes even with the guard deleted.
+  EnableShimOwnedGzWrites();
+  EnableShimOwnedGzReads();
+
+  const char* payload = "hello world";
+  const unsigned payload_length = 11;
+  const char* filename = "file.gz";
+  remove(filename);
+
+  gzFile fp = gzopen(filename, "wb");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, payload, payload_length),
+            static_cast<int>(payload_length));
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+
+  EXPECT_EQ(gzwrite(fp, "XXXX", 4), 0);
+
+  // Nothing latched. zlib tests the mode ahead of the length, so an oversized
+  // write to a read-mode file is refused on the mode and never reaches the
+  // length check that would have latched Z_DATA_ERROR.
+  int err = Z_OK;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+  EXPECT_EQ(
+      gzwrite(fp, "XXXX",
+              static_cast<unsigned>(std::numeric_limits<int>::max()) + 1u),
+      0);
+  err = Z_OK;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+
+  // The refused writes left the read untouched: the file's own first byte is
+  // still the first byte served, and the position is still zero.
+  EXPECT_EQ(gztell(fp), static_cast<z_off_t>(0));
+  char out[32] = {0};
+  EXPECT_EQ(gzread(fp, out, sizeof(out) - 1), static_cast<int>(payload_length));
+  EXPECT_STREQ(out, payload);
+
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
+// The mirror, which gzread was missing for the same reason: the four other read
+// entry points guard on the mode and it did not. zlib answers -1 and latches
+// nothing, and the buffered write it was refused against must survive intact.
+TEST_F(GzipFileTest, GzreadOnAWriteModeFileIsRefused) {
+  EnableShimOwnedGzWrites();
+  EnableShimOwnedGzReads();
+
+  const char* payload = "hello world";
+  const unsigned payload_length = 11;
+  const char* filename = "file.gz";
+  remove(filename);
+
+  gzFile fp = gzopen(filename, "wb6");
+  ASSERT_NE(fp, nullptr);
+  ASSERT_EQ(gzwrite(fp, payload, payload_length),
+            static_cast<int>(payload_length));
+
+  // Two lengths, because the unguarded call went wrong in two different ways
+  // depending on how much the write had buffered. Asking for less than is
+  // buffered was served out of the write's own buffer -- the application got
+  // its pending output back as if it were file content. Asking for more ran the
+  // buffer out, reached the descriptor, and read(2) on a write-only fd failed
+  // with EBADF; the Z_ERRNO that latched then made gzclose write nothing while
+  // still returning Z_OK, which is why the round-trip below is part of the
+  // test.
+  char out[32] = {0};
+  EXPECT_EQ(gzread(fp, out, 4), -1);
+  EXPECT_STREQ(out, "");
+  EXPECT_EQ(gzread(fp, out, sizeof(out) - 1), -1);
+  // gzgetc reads through gzread, so it has to answer the same way.
+  EXPECT_EQ(gzgetc(fp), -1);
+  int err = Z_OK;
+  gzerror(fp, &err);
+  EXPECT_EQ(err, Z_OK);
+
+  ASSERT_EQ(gzclose(fp), Z_OK);
+
+  // The refusals did not disturb what was still buffered for the write.
+  fp = gzopen(filename, "rb");
+  ASSERT_NE(fp, nullptr);
+  memset(out, 0, sizeof(out));
+  EXPECT_EQ(gzread(fp, out, sizeof(out) - 1), static_cast<int>(payload_length));
+  EXPECT_STREQ(out, payload);
+  EXPECT_EQ(gzclose(fp), Z_OK);
+  remove(filename);
+}
+
 // Sixteen bytes per record, each naming its own offset. A repeating payload
 // would let a read from the wrong offset look correct -- which is how the
 // original gzseek check passed while the shim was reading from byte 0.

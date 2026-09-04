@@ -2016,6 +2016,15 @@ bool InflateOwnsIgzipState(z_streamp strm) {
 
 enum class FileMode { NONE, READ, WRITE, APPEND };
 
+// Beside the enum rather than beside its first caller. Every gz entry point
+// that writes has to refuse a read-mode file, and the topmost of them is
+// gzwrite -- which is how gzwrite came to be the one that did not: this
+// predicate used to be defined below it, so it was the only write entry point
+// that could not reach it.
+static bool GzIsWriteMode(FileMode mode) {
+  return mode == FileMode::WRITE || mode == FileMode::APPEND;
+}
+
 // What a gzopen/gzdopen mode string asks for beyond the open(2) flags. zlib
 // parses all of this out of the same string in gz_open(), so the shim has to as
 // well or it acts on settings the application asked for and zlib recorded.
@@ -2970,6 +2979,20 @@ int ZEXPORT gzwrite(gzFile file, voidpc buf, unsigned len) {
     return 0;
   }
 
+  // A read-mode file. zlib refuses one before it does anything else, in the
+  // same condition as the error latch below (gzwrite.c:249), and returns 0
+  // without touching the file or that latch -- so an application ignoring the
+  // return value sees nothing change. The shim has more at stake than zlib
+  // does: past this point the accelerator path allocates gz->data_buf and
+  // memcpys into it, and that buffer is shared with the read path, so the
+  // written bytes come back out of the next gzread ahead of the file's own
+  // content. Refusing here, ahead of the length check further down, also drops
+  // a Z_DATA_ERROR that zlib never latches -- zlib tests the mode first and the
+  // length second (gzwrite.c:252).
+  if (!GzIsWriteMode(gz->mode)) {
+    return 0;
+  }
+
   // The write side demands a clean latch, where the read side tolerates
   // Z_BUF_ERROR (gz_write, gzwrite.c:249).
   if (gz->err != Z_OK) {
@@ -3081,10 +3104,6 @@ gzwrite_end:
       gz->data_buf_pos, ", path ", static_cast<int>(gz->path), "\n");
 
   return written_bytes;
-}
-
-static bool GzIsWriteMode(FileMode mode) {
-  return mode == FileMode::WRITE || mode == FileMode::APPEND;
 }
 
 // Without interception the level the application asks for here is recorded by
@@ -3743,6 +3762,14 @@ int ZEXPORT gzread(gzFile file, voidp buf, unsigned len) {
   auto gz = gzip_files.Get(file);
   if (gz == nullptr) {
     return orig_gzread != nullptr ? orig_gzread(file, buf, len) : -1;
+  }
+
+  // The mirror of the check in gzwrite. gzgetc, gzungetc, gzgets and gzfread
+  // all make it and gzread did not, which is the same one-sided gap gzwrite had
+  // among the write entry points. zlib refuses a write-mode file here too, in
+  // the same condition as the error latch below (gzread.c:378), returning -1.
+  if (gz->mode != FileMode::READ) {
+    return -1;
   }
 
   // A latched error refuses the read before anything is served, including bytes
