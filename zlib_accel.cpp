@@ -71,6 +71,7 @@ static int (*orig_inflateReset)(z_streamp strm);
 static int (*orig_inflateResetKeep)(z_streamp strm);
 static int (*orig_inflateReset2)(z_streamp strm, int windowBits);
 static int (*orig_inflateCopy)(z_streamp dest, z_streamp source);
+static int (*orig_inflateSync)(z_streamp strm);
 static int (*orig_compress)(Bytef* dest, uLongf* destLen, const Bytef* source,
                             uLong sourceLen);
 static int (*orig_compress2)(Bytef* dest, uLongf* destLen, const Bytef* source,
@@ -180,6 +181,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_inflateReset2, int (*)(z_streamp, int), "inflateReset2");
 
   LOAD_SYMBOL(orig_inflateCopy, int (*)(z_streamp, z_streamp), "inflateCopy");
+
+  LOAD_SYMBOL(orig_inflateSync, int (*)(z_streamp), "inflateSync");
 
   // Load compress/uncompress functions
   LOAD_SYMBOL(orig_compress, int (*)(Bytef*, uLongf*, const Bytef*, uLong),
@@ -325,6 +328,16 @@ struct InflateSettings {
   struct inflate_state* isal_strm = nullptr;
   // See DeflateSettings::stream_end_reached.
   bool stream_end_reached = false;
+  // Set once an offloaded call has consumed input from this stream. From that
+  // point on next_in addresses the middle of a stream zlib's own inflate state
+  // has never seen, so the remainder cannot be handed to orig_inflate: it would
+  // be parsed as the start of a new stream, with no history behind it.
+  bool bytes_consumed = false;
+  // Set once a mid-stream decode failure has been reported. zlib latches a data
+  // error and answers every later call with it until inflateSync() or a reset
+  // clears the state; ISA-L does not, and keeps parsing whatever follows the
+  // rejected bytes as a new block header, so the latch has to live here.
+  bool data_error = false;
 };
 
 // isal_strm is a raw pointer, so destroying a settings object does not free the
@@ -439,6 +452,8 @@ class InflateStreamSettings {
       settings->path = source.path;
       settings->isal_strm = isal_clone;
       settings->stream_end_reached = source.stream_end_reached;
+      settings->bytes_consumed = source.bytes_consumed;
+      settings->data_error = source.data_error;
       map.Set(dest, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR,
@@ -522,12 +537,57 @@ static void ResetInflateStreamState(
   }
   SetInflatePath(settings, UNDEFINED);
   settings->stream_end_reached = false;
+  settings->bytes_consumed = false;
+  settings->data_error = false;
   if (settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
     ResetUncompressIGZIP(settings->isal_strm);
 #endif
   }
 }
+
+// Hand the caller what an offloaded inflate call consumed and produced. Every
+// such call goes through here, so this is also where a stream is recorded as
+// consumed from -- zlib's inflate state saw none of these bytes.
+static void AdvanceInflateStream(
+    z_streamp strm, const std::shared_ptr<InflateSettings>& settings,
+    uint32_t input_len, uint32_t output_len) {
+  strm->next_in += input_len;
+  strm->avail_in -= input_len;
+  strm->total_in += input_len;
+  strm->next_out += output_len;
+  strm->avail_out -= output_len;
+  strm->total_out += output_len;
+  if (input_len > 0 && settings != nullptr) {
+    settings->bytes_consumed = true;
+  }
+}
+
+#ifdef USE_IGZIP
+// An IGZIP decode failure part-way through a stream cannot be handed to zlib.
+// zlib's inflate state saw none of the earlier chunks, so the bytes left in
+// next_in begin inside a deflate block with no history behind them: zlib parses
+// them as a fresh stream, which a zlib or gzip header check rejects but raw
+// deflate cannot, and whatever ISA-L had already decoded in the failing call is
+// dropped on the way. Deliver that output -- zlib hands back the decodable
+// prefix before reporting the error too -- and report the error here.
+//
+// A stream that has consumed nothing yet is the case the fall-through was
+// written for: next_in still addresses the first byte, so zlib can take the
+// whole stream from the start, and such a call is left to do exactly that.
+// Returns true when the error was answered here.
+static bool HandleMidStreamIGZIPInflateError(
+    z_streamp strm, const std::shared_ptr<InflateSettings>& settings,
+    uint32_t input_len, uint32_t output_len, int* ret) {
+  if (settings == nullptr || !settings->bytes_consumed) {
+    return false;
+  }
+  AdvanceInflateStream(strm, settings, input_len, output_len);
+  settings->data_error = true;
+  *ret = Z_DATA_ERROR;
+  return true;
+}
+#endif  // USE_IGZIP
 
 // zlib's Z_NO_COMPRESSION (0) asks for stored, uncompressed deflate blocks. No
 // backend can produce those: ISA-L's level 0 is still LZ77+Huffman ("fastest"),
@@ -1211,6 +1271,21 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     return ret;
   }
 
+  // A stream that has already failed mid-stream stays failed. zlib holds its
+  // own state at BAD and answers Z_DATA_ERROR until inflateSync() or a reset
+  // clears it; the backend that failed here has no such state, so the flag is
+  // what makes a repeated call answer the same way instead of resuming on the
+  // bytes that follow the ones it rejected. Placed below the parameter checks
+  // above, which zlib also answers ahead of its own error state.
+  if (inflate_settings->data_error) {
+    Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm), ", stream already failed, return code ",
+        Z_DATA_ERROR, "\n");
+    INCREMENT_STAT(INFLATE_FAILED_STREAM_COUNT);
+    INCREMENT_STAT(INFLATE_ERROR_COUNT);
+    return Z_DATA_ERROR;
+  }
+
   int ret = 1;
   bool end_of_stream = true;
   bool iaa_available = false;
@@ -1276,6 +1351,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   if (!in_call && strm->avail_in > 0 && inflate_settings->path != ZLIB) {
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
+#ifdef USE_IGZIP
+    // Set when an IGZIP failure was answered in place rather than delegated,
+    // which is the one accelerator error that must not reach zlib below.
+    bool igzip_midstream_error = false;
+#endif
 
 #ifdef USE_IAA
     iaa_available = configs[USE_IAA_UNCOMPRESS] &&
@@ -1362,9 +1442,17 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
         Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
             " source=igzip", " total_in=", strm->total_in,
             " total_out=", strm->total_out, " adler=", strm->adler, "\n");
-        SetInflatePath(inflate_settings, ZLIB);
+        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
+            strm, inflate_settings, input_len, output_len, &ret);
+        if (!igzip_midstream_error) {
+          SetInflatePath(inflate_settings, ZLIB);
+        }
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
-        SetInflatePath(inflate_settings, ZLIB);
+        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
+            strm, inflate_settings, input_len, output_len, &ret);
+        if (!igzip_midstream_error) {
+          SetInflatePath(inflate_settings, ZLIB);
+        }
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, IGZIP);
@@ -1400,9 +1488,17 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
             " source=igzip (", (path_selected == QAT) ? "QAT" : "IAA",
             " fallback)", " total_in=", strm->total_in,
             " total_out=", strm->total_out, " adler=", strm->adler, "\n");
-        SetInflatePath(inflate_settings, ZLIB);
+        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
+            strm, inflate_settings, input_len, output_len, &ret);
+        if (!igzip_midstream_error) {
+          SetInflatePath(inflate_settings, ZLIB);
+        }
       } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
-        SetInflatePath(inflate_settings, ZLIB);
+        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
+            strm, inflate_settings, input_len, output_len, &ret);
+        if (!igzip_midstream_error) {
+          SetInflatePath(inflate_settings, ZLIB);
+        }
       } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
                  inflate_settings->path != ZLIB) {
         SetInflatePath(inflate_settings, IGZIP);
@@ -1412,13 +1508,22 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     }
 #endif  // USE_IGZIP accelerator fallback
 
+#ifdef USE_IGZIP
+    if (igzip_midstream_error) {
+      Log(LogLevel::LOG_INFO, "inflate Line ", __LINE__, ", strm ",
+          static_cast<void*>(strm), ", igzip mid-stream error, return code ",
+          ret, ", bytes_in ", input_len, ", bytes_out ", output_len,
+          ", avail_in ", strm->avail_in, ", avail_out ", strm->avail_out,
+          ", path ", static_cast<int>(inflate_settings->path), ", path_name ",
+          ExecutionPathName(inflate_settings->path), ", window_bits ",
+          inflate_settings->window_bits, "\n");
+      INCREMENT_STAT(INFLATE_ERROR_COUNT);
+      return ret;
+    }
+#endif
+
     if (ret == 0) {
-      strm->next_in += input_len;
-      strm->avail_in -= input_len;
-      strm->total_in += input_len;
-      strm->next_out += output_len;
-      strm->avail_out -= output_len;
-      strm->total_out += output_len;
+      AdvanceInflateStream(strm, inflate_settings, input_len, output_len);
       if (end_of_stream) {
         ret = Z_STREAM_END;
       } else if (input_len > 0 || output_len > 0) {
@@ -1448,8 +1553,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // Z_DATA_ERROR reaches zlib: those path actions set the path to ZLIB and
   // leave ret non-zero, so the update block above is skipped and control
   // arrives here with strm->next_in never advanced.  zlib therefore re-reads
-  // the original, untouched input.  The fall-through is deliberate, not
-  // accidental.
+  // the original, untouched input.  That holds only while the stream has
+  // consumed nothing, which is why the pin is now conditional: once an earlier
+  // call has advanced next_in, the input zlib would re-read starts inside a
+  // deflate block, and the failure is answered above instead of delegated.
   if (in_call || configs[USE_ZLIB_UNCOMPRESS] ||
       inflate_settings->path == ZLIB) {
     // refer to comment in deflate
@@ -1564,6 +1671,53 @@ int ZEXPORT inflateResetKeep(z_streamp strm) {
   if (ret == Z_OK) {
     auto inflate_settings = inflate_stream_settings.Get(strm);
     ResetInflateStreamState(inflate_settings);
+    SetInflatePath(inflate_settings, ZLIB);
+  }
+  return ret;
+}
+
+// inflateSync() is the one legitimate mid-stream handoff to zlib, and the way
+// back from a failed stream: it searches the input for a full-flush point,
+// advances next_in to it and discards the decode state, so decoding resumes
+// there with no history. That is a request zlib has just satisfied on its own
+// state -- the search is what leaves it at a block boundary in TYPE mode -- so
+// the stream is pinned to zlib for the rest of its life and the latched data
+// error is cleared with it.
+//
+// The pin is what makes the resume work at all. A backend cannot honor it: the
+// bits it buffered ahead of the failure are still in its own state, and next_in
+// moving underneath it changes nothing, so whether it resumes correctly depends
+// on how far it had read -- ISA-L picks up the search only when the failure
+// happened to leave it byte-aligned at the flush point. zlib, which found the
+// point, always can, and everything after a full flush is self-contained by
+// construction. A stream that has consumed nothing keeps its path: it is at its
+// own start, where every engine can still take it.
+int ZEXPORT inflateSync(z_streamp strm) {
+  Log(LogLevel::LOG_INFO, "inflateSync Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), ", avail_in ",
+      strm != nullptr ? strm->avail_in : 0, "\n");
+
+  if (orig_inflateSync == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+
+  const int ret = orig_inflateSync(strm);
+
+  // Z_OK is a completed search and Z_DATA_ERROR one that ran out of input
+  // looking; both leave zlib's state holding the outcome, and zlib answers a
+  // failed search with Z_STREAM_ERROR on every later inflate() call, which is
+  // its own state to report. Z_BUF_ERROR and Z_STREAM_ERROR are refusals that
+  // change nothing, so a stream that only got those keeps its engine.
+  if (ret != Z_OK && ret != Z_DATA_ERROR) {
+    return ret;
+  }
+
+  auto inflate_settings = inflate_stream_settings.Get(strm);
+  if (inflate_settings != nullptr && inflate_settings->bytes_consumed &&
+      !inflate_settings->stream_end_reached) {
+    inflate_settings->data_error = false;
+    // Any ISA-L stream this puts out of reach is handed back by the next
+    // inflate(), the same way inflateResetKeep()'s pin releases it.
     SetInflatePath(inflate_settings, ZLIB);
   }
   return ret;
