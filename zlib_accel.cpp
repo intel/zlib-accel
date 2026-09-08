@@ -1734,6 +1734,15 @@ int ZEXPORT inflateSync(z_streamp strm) {
     return Z_VERSION_ERROR;
   }
 
+  // Decide before calling zlib, not after. zlib builds inflateSync() on top of
+  // inflateReset(), so on a libz whose internal call is interposable that call
+  // lands in this file's inflateReset() and clears the very fields the decision
+  // reads -- and this is the one entry point whose whole purpose is to pin.
+  auto inflate_settings = inflate_stream_settings.Get(strm);
+  const bool pin_to_zlib = inflate_settings != nullptr &&
+                           inflate_settings->bytes_consumed &&
+                           !inflate_settings->stream_end_reached;
+
   const int ret = orig_inflateSync(strm);
 
   // Z_OK is a completed search and Z_DATA_ERROR one that ran out of input
@@ -1745,9 +1754,7 @@ int ZEXPORT inflateSync(z_streamp strm) {
     return ret;
   }
 
-  auto inflate_settings = inflate_stream_settings.Get(strm);
-  if (inflate_settings != nullptr && inflate_settings->bytes_consumed &&
-      !inflate_settings->stream_end_reached) {
+  if (pin_to_zlib) {
     inflate_settings->data_error = false;
     // Any ISA-L stream this puts out of reach is handed back by the next
     // inflate(), the same way inflateResetKeep()'s pin releases it.
