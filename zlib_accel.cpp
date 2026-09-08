@@ -1007,6 +1007,26 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     }
   }
 
+#ifdef USE_IGZIP
+  // The compress-side counterpart of inflate()'s mid-stream gate. A failed
+  // IGZIP call on a stream that has already emitted bytes must not reach
+  // orig_deflate: zlib's deflate state holds none of that stream, so it would
+  // start a second one -- a fresh header -- in the middle of the output and
+  // report Z_OK, the worst shape available. Nothing reaches this today, and the
+  // reason is an ISA-L internal rather than a contract: isal_deflate refuses
+  // only flush values CompressIGZIP screens beforehand and a level/level_buf
+  // mismatch fixed at InitCompressIGZIP, which is never rebuilt while ISA-L
+  // owns the stream. Refuse rather than rest on that.
+  if (!in_call && ret != 0 && strm->total_out > 0 &&
+      IgzipOwnsDeflateStream(deflate_settings)) {
+    Log(LogLevel::LOG_ERROR, "deflate Line ", __LINE__, ", strm ",
+        static_cast<void*>(strm),
+        ", igzip mid-stream error, refusing to hand the stream to zlib\n");
+    INCREMENT_STAT(DEFLATE_ERROR_COUNT);
+    return Z_STREAM_ERROR;
+  }
+#endif
+
   if (in_call || configs[USE_ZLIB_COMPRESS] || deflate_settings->path == ZLIB) {
     // Distinguish "no zlib to delegate to" from "zlib rejected the data": the
     // former is an unusable library, not a data problem.
