@@ -11021,7 +11021,52 @@ TEST_F(PrimeRegressionTest, IGZIPInflatePrimeRefusedMidStream) {
 #endif  // USE_IGZIP || USE_QAT || USE_IAA
 
 #ifdef USE_IGZIP
-class InflateMidstreamErrorRegressionTest : public ::testing::Test {};
+class InflateMidstreamErrorRegressionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    // Written unconditionally by SetCompressPath/SetUncompressPath as well.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
+    saved_igzip_fallback_ = GetConfig(IGZIP_FALLBACK);
+  }
+
+  // Restored here rather than at the end of each helper: an ASSERT_* failure
+  // returns from the helper, which would skip an inline restore and leave the
+  // rest of the suite running on this test's configuration.
+  void TearDown() override {
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
+    SetConfig(IGZIP_FALLBACK, saved_igzip_fallback_);
+  }
+
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
+  uint32_t saved_igzip_fallback_ = 0;
+};
 
 // Build a stream that decodes cleanly up to a point and is invalid after it.
 // Z_SYNC_FLUSH ends the good part at a byte boundary with the stream still
@@ -11155,7 +11200,6 @@ static void RunMidstreamInflateErrorRegression(ExecutionPath accel_path,
   EXPECT_EQ(inflate(&stream, Z_NO_FLUSH), Z_DATA_ERROR);
 
   EXPECT_EQ(inflateEnd(&stream), Z_OK);
-  SetConfig(IGZIP_FALLBACK, 0);
   DestroyBlock(input);
 }
 
@@ -11202,7 +11246,6 @@ static void RunFirstCallInflateErrorRegression(ExecutionPath accel_path,
   EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
 
   EXPECT_EQ(inflateEnd(&stream), Z_OK);
-  SetConfig(IGZIP_FALLBACK, 0);
   DestroyBlock(input);
 }
 
@@ -11294,7 +11337,6 @@ static void RunInflateSyncAfterMidstreamErrorRegression(
   EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
 
   EXPECT_EQ(inflateEnd(&stream), Z_OK);
-  SetConfig(IGZIP_FALLBACK, 0);
   DestroyBlock(input);
 }
 
