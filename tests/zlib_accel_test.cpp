@@ -8063,6 +8063,7 @@ class InflateMidstreamErrorRegressionTest : public ::testing::Test {
     saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
     saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
     saved_igzip_fallback_ = GetConfig(IGZIP_FALLBACK);
+    saved_ignore_dictionary_ = GetConfig(IGNORE_ZLIB_DICTIONARY);
   }
 
   // Restored here rather than at the end of each helper: an ASSERT_* failure
@@ -8080,6 +8081,7 @@ class InflateMidstreamErrorRegressionTest : public ::testing::Test {
     SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
     SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
     SetConfig(IGZIP_FALLBACK, saved_igzip_fallback_);
+    SetConfig(IGNORE_ZLIB_DICTIONARY, saved_ignore_dictionary_);
   }
 
   uint32_t saved_use_zlib_uncompress_ = 0;
@@ -8093,6 +8095,7 @@ class InflateMidstreamErrorRegressionTest : public ::testing::Test {
   uint32_t saved_iaa_prepend_empty_block_ = 0;
   uint32_t saved_qat_allow_chunking_ = 0;
   uint32_t saved_igzip_fallback_ = 0;
+  uint32_t saved_ignore_dictionary_ = 0;
 };
 
 // Build a stream that decodes cleanly up to a point and is invalid after it.
@@ -8367,6 +8370,87 @@ static void RunInflateSyncAfterMidstreamErrorRegression(
   DestroyBlock(input);
 }
 
+// The other way a stream reaches the gate with input already consumed: a zlib
+// header delivered one byte per call. FDICT lives in the second byte, so the
+// first call is the shim's only chance to keep the stream off a backend, and it
+// cannot yet see the bit. A backend given that byte swallows it into its own
+// header buffer and reports the dictionary on the next call, by which time the
+// bytes zlib would need to parse the header itself are gone from the caller's
+// buffer -- so the request has to be answered the way zlib answers it, which
+// means not offloading the byte at all.
+static void RunFragmentedZlibHeaderDictionaryRegression(
+    ExecutionPath accel_path, uint32_t seed) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
+
+  const size_t input_length = 32 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, seed);
+  ASSERT_NE(input, nullptr);
+
+  const unsigned char dict[] = "fragmented-header-preset-dictionary";
+  const uInt dict_length = static_cast<uInt>(sizeof(dict) - 1);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  ASSERT_EQ(deflateSetDictionary(&cstream, dict, dict_length), Z_OK);
+
+  std::vector<Bytef> compressed(deflateBound(&cstream, input_length) + 4096);
+  cstream.next_in = reinterpret_cast<Bytef*>(input);
+  cstream.avail_in = static_cast<uInt>(input_length);
+  cstream.next_out = compressed.data();
+  cstream.avail_out = static_cast<uInt>(compressed.size());
+  ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+  compressed.resize(compressed.size() - cstream.avail_out);
+  ASSERT_EQ(deflateEnd(&cstream), Z_OK);
+  ASSERT_GT(compressed.size(), 2u);
+  // FDICT, second header byte -- the bit the first call cannot see.
+  ASSERT_NE(compressed[1] & 0x20, 0);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<char> output(input_length + 4096, 0);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  size_t fed = 0;
+  int ret = Z_OK;
+  bool asked_for_dictionary = false;
+  for (size_t guard = 0; guard < 4 * compressed.size() + 64; guard++) {
+    if (stream.avail_in == 0 && fed < compressed.size()) {
+      stream.next_in = compressed.data() + fed;
+      stream.avail_in = 1;
+      fed++;
+    }
+    ret = inflate(&stream, Z_NO_FLUSH);
+    if (ret == Z_NEED_DICT) {
+      asked_for_dictionary = true;
+      ASSERT_EQ(inflateSetDictionary(&stream, dict, dict_length), Z_OK);
+      continue;
+    }
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END || ret == Z_BUF_ERROR) {
+      break;
+    }
+  }
+
+  // zlib asks for the dictionary and then decodes the stream; the pin is what
+  // lets the shim do the same.
+  EXPECT_TRUE(asked_for_dictionary);
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(output.data(), input, input_length), 0);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  EXPECT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
 TEST_F(InflateMidstreamErrorRegressionTest, IGZIPRawErrorIsNotReportedAsEnd) {
   RunMidstreamInflateErrorRegression(IGZIP, -15, /*seed=*/0x11f4);
 }
@@ -8389,6 +8473,11 @@ TEST_F(InflateMidstreamErrorRegressionTest,
 TEST_F(InflateMidstreamErrorRegressionTest,
        IGZIPInflateSyncRecoversAfterError) {
   RunInflateSyncAfterMidstreamErrorRegression(IGZIP, -15, /*seed=*/0x11f8);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPFragmentedZlibHeaderStillAsksForDictionary) {
+  RunFragmentedZlibHeaderDictionaryRegression(IGZIP, /*seed=*/0x11fb);
 }
 
 #ifdef USE_QAT

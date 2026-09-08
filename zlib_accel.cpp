@@ -1343,10 +1343,23 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
   // Early detection: if this is a zlib-format stream with the FDICT bit set
   // in the header, pin to ZLIB immediately so dictionary streams never reach
   // any accelerator (QAT/IAA/IGZIP don't support preset dictionaries).
+  //
+  // A single byte of input is pinned too, because the bit lives in the second
+  // one and this is the only chance to see it: a backend consumes that byte
+  // into its own header buffer, so by the time it reports the dictionary the
+  // bytes zlib would need to parse the header itself are gone from the caller's
+  // buffer. zlib carries a partial header across calls in its bit buffer and
+  // asks for the dictionary once it holds all of it, which is why handing it
+  // the stream here is what makes a header split across calls behave. The cost
+  // is a stream whose first call happens to carry one byte staying on zlib even
+  // when it turns out to have no dictionary. An empty call is not pinned: it
+  // consumes nothing, so the next one still gets to look.
   if (!in_call && inflate_settings->path == UNDEFINED &&
       inflate_settings->window_bits >= 8 &&
-      inflate_settings->window_bits <= kWindowBitsZlib && strm->avail_in >= 2 &&
-      (strm->next_in[1] & ZLIB_FDICT_MASK)) {
+      inflate_settings->window_bits <= kWindowBitsZlib &&
+      strm->next_in != nullptr &&
+      (strm->avail_in == 1 ||
+       (strm->avail_in >= 2 && (strm->next_in[1] & ZLIB_FDICT_MASK)))) {
     SetInflatePath(inflate_settings, ZLIB);
   }
 
