@@ -258,20 +258,11 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
       ", avail_out ", isal_strm->avail_out, ", total_out ",
       isal_strm->total_out, ", total_in ", isal_strm->total_in, "\n");
 
-  // ISA-L always emits sync bytes on SYNC_FLUSH regardless of pending data.
-  // When the stream is already byte-aligned (ZSTATE_NEW_HDR) and there is no
-  // new input, no real progress can be made — return 0 progress so the caller
-  // reports Z_BUF_ERROR, matching zlib's semantics for empty flush calls.
-  // ZSTATE_NEW_HDR is the idle/byte-aligned state in ISA-L's internal deflate
-  // state machine; validated against ISA-L v2.32.0 (commit c196241).
-  if (isal_strm->avail_in == 0 && isal_strm->flush == SYNC_FLUSH &&
-      isal_strm->end_of_stream == 0 &&
-      isal_strm->internal_state.state == ZSTATE_NEW_HDR) {
-    *output_length = 0;
-    *input_length = 0;
-    return 0;
-  }
-
+  // ISA-L emits the sync marker for every SYNC_FLUSH and FULL_FLUSH whether or
+  // not one has just been emitted, so a redundant empty flush would grow the
+  // stream. Refusing such a call is zlib policy and belongs with the rest of
+  // it: deflate() decides that through IsRedundantEmptyFlush() and never gets
+  // here.
   int comp = isal_deflate(isal_strm);
 
   *output_length = original_avail_out - isal_strm->avail_out;
