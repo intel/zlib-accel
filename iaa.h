@@ -16,6 +16,10 @@
 inline constexpr unsigned int PREPENDED_BLOCK_LENGTH = 5;
 inline constexpr unsigned int MAX_BUFFER_SIZE = (2 << 20);
 
+// IAA's decompressor has a fixed 4 kB history buffer, so it can only follow a
+// stream whose match distances stay inside a 2^12-byte window.
+inline constexpr int IAA_MAX_HISTORY_WINDOW_BITS = 12;
+
 class IAAJob {
  public:
   IAAJob() : jobs_(3) {}
@@ -55,10 +59,18 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
                 int window_bits, uint32_t max_compressed_size = 0,
                 bool gzip_ext = false);
 
-int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
-                  uint32_t* output_length, qpl_path_t execution_path,
-                  int window_bits, bool* end_of_stream,
-                  bool detect_gzip_ext = false);
+// window_too_large, when non-null, is set to true if the job was rejected
+// because the stream references match distances beyond IAA's fixed 4 kB history
+// buffer (QPL_STS_BAD_DIST_ERR). That is a property of whichever compressor
+// produced the stream, not of the individual block, so a caller that sees it
+// can stop offering the rest of that stream to IAA. It is never set to false;
+// the caller owns initialisation.
+VISIBLE_FOR_TESTING int UncompressIAA(uint8_t* input, uint32_t* input_length,
+                                      uint8_t* output, uint32_t* output_length,
+                                      qpl_path_t execution_path,
+                                      int window_bits, bool* end_of_stream,
+                                      bool detect_gzip_ext = false,
+                                      bool* window_too_large = nullptr);
 
 VISIBLE_FOR_TESTING bool SupportedOptionsIAA(int window_bits,
                                              uint32_t input_length,
@@ -67,5 +79,12 @@ VISIBLE_FOR_TESTING bool SupportedOptionsIAA(int window_bits,
 VISIBLE_FOR_TESTING bool IsIAADecompressible(uint8_t* input,
                                              uint32_t input_length,
                                              int window_bits);
+
+// True if window_bits declares a maximum window IAA's history buffer can
+// follow, whatever the format's own header says. inflateReset2() takes such a
+// declaration from the caller, and it is a stronger statement than a remembered
+// rejection: a stream that referenced further back than this would be refused
+// by zlib too.
+VISIBLE_FOR_TESTING bool DeclaresIAACompatibleWindow(int window_bits);
 
 #endif  // USE_IAA
