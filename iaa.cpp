@@ -285,7 +285,7 @@ bool IsIAADecompressible(uint8_t* input, uint32_t input_length,
   CompressedFormat format = GetCompressedFormat(window_bits);
   if (format == CompressedFormat::ZLIB) {
     int window = GetWindowSizeFromZlibHeader(input, input_length);
-    return window <= 12;
+    return window <= IAA_MAX_HISTORY_WINDOW_BITS;
   }
   // For raw deflate and gzip formats, QPL always reports total_in ==
   // available_in regardless of where BFINAL=1 falls in the stream. This is
@@ -305,6 +305,21 @@ bool IsIAADecompressible(uint8_t* input, uint32_t input_length,
   // entries are typically much larger than 512 bytes; the few that are smaller
   // fall back to IGZIP which is also correct.
   return input_length > kZipInputStreamBufferSize;
+}
+
+bool DeclaresIAACompatibleWindow(int window_bits) {
+  switch (GetCompressedFormat(window_bits)) {
+    case CompressedFormat::DEFLATE_RAW:
+      return -window_bits <= IAA_MAX_HISTORY_WINDOW_BITS;
+    case CompressedFormat::ZLIB:
+      return window_bits <= IAA_MAX_HISTORY_WINDOW_BITS;
+    case CompressedFormat::GZIP:
+      // 16 is the offset zlib adds to select the gzip wrapper; what is left is
+      // the window.
+      return window_bits - 16 <= IAA_MAX_HISTORY_WINDOW_BITS;
+    default:
+      return false;
+  }
 }
 
 #endif  // USE_IAA
