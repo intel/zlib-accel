@@ -423,7 +423,20 @@ void IGZIPHandleActiveStreamNoInput(z_streamp strm,
     return;
   }
 
-  *ret = Z_BUF_ERROR;
+  // UncompressIGZIP() already returns a zlib error code, so keep it: a failure
+  // here is reached with the caller's input buffer empty, but the data behind
+  // it is not.  ISA-L takes bytes into its own state as soon as it needs bits,
+  // so by the time it has decoded everything and turns to the wrapper checksum,
+  // the trailer it is checking has long since left the caller's buffer -- a
+  // zlib stream, whose trailer is 4 bytes, fails on exactly such a call
+  // whenever the output was handed back in pieces.  Reporting Z_BUF_ERROR for
+  // that invites the caller to enlarge its buffer and retry a stream that is
+  // corrupt, and ISA-L does not latch the failure, so the retry reports success
+  // on data it has already refused.
+  Log(LogLevel::LOG_ERROR,
+      "IGZIPHandleActiveStreamNoInput() igzip inflate failed with no input "
+      "available, ret ",
+      *ret, "\n");
 }
 
 IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(

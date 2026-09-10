@@ -3540,6 +3540,69 @@ TEST(IGZIPInflateRegressionTest, ActiveStreamHandlesNullNextInWithZeroAvailIn) {
   DestroyBlock(input);
 }
 
+// A wrong wrapper checksum has to be reported as a data error, and it is the
+// no-input drain call that reports it.  ISA-L pulls bytes into its own state as
+// soon as it needs bits, so a decode that hands its output back in pieces has
+// consumed the whole compressed stream -- trailer included -- several calls
+// before it finishes producing.  The call that finally reaches the checksum
+// therefore arrives with avail_in == 0, and that path used to answer
+// Z_BUF_ERROR whatever went wrong: an invitation to enlarge the buffer and
+// retry a stream that is corrupt.  The zlib format is what reaches it, because
+// its 4-byte trailer fits inside what ISA-L has already read ahead; gzip's
+// 8-byte trailer does not, so that stream fails while input is still with the
+// caller and takes the ordinary dispatch path instead.  (ISA-L does not latch
+// the failure, so what a *repeat* call answers is a separate matter, decided
+// where the sticky error state lives.)
+TEST(IGZIPInflateRegressionTest, WrongChecksumIsADataErrorOnTheDrainCall) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 16 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, 0x3f04);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_GT(compressed.size(), 0u);
+
+  // Only the last trailer byte, so every deflate block stays valid and the
+  // decode runs to completion before anything is wrong.
+  compressed[compressed.size() - 1] =
+      static_cast<char>(compressed[compressed.size() - 1] ^ 0xff);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+  stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  stream.avail_in = static_cast<uInt>(compressed.size());
+
+  // Chunks small enough that the payload cannot be delivered in one call, which
+  // is what puts the checksum check on a call with no input left.
+  std::vector<char> chunk(1024);
+  int ret = Z_OK;
+  uInt avail_in_on_failing_call = 1;
+  for (int call = 0; call < 4096; ++call) {
+    stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+    stream.avail_out = static_cast<uInt>(chunk.size());
+    avail_in_on_failing_call = stream.avail_in;
+    ret = inflate(&stream, Z_SYNC_FLUSH);
+    ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP) << "call=" << call;
+    if (ret != Z_OK) {
+      break;
+    }
+  }
+
+  EXPECT_EQ(ret, Z_DATA_ERROR);
+  EXPECT_EQ(avail_in_on_failing_call, 0u);
+
+  inflateEnd(&stream);
+  DestroyBlock(input);
+}
+
 #ifdef USE_IAA
 // IAA->IGZIP fallback tests.
 // On machines without IAA hardware, CompressIAA/UncompressIAA return non-zero,
