@@ -7052,6 +7052,91 @@ TEST_F(IAAWindowRejectionTest, RejectionDoesNotAffectOtherStreams) {
   ASSERT_EQ(inflateEnd(&rejected), Z_OK);
   DestroyBlock(input);
 }
+
+// The window a caller declares, independent of any hardware: the format's
+// wrapper offset has to come off before the window is compared, or a gzip
+// stream looks like a 24-bit window and a raw one like a negative window.
+TEST_F(IAAWindowRejectionTest, DeclaresIAACompatibleWindowFollowsTheFormat) {
+  // Raw deflate.
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(-8));
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(-12));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(-13));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(-15));
+  // Zlib.
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(8));
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(12));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(13));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(15));
+  // Gzip, which zlib selects by adding 16.
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(16 + 8));
+  EXPECT_TRUE(DeclaresIAACompatibleWindow(16 + 12));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(16 + 13));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(16 + 15));
+  // Anything this shim does not map to a format cannot be declared compatible,
+  // including zlib's automatic-detection range, where the stream picks the
+  // wrapper and the caller has therefore declared nothing.
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(0));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(32 + 15));
+  EXPECT_FALSE(DeclaresIAACompatibleWindow(-16));
+}
+
+// A narrowing inflateReset2() is the caller declaring the next stream's window,
+// so it retires the verdict: the flag is an inference about the previous
+// stream's producer, and a declaration outranks an inference. Without this a
+// stream that was rejected once never reaches IAA again even after the caller
+// has said the data cannot reference beyond 4 kB.
+TEST_F(IAAWindowRejectionTest, NarrowingInflateReset2ClearsTheVerdict) {
+  if (!IAAHardwareDecompressWorks()) {
+    GTEST_SKIP() << "no usable IAA device: QPL cannot reach the point where it "
+                    "reports an oversized history window";
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IAA, /*zlib_fallback=*/true, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e15);
+  ASSERT_NE(input, nullptr);
+
+  std::string wide;
+  std::string narrow;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &wide, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &narrow, -12, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&stream, wide, input, input_length),
+            Z_STREAM_END);
+  ASSERT_TRUE(InflateIAAWindowRejected(&stream));
+
+  // Same window, so nothing has been declared and the verdict stands. This is
+  // the control: without it the test would pass on a build that cleared the
+  // flag on every reset.
+  ASSERT_EQ(inflateReset2(&stream, -15), Z_OK);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+  EXPECT_EQ(InflateWholeStream(&stream, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_NE(GetInflateExecutionPath(&stream), IAA);
+
+  // Narrowing to a window IAA can follow retires it, and the next stream is
+  // offered to IAA again -- and served, since the bytes really do stay inside
+  // 4 kB.
+  ASSERT_EQ(inflateReset2(&stream, -12), Z_OK);
+  EXPECT_FALSE(InflateIAAWindowRejected(&stream));
+  EXPECT_EQ(InflateWholeStream(&stream, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IAA);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
 #endif  // USE_IAA
 
 // The shim keeps per-stream state in maps keyed by z_streamp, and every entry

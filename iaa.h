@@ -16,6 +16,10 @@
 inline constexpr unsigned int PREPENDED_BLOCK_LENGTH = 5;
 inline constexpr unsigned int MAX_BUFFER_SIZE = (2 << 20);
 
+// IAA's decompressor has a fixed 4 kB history buffer, so it can only follow a
+// stream whose match distances stay inside a 2^12-byte window.
+inline constexpr int IAA_MAX_HISTORY_WINDOW_BITS = 12;
+
 class IAAJob {
  public:
   IAAJob() : jobs_(3) {}
@@ -75,5 +79,12 @@ VISIBLE_FOR_TESTING bool SupportedOptionsIAA(int window_bits,
 VISIBLE_FOR_TESTING bool IsIAADecompressible(uint8_t* input,
                                              uint32_t input_length,
                                              int window_bits);
+
+// True if window_bits declares a maximum window IAA's history buffer can
+// follow, whatever the format's own header says. inflateReset2() takes such a
+// declaration from the caller, and it is a stronger statement than a remembered
+// rejection: a stream that referenced further back than this would be refused
+// by zlib too.
+VISIBLE_FOR_TESTING bool DeclaresIAACompatibleWindow(int window_bits);
 
 #endif  // USE_IAA

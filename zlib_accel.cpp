@@ -536,7 +536,9 @@ static void ResetDeflateStreamState(
 // Lucene resets its Inflater once per stored-field document. Clearing it here
 // would make the flag useless: it would be forgotten before it was ever
 // consulted, and the shim would go back to submitting jobs it knows will be
-// rejected.
+// rejected. inflateReset2() is the one exception, and clears the field itself:
+// a caller that declares an IAA-sized window has said what the next stream is,
+// which beats an inference drawn from the last one.
 static void ResetInflateStreamState(
     const std::shared_ptr<InflateSettings>& settings) {
   if (settings == nullptr) {
@@ -1624,6 +1626,19 @@ int ZEXPORT inflateReset2(z_streamp strm, int windowBits) {
   if (inflate_settings != nullptr) {
     ResetInflateStreamState(inflate_settings);
     inflate_settings->window_bits = windowBits;
+
+#ifdef USE_IAA
+    // The one thing that overrides a remembered rejection. That verdict is an
+    // inference about the compressor that produced the previous stream, and
+    // inflateReset2() is the caller stating outright what the next stream's
+    // window is; a declaration IAA can follow wins over the inference, since
+    // bytes that reached further back would be refused by zlib as well. An
+    // inflateReset() carries no such statement, which is why the verdict
+    // survives it.
+    if (DeclaresIAACompatibleWindow(windowBits)) {
+      inflate_settings->iaa_window_too_large = false;
+    }
+#endif
 
     if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
