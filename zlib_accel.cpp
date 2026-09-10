@@ -100,6 +100,7 @@ static int (*orig_deflateEnd)(z_streamp strm);
 static int (*orig_deflateReset)(z_streamp strm);
 static int (*orig_deflateResetKeep)(z_streamp strm);
 static int (*orig_deflateParams)(z_streamp strm, int level, int strategy);
+static int (*orig_deflatePrime)(z_streamp strm, int bits, int value);
 static int (*orig_deflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_inflateInit_)(z_streamp strm, const char* version,
                                 int stream_size);
@@ -112,6 +113,7 @@ static int (*orig_inflateEnd)(z_streamp strm);
 static int (*orig_inflateReset)(z_streamp strm);
 static int (*orig_inflateResetKeep)(z_streamp strm);
 static int (*orig_inflateReset2)(z_streamp strm, int windowBits);
+static int (*orig_inflatePrime)(z_streamp strm, int bits, int value);
 static int (*orig_inflateCopy)(z_streamp dest, z_streamp source);
 static int (*orig_compress)(Bytef* dest, uLongf* destLen, const Bytef* source,
                             uLong sourceLen);
@@ -213,6 +215,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_deflateParams, int (*)(z_streamp, int, int),
               "deflateParams");
 
+  LOAD_SYMBOL(orig_deflatePrime, int (*)(z_streamp, int, int), "deflatePrime");
+
   LOAD_SYMBOL(orig_deflateCopy, int (*)(z_streamp, z_streamp), "deflateCopy");
 
   // Load inflate functions
@@ -234,6 +238,8 @@ static int init_zlib_accel(void) {
   LOAD_SYMBOL(orig_inflateResetKeep, int (*)(z_streamp), "inflateResetKeep");
 
   LOAD_SYMBOL(orig_inflateReset2, int (*)(z_streamp, int), "inflateReset2");
+
+  LOAD_SYMBOL(orig_inflatePrime, int (*)(z_streamp, int, int), "inflatePrime");
 
   LOAD_SYMBOL(orig_inflateCopy, int (*)(z_streamp, z_streamp), "inflateCopy");
 
@@ -798,6 +804,52 @@ int ZEXPORT deflateParams(z_streamp strm, int level, int strategy) {
   return ret;
 }
 
+// deflatePrime() and inflatePrime() insert bits into a bit buffer no backend
+// has. QAT and IAA take a whole stream and always start on a byte boundary;
+// ISA-L can neither preload its encoder's output bit buffer nor its decoder's
+// input one. Leaving the call to fall through unintercepted drops the caller's
+// bits silently: the primed byte never reaches deflate output, and a decoder
+// that should have started off a byte boundary decodes as if unprimed and
+// reports Z_STREAM_END where zlib reports Z_DATA_ERROR. Both wrappers therefore
+// pin the stream to zlib, which is the only engine whose bit buffer the call
+// actually reaches.
+//
+// A zero bit count changes nothing in either direction, so those calls neither
+// pin nor refuse -- a caller that primes zero bits should not lose the offload
+// for the rest of the stream.
+int ZEXPORT deflatePrime(z_streamp strm, int bits, int value) {
+  Log(LogLevel::LOG_INFO, "deflatePrime Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), ", bits ", bits, ", value ", value, "\n");
+  auto deflate_settings = deflate_stream_settings.Get(strm);
+
+  // Once an accelerator holds the stream the request cannot be served at all.
+  // zlib's own deflate state was never fed, so the bits can be neither emitted
+  // where the caller asked for them nor recovered later, and handing the rest
+  // of the stream to zlib would restart it mid-output. Refuse instead, the same
+  // decision deflateSetDictionary() makes for the same reason. zlib itself
+  // accepts a mid-stream prime, so this is a deliberate divergence -- a refusal
+  // the caller can see, in place of bits that quietly disappear.
+  if (bits != 0 && deflate_settings != nullptr &&
+      deflate_settings->path != UNDEFINED && deflate_settings->path != ZLIB) {
+    return Z_STREAM_ERROR;
+  }
+
+  if (orig_deflatePrime == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+  const int ret = orig_deflatePrime(strm, bits, value);
+  // Pin only what zlib accepted: deflatePrime() reports Z_BUF_ERROR for a
+  // negative or over-16 bit count and for a pending buffer with no room,
+  // leaving its bit buffer untouched and the stream still offloadable.
+  // deflateReset() clears that bit buffer, and clearing the path is exactly
+  // what ResetDeflateStreamState() already does, so a reset returns the stream
+  // to path selection with nothing primed on either side.
+  if (ret == Z_OK && bits > 0) {
+    SetDeflatePath(deflate_settings, ZLIB);
+  }
+  return ret;
+}
+
 int ZEXPORT deflate(z_streamp strm, int flush) {
   auto deflate_settings = deflate_stream_settings.Get(strm);
   INCREMENT_STAT(DEFLATE_COUNT);
@@ -1320,6 +1372,38 @@ int ZEXPORT inflateSetDictionary(z_streamp strm, const Bytef* dictionary,
       " ignored because ignore_zlib_dictionary is set to ",
       configs[IGNORE_ZLIB_DICTIONARY], "\n");
   return Z_OK;
+}
+
+// See the comment on deflatePrime() for why both directions pin. The decode
+// side is the one that can report success on data zlib refuses: bits primed
+// into the decoder shift every symbol that follows, so ignoring them turns a
+// stream the caller deliberately started off a byte boundary into a clean
+// decode.
+int ZEXPORT inflatePrime(z_streamp strm, int bits, int value) {
+  Log(LogLevel::LOG_INFO, "inflatePrime Line ", __LINE__, ", strm ",
+      static_cast<void*>(strm), ", bits ", bits, ", value ", value, "\n");
+  auto inflate_settings = inflate_stream_settings.Get(strm);
+
+  // Refuse mid-stream, as deflatePrime() does. A negative bit count is included
+  // deliberately: on a stream zlib is decoding it discards zlib's bit buffer
+  // mid-symbol, and an accelerator holds the equivalent bits where the shim
+  // cannot reach them, so the call would report success having done nothing.
+  if (bits != 0 && inflate_settings != nullptr &&
+      inflate_settings->path != UNDEFINED && inflate_settings->path != ZLIB) {
+    return Z_STREAM_ERROR;
+  }
+
+  if (orig_inflatePrime == nullptr) {
+    return Z_VERSION_ERROR;
+  }
+  const int ret = orig_inflatePrime(strm, bits, value);
+  // A negative bit count asks zlib to drop whatever it is holding, which before
+  // the first inflate() call is nothing on either side -- so it is not a reason
+  // to give up the offload. Only actual primed bits pin.
+  if (ret == Z_OK && bits > 0) {
+    SetInflatePath(inflate_settings, ZLIB);
+  }
+  return ret;
 }
 
 int ZEXPORT inflate(z_streamp strm, int flush) {
