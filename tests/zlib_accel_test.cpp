@@ -6781,7 +6781,55 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
 // block. IsIAADecompressible() cannot see it for raw deflate or gzip, where
 // there is no header to read the window out of, so the only way to know is to
 // be told once and remember.
-class IAAWindowRejectionTest : public ::testing::Test {};
+class IAAWindowRejectionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    // SetCompressPath/SetUncompressPath write these two unconditionally, and
+    // the no-fallback case below turns the third off, so all three have to come
+    // back or this fixture makes the suite order-dependent.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
+    saved_igzip_fallback_ = GetConfig(IGZIP_FALLBACK);
+    saved_iaa_uncompress_percentage_ = GetConfig(IAA_UNCOMPRESS_PERCENTAGE);
+  }
+
+  void TearDown() override {
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
+    SetConfig(IGZIP_FALLBACK, saved_igzip_fallback_);
+    SetConfig(IAA_UNCOMPRESS_PERCENTAGE, saved_iaa_uncompress_percentage_);
+  }
+
+ private:
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
+  uint32_t saved_igzip_fallback_ = 0;
+  uint32_t saved_iaa_uncompress_percentage_ = 0;
+};
 
 // Run one whole stream through strm and check the bytes. Returns the last
 // inflate() code so the caller can assert on it, or Z_DATA_ERROR if the output
@@ -7134,6 +7182,144 @@ TEST_F(IAAWindowRejectionTest, NarrowingInflateReset2ClearsTheVerdict) {
   EXPECT_EQ(GetInflateExecutionPath(&stream), IAA);
 
   ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+// The remembered verdict is an optimization, so it must not change what a
+// caller who has turned every fallback off gets back. That configuration
+// answers Z_DATA_ERROR whenever no engine will take the data -- an input below
+// IAA's 512-byte floor does it with no verdict involved -- but the verdict must
+// not be what puts a stream in that category: with nothing else to fall back
+// to, the stream is offered to IAA anyway, because a job that probably fails
+// beats refusing data that may decode.
+TEST_F(IAAWindowRejectionTest, RememberedRejectionWithNoFallbackDoesNotRefuse) {
+  if (!IAAHardwareDecompressWorks()) {
+    GTEST_SKIP() << "no usable IAA device: QPL cannot reach the point where it "
+                    "reports an oversized history window";
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x7e16);
+  ASSERT_NE(input, nullptr);
+  const size_t tiny_length = 256;
+  char* tiny = GenerateSeededCompressibleBlock(tiny_length, /*seed=*/0x7e17);
+  ASSERT_NE(tiny, nullptr);
+
+  std::string wide;
+  std::string narrow;
+  std::string tiny_compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &wide, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(input, input_length, &narrow, -12, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_EQ(ZlibCompress(tiny, tiny_length, &tiny_compressed, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  // IAA and nothing else: no zlib, no igzip retry.
+  SetUncompressPath(IAA, /*zlib_fallback=*/false, false);
+  SetConfig(IGZIP_FALLBACK, 0);
+
+  // The floor case, which no part of this change touches: a stream too short
+  // for IsIAADecompressible() reaches no engine and is refused. This is the
+  // configuration's own contract, and it stays exactly as it was.
+  z_stream small;
+  memset(&small, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&small, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&small, tiny_compressed, tiny, tiny_length),
+            Z_DATA_ERROR);
+  EXPECT_FALSE(InflateIAAWindowRejected(&small));
+  ASSERT_EQ(inflateEnd(&small), Z_OK);
+
+  // A stream IAA can follow is still served, so the configuration is not
+  // simply broken.
+  z_stream served;
+  memset(&served, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&served, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&served, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&served), IAA);
+  ASSERT_EQ(inflateEnd(&served), Z_OK);
+
+  // The rejection itself is refused with no fallback to hand it to, which is
+  // what this configuration means and is already true without the verdict.
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&stream, wide, input, input_length),
+            Z_DATA_ERROR);
+  ASSERT_TRUE(InflateIAAWindowRejected(&stream));
+
+  // The next stream on the same z_stream is a payload IAA can follow, and the
+  // verdict does not get to refuse it: with no other engine available the
+  // suppression stands down and IAA is submitted, so the caller gets the same
+  // answer as `served` above. The verdict is still recorded -- it just is not
+  // deciding anything here.
+  ASSERT_EQ(inflateReset(&stream), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&stream, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IAA);
+  EXPECT_TRUE(InflateIAAWindowRejected(&stream));
+
+  // Narrowing the window retires the verdict outright, with no fallback too.
+  ASSERT_EQ(inflateReset2(&stream, -12), Z_OK);
+  EXPECT_FALSE(InflateIAAWindowRejected(&stream));
+  EXPECT_EQ(InflateWholeStream(&stream, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IAA);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+
+#ifdef USE_IGZIP
+  // With zlib off but IGZIP on, the verdict does its job again: another engine
+  // can take the stream, so IAA is suppressed and IGZIP serves it. Without the
+  // suppression the doomed IAA submission would go first and, with no fallback
+  // behind it, refuse data IGZIP would have decoded.
+  SetConfig(USE_IGZIP_UNCOMPRESS, 1);
+
+  z_stream to_igzip;
+  memset(&to_igzip, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&to_igzip, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_igzip, wide, input, input_length),
+            Z_DATA_ERROR);
+  ASSERT_TRUE(InflateIAAWindowRejected(&to_igzip));
+
+  ASSERT_EQ(inflateReset(&to_igzip), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_igzip, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&to_igzip), IGZIP);
+  ASSERT_EQ(inflateEnd(&to_igzip), Z_OK);
+  SetConfig(USE_IGZIP_UNCOMPRESS, 0);
+#endif
+
+#ifdef USE_QAT
+  // Same with QAT as the only other engine. The traffic split is pinned at 100%
+  // IAA so the setup stream is the one that gets rejected rather than a coin
+  // toss; once the verdict stands the split no longer applies, because a
+  // suppressed IAA leaves QAT as the only candidate.
+  SetConfig(USE_QAT_UNCOMPRESS, 1);
+  SetConfig(IAA_UNCOMPRESS_PERCENTAGE, 100);
+
+  z_stream to_qat;
+  memset(&to_qat, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&to_qat, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_qat, wide, input, input_length),
+            Z_DATA_ERROR);
+  ASSERT_TRUE(InflateIAAWindowRejected(&to_qat));
+
+  ASSERT_EQ(inflateReset(&to_qat), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_qat, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&to_qat), QAT);
+  ASSERT_EQ(inflateEnd(&to_qat), Z_OK);
+#endif
+
+  DestroyBlock(tiny);
   DestroyBlock(input);
 }
 

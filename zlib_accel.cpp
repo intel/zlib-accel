@@ -1302,12 +1302,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     uint32_t output_len = strm->avail_out;
 
 #ifdef USE_IAA
-    // IsIAADecompressible cannot see match distances, so for raw deflate and
-    // gzip it has no header to read and is guessing. iaa_window_too_large is
-    // what a wrong guess, once made, costs being remembered: IAA has already
-    // told us this stream's producer used a window it cannot follow.
     iaa_available = configs[USE_IAA_UNCOMPRESS] &&
-                    !inflate_settings->iaa_window_too_large &&
                     SupportedOptionsIAA(inflate_settings->window_bits,
                                         input_len, output_len) &&
                     IsIAADecompressible(strm->next_in, input_len,
@@ -1321,6 +1316,24 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 #endif
 #ifdef USE_IGZIP
     igzip_available = igzip_supported_options;
+#endif
+
+#ifdef USE_IAA
+    // IsIAADecompressible cannot see match distances, so for raw deflate and
+    // gzip it has no header to read and is guessing. iaa_window_too_large is
+    // what a wrong guess, once made, costs being remembered: IAA has already
+    // told us this stream's producer used a window it cannot follow.
+    //
+    // That memory is an optimization, and an optimization must not change the
+    // answer, so it only suppresses IAA while some other engine can take the
+    // stream. The three terms are that complete set: the config the zlib
+    // fall-through below tests, QAT, and the IGZIP retry. With none of them a
+    // suppressed stream would be refused outright, so submit it and let IAA
+    // decide: a job that probably fails beats refusing data that may decode.
+    if (iaa_available && inflate_settings->iaa_window_too_large &&
+        (configs[USE_ZLIB_UNCOMPRESS] || qat_available || igzip_available)) {
+      iaa_available = false;
+    }
 #endif
 
     // If both accelerators are enabled, send configured ratio of requests to
