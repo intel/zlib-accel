@@ -1,0 +1,14 @@
+# LeakSanitizer suppressions for the ASAN build (-DASAN=ON).
+#
+# One entry per allocation that is never released and is not ours to release.
+# A leak in the shim or in the test suite is a bug to fix, not an entry to add
+# here -- everything listed below is inside a vendor library, named per entry.
+
+# The QAT driver's OSAL (libqat, reached through QATzip's session setup)
+# allocates a process-lifetime mutex and never calls the matching destroy, so it
+# is still held at exit. Only reachable with USE_QAT.
+#
+# osalMutexInit is a local symbol, so this matches only while libqat ships
+# unstripped. Against a stripped driver the frame has no name, the entry stops
+# matching, and the leak comes back as a failure.
+leak:osalMutexInit

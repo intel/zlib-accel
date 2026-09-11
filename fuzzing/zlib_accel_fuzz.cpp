@@ -54,7 +54,7 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
     return;
   }
 
-  char* uncompressed;
+  char* uncompressed = nullptr;
   size_t uncompressed_length;
   size_t input_consumed;
   execution_path = UNDEFINED;
@@ -63,13 +63,18 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
                        window_bits_uncompress, flush_uncompress, 1,
                        &execution_path);
 
+  // A Z_OK return owns the partial prefix it produced and an error owns
+  // nothing, so release unconditionally here -- delete[] on the null an error
+  // leaves is a no-op, and anything else is the buffer this call is abandoning.
   if (ret != Z_STREAM_END) {
     *fuzz_ret = 1;
+    delete[] uncompressed;
     return;
   }
 
   if (memcmp(uncompressed, input, uncompressed_length) != 0) {
     *fuzz_ret = 1;
+    delete[] uncompressed;
     return;
   }
 

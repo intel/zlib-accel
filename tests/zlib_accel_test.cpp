@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <new>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -55,7 +57,7 @@ std::string GenerateRandomString(size_t length) {
 }
 
 char* GenerateCompressibleBlock(size_t length, int ratio = 4) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -83,7 +85,7 @@ char* GenerateCompressibleBlock(size_t length, int ratio = 4) {
 }
 
 char* GenerateIncompressibleBlock(size_t length) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -95,7 +97,9 @@ char* GenerateIncompressibleBlock(size_t length) {
 }
 
 char* GenerateZeroBlock(size_t length) {
-  char* buf = (char*)calloc(length, sizeof(char));
+  // The () is what calloc's zeroing becomes; without it the block is
+  // uninitialized and nothing here would say so.
+  char* buf = new (std::nothrow) char[length]();
   if (!buf) {
     return nullptr;
   }
@@ -129,7 +133,7 @@ void GenerateSeededBytes(char* out, size_t length, uint32_t* state) {
 
 char* GenerateSeededCompressibleBlock(size_t length, uint32_t seed,
                                       int ratio = 4) {
-  char* buf = (char*)malloc(length);
+  char* buf = new (std::nothrow) char[length];
   if (!buf) {
     return nullptr;
   }
@@ -158,7 +162,10 @@ char* GenerateSeededCompressibleBlock(size_t length, uint32_t seed,
   return buf;
 }
 
-void DestroyBlock(char* buf) { free(buf); }
+// Releases anything the suite hands out, so every producer here and in
+// test_utils.cpp has to allocate the way this releases. It used to free() while
+// ZlibUncompress() returned new[] memory, which ASAN halts on.
+void DestroyBlock(char* buf) { delete[] buf; }
 
 int ZlibCompressUtility(const char* input, size_t input_length,
                         std::string* output, size_t* output_upper_bound) {
@@ -654,6 +661,20 @@ void RunDummyQATJob() {
                  &execution_path);
   delete[] uncompressed;
   DestroyBlock(input);
+}
+
+// A zero block that is not zeros still round-trips, so every case that takes
+// one would pass on uninitialized memory and the parameterized sweep would
+// quietly lose its most compressible payload.  Nothing else in the suite looks
+// at the contents of a generated block, so state the one generator whose
+// contents are part of its contract.  Draws no randomness, so it leaves the
+// payload sequence the parameterized cases share alone.
+TEST(GeneratedBlockTest, ZeroBlockIsZeroed) {
+  const size_t length = 4096;
+  char* buf = GenerateBlock(length, zero_block);
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(static_cast<size_t>(std::count(buf, buf + length, '\0')), length);
+  DestroyBlock(buf);
 }
 
 class ZlibTest
@@ -5077,9 +5098,17 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(GetDeflateExecutionPath(&source), ZLIB);
   const size_t source_produced = source_output.size() - source.avail_out;
 
+  // zlib's deflateCopy overwrites the destination z_stream wholesale, so the
+  // destination's own zlib state is orphaned rather than freed -- stock zlib
+  // does this with no shim loaded.  Keep the pointer so the test can hand it
+  // back afterwards; deflateEnd refuses any other z_stream address, because the
+  // state points back at the stream it was initialized with.
+  struct internal_state* orphaned_state = dest.state;
+
   ASSERT_EQ(deflateCopy(&dest, &source), Z_OK);
   EXPECT_EQ(GetDeflateExecutionPath(&dest), ZLIB);
   EXPECT_FALSE(DeflateOwnsIgzipState(&dest));
+  ASSERT_NE(dest.state, orphaned_state);
 
   // Finishing on the copy proves the release did not disturb the state the copy
   // is meant to continue from: the prefix the source emitted plus the tail the
@@ -5091,6 +5120,8 @@ TEST_F(StreamCopyRegressionTest,
   dest.avail_out = static_cast<uInt>(dest_output.size());
   ASSERT_EQ(deflate(&dest, Z_FINISH), Z_STREAM_END);
   const size_t dest_produced = dest_output.size() - dest.avail_out;
+  ASSERT_EQ(deflateEnd(&dest), Z_OK);
+  dest.state = orphaned_state;
   ASSERT_EQ(deflateEnd(&dest), Z_OK);
   // The source is abandoned with its stream unfinished, which is exactly the
   // case zlib reports Z_DATA_ERROR for; the copy carried the tail.
@@ -5177,9 +5208,14 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(GetInflateExecutionPath(&source), ZLIB);
   const size_t source_produced = source.total_out;
 
+  // As on the deflate side, the copy orphans the destination's own zlib state,
+  // which only this z_stream address can release.
+  struct internal_state* orphaned_state = dest.state;
+
   ASSERT_EQ(inflateCopy(&dest, &source), Z_OK);
   EXPECT_EQ(GetInflateExecutionPath(&dest), ZLIB);
   EXPECT_FALSE(InflateOwnsIgzipState(&dest));
+  ASSERT_NE(dest.state, orphaned_state);
 
   // As on the deflate side, the copy has to be able to finish the stream the
   // source was partway through.
@@ -5199,6 +5235,8 @@ TEST_F(StreamCopyRegressionTest,
   ASSERT_EQ(dest_produced, input_length - source_produced);
   EXPECT_EQ(memcmp(dest_output.data(), input + source_produced, dest_produced),
             0);
+  ASSERT_EQ(inflateEnd(&dest), Z_OK);
+  dest.state = orphaned_state;
   ASSERT_EQ(inflateEnd(&dest), Z_OK);
   ASSERT_EQ(inflateEnd(&source), Z_OK);
 
@@ -6771,6 +6809,29 @@ TEST_F(ConfigLoaderTest, MapShardsInvalidNonPowerOfTwo) {
   EXPECT_EQ(GetConfig(MAP_SHARDS), saved_shards);
   std::remove(config_path);
   SetConfig(MAP_SHARDS, saved_shards);
+}
+
+// The log path is handed back through an out-parameter rather than parked in a
+// global, so a caller that asks for it gets what the config file names, and a
+// config file that names none leaves the caller's string alone.
+TEST_F(ConfigLoaderTest, LogFilePathHandedBack) {
+  std::string file_content;
+  std::string log_file;
+  EXPECT_TRUE(
+      LoadConfigFile(file_content, "../../config/default_config", &log_file));
+  EXPECT_EQ(log_file, "/tmp/zlib-accel.log");
+
+  const char* config_path = "/tmp/no_log_file_config";
+  std::ofstream config_file(config_path);
+  config_file << "log_level=1\n";
+  config_file.close();
+  std::string untouched = "unchanged";
+  EXPECT_TRUE(LoadConfigFile(file_content, config_path, &untouched));
+  EXPECT_EQ(untouched, "unchanged");
+  std::remove(config_path);
+
+  // Restore config from the official config file.
+  LoadConfigFile(file_content);
 }
 
 // The shim keeps per-stream state in maps keyed by z_streamp, and every entry

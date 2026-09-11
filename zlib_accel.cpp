@@ -244,7 +244,9 @@ static int init_zlib_accel(void) {
   // Load configuration file; on failure (file absent or is a symlink) continue
   // with compiled-in defaults — a missing config is not fatal.
   std::string config_file_content;
-  const bool config_loaded = config::LoadConfigFile(config_file_content);
+  std::string log_file;
+  const bool config_loaded = config::LoadConfigFile(
+      config_file_content, config::kDefaultConfigPath, &log_file);
   if (!config_loaded) {
     Log(LogLevel::LOG_ERROR,
         "Failed to load configuration file, continuing with defaults\n");
@@ -253,8 +255,8 @@ static int init_zlib_accel(void) {
   InitStreamRegistries();
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
-  if (config_loaded && !config::log_file.empty()) {
-    CreateLogFile(config::log_file.c_str());
+  if (config_loaded && !log_file.empty()) {
+    CreateLogFile(log_file.c_str());
   }
 #endif
 

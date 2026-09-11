@@ -11,8 +11,6 @@
 
 namespace config {
 
-std::string log_file = "";
-
 // default config values at initialization
 uint32_t configs[CONFIG_MAX] = {
     1,    /*use_qat_compress*/
@@ -36,7 +34,8 @@ uint32_t configs[CONFIG_MAX] = {
     64    /*map_shards*/
 };
 
-bool LoadConfigFile(std::string& file_content, const char* file_path) {
+bool LoadConfigFile(std::string& file_content, const char* file_path,
+                    std::string* log_file) {
   // Initialize config_names within the function to avoid initialization order
   // problems. LoadConfigFile is called from the zlib-accel shared library
   // constructor. If config_names is a global array of strings, it may not be
@@ -101,7 +100,9 @@ bool LoadConfigFile(std::string& file_content, const char* file_path) {
   trySetConfig(LOG_STATS_SAMPLES, UINT32_MAX, 0);
   trySetConfig(MAP_SHARDS, 65536, 2,
                [](uint32_t v) { return (v & (v - 1)) == 0; });
-  config_reader.GetValue("log_file", log_file);
+  if (log_file != nullptr) {
+    config_reader.GetValue("log_file", *log_file);
+  }
   file_content.append(config_reader.DumpValues());
 
   return true;

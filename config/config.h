@@ -32,12 +32,18 @@ enum ConfigOption {
   CONFIG_MAX
 };
 
-extern std::string log_file;
-
 extern uint32_t configs[CONFIG_MAX];
 
+inline constexpr const char* kDefaultConfigPath = "/etc/zlib-accel.conf";
+
+// log_file, when given, receives the log path the config file names, and is
+// left untouched when the file names none. It is an out-parameter rather than a
+// global: the shim opens the log file a few lines after loading the config and
+// has no reader for the path afterwards, and a global written from the library
+// constructor is written before its own initializer runs.
 VISIBLE_FOR_TESTING bool LoadConfigFile(
-    std::string& file_content, const char* file_path = "/etc/zlib-accel.conf");
+    std::string& file_content, const char* file_path = kDefaultConfigPath,
+    std::string* log_file = nullptr);
 
 VISIBLE_FOR_TESTING void SetConfig(ConfigOption option, uint32_t value);
 VISIBLE_FOR_TESTING uint32_t GetConfig(ConfigOption option);
