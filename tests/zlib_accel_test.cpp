@@ -8108,6 +8108,454 @@ TEST_F(GzipFileTest, GzwriteAndGzreadRejectALengthThatDoesNotFitInInt) {
   DestroyBlock(input);
 }
 
+#ifdef USE_IGZIP
+class InflateMidstreamErrorRegressionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    // Written unconditionally by SetCompressPath/SetUncompressPath as well.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
+    saved_igzip_fallback_ = GetConfig(IGZIP_FALLBACK);
+    saved_ignore_dictionary_ = GetConfig(IGNORE_ZLIB_DICTIONARY);
+  }
+
+  // Restored here rather than at the end of each helper: an ASSERT_* failure
+  // returns from the helper, which would skip an inline restore and leave the
+  // rest of the suite running on this test's configuration.
+  void TearDown() override {
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
+    SetConfig(IGZIP_FALLBACK, saved_igzip_fallback_);
+    SetConfig(IGNORE_ZLIB_DICTIONARY, saved_ignore_dictionary_);
+  }
+
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
+  uint32_t saved_igzip_fallback_ = 0;
+  uint32_t saved_ignore_dictionary_ = 0;
+};
+
+// Build a stream that decodes cleanly up to a point and is invalid after it.
+// Z_SYNC_FLUSH ends the good part at a byte boundary with the stream still
+// open, and the byte appended there opens a block whose type is the reserved
+// 11b, which every conforming decoder must reject. The whole payload is
+// decodable from the prefix, which is what makes the delivered byte count
+// assertable.
+static void BuildStreamWithInvalidTail(const char* input, size_t input_length,
+                                       int window_bits,
+                                       std::vector<Bytef>* stream_out) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         window_bits, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> buffer(deflateBound(&stream, input_length) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input));
+  stream.avail_in = static_cast<uInt>(input_length);
+  stream.next_out = buffer.data();
+  stream.avail_out = static_cast<uInt>(buffer.size());
+
+  ASSERT_EQ(deflate(&stream, Z_SYNC_FLUSH), Z_OK);
+  ASSERT_EQ(stream.avail_in, 0u);
+  const size_t prefix_length = buffer.size() - stream.avail_out;
+  // Z_DATA_ERROR, not Z_OK: the stream is deliberately left unfinished, which
+  // is what deflateEnd() reports when it is ended before Z_FINISH.
+  ASSERT_EQ(deflateEnd(&stream), Z_DATA_ERROR);
+
+  buffer.resize(prefix_length + 64);
+  buffer[prefix_length] = 0x07;
+  for (size_t i = prefix_length + 1; i < buffer.size(); i++) {
+    buffer[i] = 0x5a;
+  }
+  *stream_out = buffer;
+}
+
+// Feed a stream to inflate() in fixed-size chunks, stopping at the first error
+// or at the end of the stream. Reports what the caller needs to judge the
+// failure: whether a completion was ever claimed, and what the last call said.
+// Resumable: the cursor comes from total_in, so a caller that resynchronized
+// the stream in between continues from where the resync left it.
+static void InflateInChunks(z_streamp stream, const std::vector<Bytef>& input,
+                            size_t chunk_length, int* last_ret,
+                            bool* saw_stream_end) {
+  *last_ret = Z_OK;
+  *saw_stream_end = false;
+  size_t fed = stream->total_in;
+  stream->avail_in = 0;
+  for (int guard = 0; guard < 1024; guard++) {
+    if (stream->avail_in == 0 && fed < input.size()) {
+      const size_t take = std::min(chunk_length, input.size() - fed);
+      stream->next_in = const_cast<Bytef*>(input.data()) + fed;
+      stream->avail_in = static_cast<uInt>(take);
+      fed += take;
+    }
+    *last_ret = inflate(stream, Z_NO_FLUSH);
+    if (*last_ret == Z_STREAM_END) {
+      *saw_stream_end = true;
+      return;
+    }
+    if (*last_ret < 0) {
+      return;
+    }
+    if (stream->avail_in == 0 && fed >= input.size() &&
+        *last_ret == Z_BUF_ERROR) {
+      return;
+    }
+  }
+  FAIL() << "inflate() made no progress in 1024 calls";
+}
+
+// The finding: a decode failure part-way through a stream used to pin the
+// stream to zlib and hand it the rest, but zlib's inflate state never saw the
+// earlier chunks, so next_in pointed into the middle of a deflate block that
+// zlib read as the start of a fresh stream. On a raw stream there is no header
+// to reject that, so zlib emitted junk it counted as output and could report
+// Z_STREAM_END -- a short decode reported as success -- and the output the
+// failing call had already decoded was dropped on the way out.
+static void RunMidstreamInflateErrorRegression(ExecutionPath accel_path,
+                                               int window_bits, uint32_t seed) {
+  const size_t input_length = 96 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, seed);
+  ASSERT_NE(input, nullptr);
+
+  std::vector<Bytef> compressed;
+  BuildStreamWithInvalidTail(input, input_length, window_bits, &compressed);
+  ASSERT_FALSE(compressed.empty());
+
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  if (accel_path != IGZIP) {
+    SetConfig(USE_IGZIP_UNCOMPRESS, 1);
+    SetConfig(IGZIP_FALLBACK, 1);
+  }
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, window_bits), Z_OK);
+
+  std::vector<char> output(input_length + 4096, 0);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  int last_ret = Z_OK;
+  bool saw_stream_end = false;
+  // Chunked deliberately: one call per stream is the case the fall-through was
+  // written for, and it stays supported -- see the first-call test below.
+  InflateInChunks(&stream, compressed, 4096, &last_ret, &saw_stream_end);
+
+  // The stream is broken, so the one answer that must never appear is success.
+  EXPECT_FALSE(saw_stream_end);
+  EXPECT_EQ(last_ret, Z_DATA_ERROR);
+
+  // Everything before the invalid block is decodable, and an engine that
+  // decoded it has to hand it over -- zlib returns the decodable prefix and
+  // then the error too.
+  const size_t produced = output.size() - stream.avail_out;
+  EXPECT_EQ(produced, input_length);
+  EXPECT_EQ(memcmp(output.data(), input, std::min(produced, input_length)), 0);
+
+  // Answered in place rather than delegated: a stream this far in cannot be
+  // handed to zlib at all, so the path must not have moved to ZLIB.
+  EXPECT_NE(GetInflateExecutionPath(&stream), ZLIB);
+
+  // A failed stream stays failed. zlib holds its own state at BAD and keeps
+  // answering Z_DATA_ERROR; the engine here has no such state of its own.
+  stream.next_in = compressed.data();
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  EXPECT_EQ(inflate(&stream, Z_NO_FLUSH), Z_DATA_ERROR);
+
+  EXPECT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+// The other side of the same gate. When the very first call fails, next_in
+// still addresses the first byte of the stream, so zlib can take it from the
+// start -- which is what the fall-through was for, and it has to keep working.
+static void RunFirstCallInflateErrorRegression(ExecutionPath accel_path,
+                                               int window_bits, uint32_t seed) {
+  const size_t input_length = 32 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, seed);
+  ASSERT_NE(input, nullptr);
+
+  std::vector<Bytef> compressed;
+  BuildStreamWithInvalidTail(input, input_length, window_bits, &compressed);
+  ASSERT_FALSE(compressed.empty());
+  // Smash the first block instead of the appended one, leaving the zlib header
+  // valid so the stream is refused for its content rather than its format.
+  const size_t header_length = (window_bits >= 8) ? 2 : 0;
+  ASSERT_GT(compressed.size(), header_length);
+  compressed[header_length] = 0x07;
+
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  if (accel_path != IGZIP) {
+    SetConfig(USE_IGZIP_UNCOMPRESS, 1);
+    SetConfig(IGZIP_FALLBACK, 1);
+  }
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, window_bits), Z_OK);
+
+  std::vector<char> output(input_length + 4096, 0);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  int last_ret = Z_OK;
+  bool saw_stream_end = false;
+  InflateInChunks(&stream, compressed, 4096, &last_ret, &saw_stream_end);
+
+  EXPECT_FALSE(saw_stream_end);
+  EXPECT_EQ(last_ret, Z_DATA_ERROR);
+  EXPECT_EQ(output.size() - stream.avail_out, 0u);
+  // Nothing was consumed, so this is the one case zlib can still be given.
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  EXPECT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+// inflateSync() is the way back from a failed stream: it skips to the next
+// full-flush point and decoding resumes there. Recovery has to survive the
+// mid-stream gate above -- the resync clears the latched error, or a stream
+// that resynchronized successfully would answer Z_DATA_ERROR forever.
+static void RunInflateSyncAfterMidstreamErrorRegression(
+    ExecutionPath accel_path, int window_bits, uint32_t seed) {
+  const size_t segment_length = 32 * 1024;
+  const size_t input_length = 3 * segment_length;
+  char* input = GenerateSeededCompressibleBlock(input_length, seed);
+  ASSERT_NE(input, nullptr);
+
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         window_bits, 8, Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> compressed(deflateBound(&cstream, input_length) + 4096);
+  cstream.next_out = compressed.data();
+  cstream.avail_out = static_cast<uInt>(compressed.size());
+
+  // Z_FULL_FLUSH discards the window, so each segment decodes from its own
+  // start. That is what a resync can recover to.
+  size_t mark[3] = {0, 0, 0};
+  for (int segment = 0; segment < 3; segment++) {
+    cstream.next_in =
+        reinterpret_cast<Bytef*>(input) + segment * segment_length;
+    cstream.avail_in = static_cast<uInt>(segment_length);
+    const int ret = deflate(&cstream, segment == 2 ? Z_FINISH : Z_FULL_FLUSH);
+    ASSERT_EQ(ret, segment == 2 ? Z_STREAM_END : Z_OK);
+    mark[segment] = compressed.size() - cstream.avail_out;
+  }
+  const size_t compressed_length = compressed.size() - cstream.avail_out;
+  ASSERT_EQ(deflateEnd(&cstream), Z_OK);
+  compressed.resize(compressed_length);
+
+  // Smash the middle segment from its byte-aligned start, keeping its trailing
+  // flush marker so the resync still has a point to find.
+  compressed[mark[0]] = 0x07;
+  for (size_t i = mark[0] + 1; i + 8 < mark[1]; i++) {
+    compressed[i] = 0x5a;
+  }
+
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  if (accel_path != IGZIP) {
+    SetConfig(USE_IGZIP_UNCOMPRESS, 1);
+    SetConfig(IGZIP_FALLBACK, 1);
+  }
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, window_bits), Z_OK);
+
+  std::vector<char> output(input_length + 4096, 0);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  int last_ret = Z_OK;
+  bool saw_stream_end = false;
+  InflateInChunks(&stream, compressed, 4096, &last_ret, &saw_stream_end);
+  ASSERT_EQ(last_ret, Z_DATA_ERROR);
+  const size_t produced_before_sync = output.size() - stream.avail_out;
+  ASSERT_GE(produced_before_sync, segment_length);
+  EXPECT_EQ(memcmp(output.data(), input, segment_length), 0);
+
+  // inflateSync() searches the input it is given, and the flush point it needs
+  // is past what the failing call had been fed.
+  stream.next_in = compressed.data() + stream.total_in;
+  stream.avail_in = static_cast<uInt>(compressed.size() - stream.total_in);
+  ASSERT_EQ(inflateSync(&stream), Z_OK);
+
+  // Segment 3 comes back, which it cannot if the resync left the error latched.
+  InflateInChunks(&stream, compressed, 4096, &last_ret, &saw_stream_end);
+  EXPECT_NE(last_ret, Z_DATA_ERROR);
+  const size_t produced = output.size() - stream.avail_out;
+  ASSERT_GE(produced, segment_length);
+  EXPECT_EQ(memcmp(output.data() + produced - segment_length,
+                   input + 2 * segment_length, segment_length),
+            0);
+  // The resync is the one mid-stream handoff to zlib, and the only engine that
+  // can honor it: zlib performed the search, so its state is the one left at
+  // the flush point. A backend still holds the bits it read ahead of the
+  // failure.
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  EXPECT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+// The other way a stream reaches the gate with input already consumed: a zlib
+// header delivered one byte per call. FDICT lives in the second byte, so the
+// first call is the shim's only chance to keep the stream off a backend, and it
+// cannot yet see the bit. A backend given that byte swallows it into its own
+// header buffer and reports the dictionary on the next call, by which time the
+// bytes zlib would need to parse the header itself are gone from the caller's
+// buffer -- so the request has to be answered the way zlib answers it, which
+// means not offloading the byte at all.
+static void RunFragmentedZlibHeaderDictionaryRegression(
+    ExecutionPath accel_path, uint32_t seed) {
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+  SetConfig(IGNORE_ZLIB_DICTIONARY, 0);
+
+  const size_t input_length = 32 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, seed);
+  ASSERT_NE(input, nullptr);
+
+  const unsigned char dict[] = "fragmented-header-preset-dictionary";
+  const uInt dict_length = static_cast<uInt>(sizeof(dict) - 1);
+
+  z_stream cstream;
+  memset(&cstream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  ASSERT_EQ(deflateSetDictionary(&cstream, dict, dict_length), Z_OK);
+
+  std::vector<Bytef> compressed(deflateBound(&cstream, input_length) + 4096);
+  cstream.next_in = reinterpret_cast<Bytef*>(input);
+  cstream.avail_in = static_cast<uInt>(input_length);
+  cstream.next_out = compressed.data();
+  cstream.avail_out = static_cast<uInt>(compressed.size());
+  ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+  compressed.resize(compressed.size() - cstream.avail_out);
+  ASSERT_EQ(deflateEnd(&cstream), Z_OK);
+  ASSERT_GT(compressed.size(), 2u);
+  // FDICT, second header byte -- the bit the first call cannot see.
+  ASSERT_NE(compressed[1] & 0x20, 0);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<char> output(input_length + 4096, 0);
+  stream.next_out = reinterpret_cast<Bytef*>(output.data());
+  stream.avail_out = static_cast<uInt>(output.size());
+
+  size_t fed = 0;
+  int ret = Z_OK;
+  bool asked_for_dictionary = false;
+  for (size_t guard = 0; guard < 4 * compressed.size() + 64; guard++) {
+    if (stream.avail_in == 0 && fed < compressed.size()) {
+      stream.next_in = compressed.data() + fed;
+      stream.avail_in = 1;
+      fed++;
+    }
+    ret = inflate(&stream, Z_NO_FLUSH);
+    if (ret == Z_NEED_DICT) {
+      asked_for_dictionary = true;
+      ASSERT_EQ(inflateSetDictionary(&stream, dict, dict_length), Z_OK);
+      continue;
+    }
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END || ret == Z_BUF_ERROR) {
+      break;
+    }
+  }
+
+  // zlib asks for the dictionary and then decodes the stream; the pin is what
+  // lets the shim do the same.
+  EXPECT_TRUE(asked_for_dictionary);
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(stream.total_out, input_length);
+  EXPECT_EQ(memcmp(output.data(), input, input_length), 0);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  EXPECT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest, IGZIPRawErrorIsNotReportedAsEnd) {
+  RunMidstreamInflateErrorRegression(IGZIP, -15, /*seed=*/0x11f4);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPZlibErrorDeliversDecodedBytes) {
+  RunMidstreamInflateErrorRegression(IGZIP, 15, /*seed=*/0x11f5);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPGzipErrorDeliversDecodedBytes) {
+  RunMidstreamInflateErrorRegression(IGZIP, 31, /*seed=*/0x11f6);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPFirstCallErrorStillReachesZlib) {
+  RunFirstCallInflateErrorRegression(IGZIP, 15, /*seed=*/0x11f7);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPInflateSyncRecoversAfterError) {
+  RunInflateSyncAfterMidstreamErrorRegression(IGZIP, -15, /*seed=*/0x11f8);
+}
+
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IGZIPFragmentedZlibHeaderStillAsksForDictionary) {
+  RunFragmentedZlibHeaderDictionaryRegression(IGZIP, /*seed=*/0x11fb);
+}
+
+#ifdef USE_QAT
+TEST_F(InflateMidstreamErrorRegressionTest,
+       QATFallbackRawErrorIsNotReportedAsEnd) {
+  RunMidstreamInflateErrorRegression(QAT, -15, /*seed=*/0x11f9);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(InflateMidstreamErrorRegressionTest,
+       IAAFallbackRawErrorIsNotReportedAsEnd) {
+  RunMidstreamInflateErrorRegression(IAA, -15, /*seed=*/0x11fa);
+}
+#endif
+#endif  // USE_IGZIP
+
 class ShardedMapTest : public ::testing::Test {};
 
 TEST_F(ShardedMapTest, BasicSetAndGet) {
