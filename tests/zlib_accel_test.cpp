@@ -10711,6 +10711,10 @@ static void RunDeflatePrimeRefusedOnAcceleratedStream(
   // The refusal is about bits, not about the call: priming nothing asks for
   // nothing and is passed through.
   EXPECT_EQ(deflatePrime(&stream, 0, 0), Z_OK);
+  // A count zlib refuses primes nothing either, so it keeps zlib's own answer
+  // here exactly as it does on a stream no engine has taken yet.
+  EXPECT_EQ(deflatePrime(&stream, 17, 0), Z_BUF_ERROR);
+  EXPECT_EQ(deflatePrime(&stream, -1, 0), Z_BUF_ERROR);
   EXPECT_EQ(GetDeflateExecutionPath(&stream), accel_path)
       << "a refused prime must not take the stream off its engine either";
 
@@ -10925,6 +10929,9 @@ static void RunInflatePrimeRefusedOnAcceleratedStream(
   EXPECT_EQ(inflatePrime(&stream, 8, kPrimedByte), Z_STREAM_ERROR);
   EXPECT_EQ(inflatePrime(&stream, -1, 0), Z_STREAM_ERROR);
   EXPECT_EQ(inflatePrime(&stream, 0, 0), Z_OK);
+  // zlib refuses an over-16 count with the same code, so this row is here to
+  // record that the answer does not depend on which side produced it.
+  EXPECT_EQ(inflatePrime(&stream, 17, 0), Z_STREAM_ERROR);
   EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
 
   ASSERT_EQ(inflateReset(&stream), Z_OK);

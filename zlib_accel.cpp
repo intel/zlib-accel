@@ -817,6 +817,10 @@ int ZEXPORT deflateParams(z_streamp strm, int level, int strategy) {
 // A zero bit count changes nothing in either direction, so those calls neither
 // pin nor refuse -- a caller that primes zero bits should not lose the offload
 // for the rest of the stream.
+
+// The largest bit count zlib.h allows either function to insert.
+static constexpr int kMaxPrimeBits = 16;
+
 int ZEXPORT deflatePrime(z_streamp strm, int bits, int value) {
   Log(LogLevel::LOG_INFO, "deflatePrime Line ", __LINE__, ", strm ",
       static_cast<void*>(strm), ", bits ", bits, ", value ", value, "\n");
@@ -829,7 +833,15 @@ int ZEXPORT deflatePrime(z_streamp strm, int bits, int value) {
   // decision deflateSetDictionary() makes for the same reason. zlib itself
   // accepts a mid-stream prime, so this is a deliberate divergence -- a refusal
   // the caller can see, in place of bits that quietly disappear.
-  if (bits != 0 && deflate_settings != nullptr &&
+  //
+  // Only a count zlib would accept is refused. A negative or over-16 count
+  // primes nothing, so there is nothing an engine can swallow and zlib's own
+  // Z_BUF_ERROR is the better answer; those calls are forwarded. zlib's other
+  // Z_BUF_ERROR, a pending buffer with no room, cannot shadow the refusal here:
+  // only deflate()'s zlib fall-through writes that buffer and it pins the
+  // stream to ZLIB first, so the buffer is empty whenever an accelerator holds
+  // it.
+  if (bits > 0 && bits <= kMaxPrimeBits && deflate_settings != nullptr &&
       deflate_settings->path != UNDEFINED && deflate_settings->path != ZLIB) {
     return Z_STREAM_ERROR;
   }
@@ -1388,6 +1400,12 @@ int ZEXPORT inflatePrime(z_streamp strm, int bits, int value) {
   // deliberately: on a stream zlib is decoding it discards zlib's bit buffer
   // mid-symbol, and an accelerator holds the equivalent bits where the shim
   // cannot reach them, so the call would report success having done nothing.
+  //
+  // Unlike deflatePrime() this needs no upper bound on the count: zlib answers
+  // an over-16 count with Z_STREAM_ERROR itself, which is what the refusal
+  // returns, so excluding it would only add a term nothing can distinguish. Its
+  // other refusal, a bit buffer with no room for the count, is unreachable for
+  // the same reason -- zlib's hold is empty on a stream it never decoded.
   if (bits != 0 && inflate_settings != nullptr &&
       inflate_settings->path != UNDEFINED && inflate_settings->path != ZLIB) {
     return Z_STREAM_ERROR;
