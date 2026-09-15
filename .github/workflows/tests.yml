@@ -43,7 +43,33 @@ jobs:
         cd build
         cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
         make
-        
+
+    # The shim's exported symbols get C linkage only by matching a declaration
+    # zlib.h already made; there is no extern "C" in zlib_accel.cpp. An
+    # interceptor zlib.h does not declare is therefore compiled as ordinary C++,
+    # emitted under a mangled name, and silently not interposed by LD_PRELOAD --
+    # it still compiles, still links, and still passes every unit test that calls
+    # it directly. Adding or renaming an interceptor is the way to reach that, so
+    # this asserts the invariant on the built library rather than trusting review.
+    # The eight named below are the large-file pairs the surrounding LFS logic
+    # turns on; the blanket pattern covers the rest. It cannot match the
+    # intentionally-C++ test hooks (DeflateOwnsIgzipState and friends), which have
+    # no lowercase "gz" directly after the length digits.
+    - name: Check gz symbol export and linkage
+      run: |
+        pwd
+        cd build
+        nm -D --defined-only libzlib-accel.so > /tmp/gzsyms.txt
+        for s in gzopen gzopen64 gzseek gzseek64 gztell gztell64 gzoffset gzoffset64; do
+          grep -qE " T $s\$" /tmp/gzsyms.txt \
+            || { echo "MISSING or non-C symbol: $s"; exit 1; }
+        done
+        if grep -E '_Z[0-9]+gz' /tmp/gzsyms.txt; then
+          echo "C++-mangled gz symbol above: LD_PRELOAD cannot interpose it"
+          exit 1
+        fi
+        echo "gz symbols with C linkage: $(grep -cE ' T gz' /tmp/gzsyms.txt)"
+
     - name: Build tests
       run: |
         pwd
