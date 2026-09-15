@@ -61,9 +61,7 @@ CI for HW offload tests is in development (tests are currently run internally).
 
 ## Releases
 
-The project is still in development and subject to change. It can be used for testing, but it is not yet ready for production use.
-
-Tagged releases will be provided with details on the maturity of the features. Commits on the main branch that are not tagged as releases are not to be considered stable.
+Tagged releases are the supported way to consume the project, and each release's notes state what it contains, which accelerators it covers, and any change to the build requirements or the configuration options. Commits on the main branch that are not tagged as releases are not to be considered stable.
 
 
 ## Build the Shared Library
