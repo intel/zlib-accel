@@ -2907,18 +2907,23 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
     }
   }
 
-  int write_ret = 0;
-  do {
-    write_ret = write(gz->fd, gz->io_buf, output_len);
+  // write(2) may accept fewer bytes than asked for -- a pipe or socket that is
+  // full, or a call interrupted by a signal -- so advance past what each write
+  // took and send the rest from there. Writing from the start of io_buf every
+  // time would re-emit the bytes already written and drop the tail, corrupting
+  // the compressed stream. A non-positive return makes no progress: an error is
+  // reported, and a zero is treated as one rather than spun on. EINTR is not
+  // retried, matching gz_load on the read path.
+  uint32_t written = 0;
+  while (written < output_len) {
+    const ssize_t write_ret =
+        write(gz->fd, gz->io_buf + written, output_len - written);
     Log(LogLevel::LOG_INFO, "CompressAndWrite Line ", __LINE__, ", file ",
         static_cast<void*>(file), ", written to file ", write_ret, "\n");
-    if (write_ret >= 0) {
-      output_len -= write_ret;
+    if (write_ret <= 0) {
+      return 1;
     }
-  } while (output_len > 0 && write_ret >= 0);
-
-  if (write_ret == -1) {
-    return 1;
+    written += static_cast<uint32_t>(write_ret);
   }
 
   return 0;
