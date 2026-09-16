@@ -3766,21 +3766,36 @@ TEST(IGZIPInflateRegressionTest, WrongChecksumIsADataErrorOnTheDrainCall) {
   // Chunks small enough that the payload cannot be delivered in one call, which
   // is what puts the checksum check on a call with no input left.
   std::vector<char> chunk(1024);
+  std::string decompressed;
   int ret = Z_OK;
   uInt avail_in_on_failing_call = 1;
+  size_t produced_on_failing_call = 0;
   for (int call = 0; call < 4096; ++call) {
     stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
     stream.avail_out = static_cast<uInt>(chunk.size());
     avail_in_on_failing_call = stream.avail_in;
     ret = inflate(&stream, Z_SYNC_FLUSH);
     ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP) << "call=" << call;
+    const size_t produced = chunk.size() - stream.avail_out;
+    decompressed.append(chunk.data(), produced);
     if (ret != Z_OK) {
+      produced_on_failing_call = produced;
       break;
     }
   }
 
   EXPECT_EQ(ret, Z_DATA_ERROR);
   EXPECT_EQ(avail_in_on_failing_call, 0u);
+
+  // The failing call is the one that delivers the tail of the payload -- the
+  // trailer is only checked once the last payload byte is out -- so it has to
+  // account for those bytes as zlib does, whatever it goes on to return.
+  // Reporting the error with next_out, avail_out and total_out untouched tells
+  // the caller the bytes in its buffer do not exist.
+  EXPECT_GT(produced_on_failing_call, 0u);
+  EXPECT_EQ(stream.total_out, input_length);
+  ASSERT_EQ(decompressed.size(), input_length);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_length), 0);
 
   inflateEnd(&stream);
   DestroyBlock(input);

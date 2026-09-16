@@ -406,13 +406,21 @@ void IGZIPHandleActiveStreamNoInput(z_streamp strm,
                          &output_len, &strm->total_in, &strm->total_out,
                          &end_of_stream);
 
+  // Account for what ISA-L produced before deciding what to report, the way
+  // zlib advances the stream at inf_leave whatever it goes on to return. The
+  // bytes are already in the caller's buffer, and a failure here is the very
+  // call likely to carry them: a wrapper checksum is only checked once the last
+  // payload byte has been handed over, so the call that delivers the tail is
+  // the call that reports the mismatch. Leaving next_out, avail_out and
+  // total_out where they were tells the caller those bytes do not exist.
+  strm->next_out += output_len;
+  strm->avail_out -= output_len;
+  // This is the only site that updates total_out for the avail_in==0 path.
+  // The caller returns immediately after this call, so the main
+  // inflate() update block is never reached — no double-counting.
+  strm->total_out += output_len;
+
   if (*ret == 0) {
-    strm->next_out += output_len;
-    strm->avail_out -= output_len;
-    // This is the only site that updates total_out for the avail_in==0 path.
-    // The caller returns immediately after this call, so the main
-    // inflate() update block is never reached — no double-counting.
-    strm->total_out += output_len;
     if (end_of_stream) {
       *ret = Z_STREAM_END;
     } else if (output_len > 0) {
