@@ -865,8 +865,19 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // Counted like the fall-through below rather than like an early exit: the
   // call did reach zlib, and its rejection is an error the statistics should
   // show.
+  //
+  // A flush value outside zlib's range is delegated for the same reason, and it
+  // has to be delegated from here, above every path decision. No engine accepts
+  // such a value, so left to the code below it reaches the zlib fall-through --
+  // which pins the stream to ZLIB, abandoning whatever an active ISA-L stream
+  // still holds -- and on the way it is recorded as the stream's last flush,
+  // where it outranks every legal value and suppresses the caller's next empty
+  // flush. zlib rejects it before it touches any state, so the stream stays
+  // exactly as offloadable as it was. The terminal-state gate above tests the
+  // same range because a finished stream never reaches this point.
   if (strm->next_out == nullptr ||
-      (strm->avail_in != 0 && strm->next_in == nullptr)) {
+      (strm->avail_in != 0 && strm->next_in == nullptr) || flush > Z_BLOCK ||
+      flush < 0) {
     if (orig_deflate == nullptr) {
       return Z_VERSION_ERROR;
     }

@@ -2429,6 +2429,75 @@ TEST_F(IGZIPEmptyFlushRegressionTest, WrappedFormatsFollowTheSameRule) {
   }
 }
 
+// zlib checks the flush range before it looks at anything else and rejects an
+// out-of-range value without touching the stream, so an accelerated stream has
+// to come out of such a call exactly as it went in.  Both halves of that were
+// wrong: the value was recorded as the stream's last flush, where it outranks
+// every legal one and refuses the caller's next empty flush, and since no
+// engine accepts it the call landed on the zlib fall-through, which pinned a
+// stream ISA-L was still holding to ZLIB -- so the buffered payload was never
+// emitted and the caller's own Z_FINISH produced a valid, empty stream.
+TEST_F(IGZIPEmptyFlushRegressionTest, InvalidFlushLeavesTheStreamUntouched) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_NO_FLUSH));
+
+  // Z_TREES is one above deflate's Z_BLOCK and a legal flush for inflate, which
+  // makes it the out-of-range value a caller is likeliest to pass by mistake.
+  for (const int flush : {Z_TREES, 99, -1}) {
+    size_t bytes = 0;
+    EXPECT_EQ(EmptyFlush(flush, &bytes), Z_STREAM_ERROR) << "flush=" << flush;
+    EXPECT_EQ(bytes, 0u) << "flush=" << flush;
+    EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP) << "flush=" << flush;
+  }
+
+  // Having no output space does not change the answer, the way it does for a
+  // legal flush: zlib's range check comes first.
+  stream_.next_in = nullptr;
+  stream_.avail_in = 0;
+  stream_.next_out =
+      reinterpret_cast<Bytef*>(compressed_.data()) + compressed_used_;
+  stream_.avail_out = 0;
+  EXPECT_EQ(deflate(&stream_, 99), Z_STREAM_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  // The recorded flush is still the opening Z_NO_FLUSH, so an empty
+  // Z_PARTIAL_FLUSH outranks it and does work -- and that is also the call that
+  // proves the payload is still ISA-L's to emit.
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_PARTIAL_FLUSH, &bytes), Z_OK);
+  EXPECT_GT(bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The same value on the first call, where there is no engine holding anything
+// yet: the cost then is the pin itself, which takes the stream off the offload
+// for the rest of its life over a call zlib treats as a no-op.
+TEST_F(IGZIPEmptyFlushRegressionTest,
+       InvalidFlushOnAFreshStreamKeepsItOffloadable) {
+  ASSERT_EQ(deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  stream_open_ = true;
+  compressed_.assign(kInputLength * 2 + 4096, 0);
+  compressed_used_ = 0;
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(99, &bytes), Z_STREAM_ERROR);
+  EXPECT_EQ(bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), UNDEFINED);
+
+  stream_.next_in = reinterpret_cast<Bytef*>(input_);
+  stream_.avail_in = static_cast<unsigned int>(kInputLength);
+  stream_.next_out = reinterpret_cast<Bytef*>(compressed_.data());
+  stream_.avail_out = static_cast<unsigned int>(compressed_.size());
+  EXPECT_EQ(deflate(&stream_, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+  compressed_used_ = compressed_.size() - stream_.avail_out;
+
+  ExpectPayloadRecoverable(-15);
+}
+
 // Regression test for: deflateReset on a reused IGZIP stream must restore the
 // zlib header (gzip_flag = IGZIP_ZLIB) so that each independent chunk is
 // self-contained and decompressible by a fresh zlib inflater.  Without the
