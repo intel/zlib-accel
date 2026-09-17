@@ -1415,8 +1415,8 @@ TEST(IGZIPInflateRegressionTest, RawContinuationMustNotIncreaseAvailIn) {
   stream.avail_out = static_cast<unsigned int>(output_chunk.size());
 
   ret = inflate(&stream, Z_SYNC_FLUSH);
-  EXPECT_NE(ret, Z_DATA_ERROR);
-  EXPECT_LE(stream.avail_in, 1u);
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(stream.avail_in, 1u);
 
   inflateEnd(&stream);
   DestroyBlock(input);
@@ -1452,12 +1452,13 @@ TEST(IGZIPInflateRegressionTest, RawTrailingByteMustNotIncreaseAvailIn) {
   stream.avail_out = static_cast<unsigned int>(uncompressed.size());
 
   ret = inflate(&stream, Z_SYNC_FLUSH);
-  EXPECT_NE(ret, Z_DATA_ERROR);
+  EXPECT_EQ(ret, Z_STREAM_END);
   EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
 
-  // For valid raw-deflate stream with one extra byte, inflate may leave that
-  // byte unconsumed, but avail_in must never increase.
-  EXPECT_LE(stream.avail_in, 1u);
+  // The stream ends inside its last byte, and the byte after it belongs to the
+  // caller: exactly one byte must come back unconsumed. "No more than one" also
+  // passed when the decompressor swallowed it.
+  EXPECT_EQ(stream.avail_in, 1u);
 
   inflateEnd(&stream);
   DestroyBlock(input);
@@ -1526,8 +1527,27 @@ TEST(IGZIPInflateRegressionTest,
     stream.avail_out = static_cast<unsigned int>(output_chunk.size());
 
     int one_byte_ret = inflate(&stream, Z_SYNC_FLUSH);
-    EXPECT_NE(one_byte_ret, Z_DATA_ERROR);
-    EXPECT_LE(stream.avail_in, 1u) << "input_length=" << input_length;
+    // The byte is past the end of the stream, so no call may take it, whether
+    // the stream has already ended or is still handing back buffered output.
+    // ISA-L takes the whole input into its own buffer long before it has
+    // delivered the payload, so unlike zlib it is usually still draining here.
+    EXPECT_EQ(stream.avail_in, 1u) << "input_length=" << input_length;
+    EXPECT_TRUE(one_byte_ret == Z_OK || one_byte_ret == Z_STREAM_END)
+        << "ret=" << one_byte_ret << " input_length=" << input_length;
+
+    // Finish the drain with the byte still on offer: the stream must end, hand
+    // back exactly the payload, and leave the byte where it found it.
+    for (int iter = 0; iter < 4096 && one_byte_ret != Z_STREAM_END; ++iter) {
+      stream.next_out = reinterpret_cast<Bytef*>(output_chunk.data());
+      stream.avail_out = static_cast<unsigned int>(output_chunk.size());
+      one_byte_ret = inflate(&stream, Z_SYNC_FLUSH);
+      ASSERT_TRUE(one_byte_ret == Z_OK || one_byte_ret == Z_STREAM_END)
+          << "ret=" << one_byte_ret << " input_length=" << input_length;
+      ASSERT_EQ(stream.avail_in, 1u) << "input_length=" << input_length;
+    }
+    EXPECT_EQ(one_byte_ret, Z_STREAM_END) << "input_length=" << input_length;
+    EXPECT_EQ(stream.total_out, input_length)
+        << "input_length=" << input_length;
 
     inflateEnd(&stream);
   }
@@ -1567,9 +1587,11 @@ TEST(IGZIPInflateRegressionTest,
   stream.avail_out = static_cast<unsigned int>(output.size());
 
   ret = inflate(&stream, Z_SYNC_FLUSH);
-  const ExecutionPath observed_path = GetInflateExecutionPath(&stream);
-  ASSERT_TRUE(observed_path == IGZIP || observed_path == ZLIB);
-  ASSERT_NE(ret, Z_DATA_ERROR);
+  // Both of these were once permissive -- any path, and any return but
+  // Z_DATA_ERROR -- which let the test pass without IGZIP ever running, and
+  // without the stream having ended where it should.
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  ASSERT_EQ(ret, Z_STREAM_END);
 
   // No output is expected for empty payload. Most importantly, all trailing
   // bytes must remain unconsumed for the caller.
@@ -1578,6 +1600,89 @@ TEST(IGZIPInflateRegressionTest,
       << "compressed_size=" << compressed.size();
 
   inflateEnd(&stream);
+}
+
+// The end of a raw deflate stream almost never lands on a byte boundary, so the
+// decompressor has to stop at the right *bit* and hand the rest of the byte's
+// container back to the caller as a whole byte.  Getting that wrong shows up as
+// an off-by-one in avail_in, which the tests above tolerated: one permitted the
+// ZLIB path, another asserted only that avail_in had not grown.  This pins the
+// byte count exactly, on payloads chosen to leave every possible number of
+// spare bits in the final byte.
+//
+// The spare-bit count is not observable from a finished stream -- zlib drops
+// the remainder of the last byte before it returns Z_STREAM_END -- so the
+// boundary is *constructed* instead.  A static-Huffman block has an exactly
+// predictable bit length: 3 for the block header, 8 bits per literal below 144,
+// 9 bits per literal at or above it, and 7 for end-of-block.  So k literals >=
+// 144 put the stream's last bit at 8 * (m + k) + k + 10, and k = 0..7 walks all
+// eight boundaries.  Z_FIXED asks for the static block, and every byte of the
+// payload is distinct so the encoder finds no match to spend different bits on.
+TEST(IGZIPInflateRegressionTest, RawStreamEndsOnEverySubByteBoundary) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, false, false);
+
+  constexpr size_t kTrailingLen = 8;
+  const char kTrailing[kTrailingLen + 1] = "SENTINEL";
+  constexpr int kLowLiterals = 24;
+
+  for (int k = 0; k < 8; ++k) {
+    const int expected_spare_bits = (8 - (k + 2) % 8) % 8;
+    SCOPED_TRACE("k=" + std::to_string(k) +
+                 " spare_bits=" + std::to_string(expected_spare_bits));
+
+    std::string payload;
+    for (int i = 0; i < k; ++i) {
+      payload.push_back(static_cast<char>(200 + i));
+    }
+    for (int i = 0; i < kLowLiterals; ++i) {
+      payload.push_back(static_cast<char>(1 + i));
+    }
+
+    z_stream cstream;
+    memset(&cstream, 0, sizeof(z_stream));
+    ASSERT_EQ(deflateInit2(&cstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                           Z_FIXED),
+              Z_OK);
+    std::vector<char> compressed_buffer(payload.size() + 64);
+    cstream.next_in = reinterpret_cast<Bytef*>(payload.data());
+    cstream.avail_in = static_cast<unsigned int>(payload.size());
+    cstream.next_out = reinterpret_cast<Bytef*>(compressed_buffer.data());
+    cstream.avail_out = static_cast<unsigned int>(compressed_buffer.size());
+    ASSERT_EQ(deflate(&cstream, Z_FINISH), Z_STREAM_END);
+    const std::string compressed(compressed_buffer.data(), cstream.total_out);
+    ASSERT_EQ(deflateEnd(&cstream), Z_OK);
+
+    // If this fails the encoder did not emit the block this test assumes -- a
+    // stored block, or a match -- and the boundary is not the one named above.
+    const size_t bits = 3 + 8 * kLowLiterals + 9 * k + 7;
+    ASSERT_EQ(compressed.size(), (bits + 7) / 8);
+    ASSERT_EQ(8 * compressed.size() - bits,
+              static_cast<size_t>(expected_spare_bits));
+
+    std::string with_trailing = compressed;
+    with_trailing.append(kTrailing, kTrailingLen);
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(z_stream));
+    ASSERT_EQ(inflateInit2(&stream, -15), Z_OK);
+    std::vector<char> output(payload.size() + 64);
+    stream.next_in = reinterpret_cast<Bytef*>(with_trailing.data());
+    stream.avail_in = static_cast<unsigned int>(with_trailing.size());
+    stream.next_out = reinterpret_cast<Bytef*>(output.data());
+    stream.avail_out = static_cast<unsigned int>(output.size());
+
+    const int ret = inflate(&stream, Z_SYNC_FLUSH);
+    EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+    EXPECT_EQ(ret, Z_STREAM_END);
+    EXPECT_EQ(stream.avail_in, kTrailingLen);
+    EXPECT_EQ(stream.total_out, payload.size());
+    EXPECT_EQ(memcmp(output.data(), payload.data(), payload.size()), 0);
+    if (stream.avail_in == kTrailingLen) {
+      EXPECT_EQ(memcmp(stream.next_in, kTrailing, kTrailingLen), 0);
+    }
+    inflateEnd(&stream);
+  }
 }
 
 TEST(IGZIPInflateRegressionTest, RawStreamEndMustPreserveEightTrailingBytes) {
@@ -1852,6 +1957,545 @@ TEST(IGZIPDeflateRegressionTest,
   EXPECT_EQ(ret, Z_STREAM_END);
 
   deflateEnd(&stream);
+}
+
+// Regression tests for the empty-flush rule on a mid-stream IGZIP deflate.
+//
+// ISA-L emits the sync marker for every SYNC_FLUSH and FULL_FLUSH whether or
+// not one has just been emitted, so something has to refuse a flush that would
+// only repeat the previous one -- otherwise a caller flushing on a timer with
+// no new data grows the stream by marker bytes per tick, and the output stays
+// valid deflate, so nothing downstream notices.  zlib's own rule is rank-based:
+//
+//   avail_in == 0 && flush != Z_FINISH && RANK(flush) <= RANK(last_flush)
+//   RANK(f) = f * 2 - (f > 4 ? 9 : 0)
+//   => Z_NO_FLUSH 0, Z_BLOCK 1, Z_PARTIAL_FLUSH 2, Z_TREES 3,
+//      Z_SYNC_FLUSH 4, Z_FULL_FLUSH 6, Z_FINISH 8
+//
+// The rule this replaced asked instead whether ISA-L was already byte-aligned,
+// which is a different question, and it read the flush value ISA-L had been
+// given -- and igzip.cpp maps Z_SYNC_FLUSH, Z_PARTIAL_FLUSH and Z_BLOCK all
+// onto ISA-L's SYNC_FLUSH.  So it fired on an empty Z_SYNC_FLUSH that outranked
+// a preceding Z_PARTIAL_FLUSH, where zlib does work, and never fired on
+// Z_FULL_FLUSH at all, which is the case that grows the stream.  Each test
+// below names the term of the rule it covers.
+class IGZIPEmptyFlushRegressionTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kInputLength = 8 * 1024;
+
+  void SetUp() override {
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    // SetCompressPath/SetUncompressPath write these two unconditionally, so
+    // they have to be restored as well or this fixture makes the suite
+    // order-dependent.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
+
+    SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+    SetUncompressPath(ZLIB, false, false);
+
+    input_ = GenerateSeededCompressibleBlock(kInputLength, /*seed=*/0x12a1);
+    ASSERT_NE(input_, nullptr);
+    memset(&stream_, 0, sizeof(stream_));
+  }
+
+  void TearDown() override {
+    if (stream_open_) {
+      deflateEnd(&stream_);
+    }
+    DestroyBlock(input_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
+  }
+
+  // Opens a deflate stream and hands the whole payload to one call with
+  // `first_flush`, which becomes the last_flush the empty calls are ranked
+  // against.  Output is accumulated so a test can inflate what the stream
+  // produced.
+  void StartStream(int window_bits, int first_flush) {
+    ASSERT_EQ(deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           window_bits, 8, Z_DEFAULT_STRATEGY),
+              Z_OK);
+    stream_open_ = true;
+    compressed_.assign(kInputLength * 2 + 4096, 0);
+    compressed_used_ = 0;
+
+    stream_.next_in = reinterpret_cast<Bytef*>(input_);
+    stream_.avail_in = static_cast<unsigned int>(kInputLength);
+    stream_.next_out = reinterpret_cast<Bytef*>(compressed_.data());
+    stream_.avail_out = static_cast<unsigned int>(compressed_.size());
+    const int ret = deflate(&stream_, first_flush);
+    ASSERT_TRUE(ret == Z_OK || ret == Z_BUF_ERROR) << "ret=" << ret;
+    ASSERT_EQ(stream_.avail_in, 0u);
+    ASSERT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+    compressed_used_ = compressed_.size() - stream_.avail_out;
+  }
+
+  // One deflate() call carrying no input at all, appending whatever it
+  // produces. Returns the return code; `bytes` receives the byte count.
+  int EmptyFlush(int flush, size_t* bytes) {
+    stream_.next_in = nullptr;
+    stream_.avail_in = 0;
+    stream_.next_out =
+        reinterpret_cast<Bytef*>(compressed_.data()) + compressed_used_;
+    stream_.avail_out =
+        static_cast<unsigned int>(compressed_.size() - compressed_used_);
+    const unsigned int before = stream_.avail_out;
+    const int ret = deflate(&stream_, flush);
+    *bytes = before - stream_.avail_out;
+    compressed_used_ += *bytes;
+    return ret;
+  }
+
+  // Inflates everything the stream has emitted so far and compares it with the
+  // payload.  A refusal must not cost the caller bytes it already handed over,
+  // and a flush that does run must leave the stream decodable at that point.
+  void ExpectPayloadRecoverable(int window_bits) {
+    z_stream inflate_stream;
+    memset(&inflate_stream, 0, sizeof(inflate_stream));
+    ASSERT_EQ(inflateInit2(&inflate_stream, window_bits), Z_OK);
+    std::vector<char> decompressed(kInputLength + 4096, 0);
+    inflate_stream.next_in = reinterpret_cast<Bytef*>(compressed_.data());
+    inflate_stream.avail_in = static_cast<unsigned int>(compressed_used_);
+    inflate_stream.next_out = reinterpret_cast<Bytef*>(decompressed.data());
+    inflate_stream.avail_out = static_cast<unsigned int>(decompressed.size());
+    const int ret = inflate(&inflate_stream, Z_SYNC_FLUSH);
+    EXPECT_TRUE(ret == Z_OK || ret == Z_BUF_ERROR || ret == Z_STREAM_END)
+        << "ret=" << ret;
+    EXPECT_EQ(inflate_stream.total_out, kInputLength);
+    EXPECT_EQ(memcmp(decompressed.data(), input_, kInputLength), 0);
+    inflateEnd(&inflate_stream);
+  }
+
+  z_stream stream_;
+  bool stream_open_ = false;
+  char* input_ = nullptr;
+  std::vector<char> compressed_;
+  size_t compressed_used_ = 0;
+
+ private:
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
+};
+
+// The rank term, in the direction the alignment rule got wrong: an empty flush
+// that outranks its predecessor does work.  Z_PARTIAL_FLUSH (2) outranks
+// Z_NO_FLUSH (0), and Z_SYNC_FLUSH (4) outranks Z_PARTIAL_FLUSH -- and because
+// igzip.cpp maps both onto ISA-L's SYNC_FLUSH, the alignment rule refused the
+// second of these with zero bytes.
+TEST_F(IGZIPEmptyFlushRegressionTest, EmptyFlushThatOutranksPredecessorRuns) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_NO_FLUSH));
+
+  size_t partial_bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_PARTIAL_FLUSH, &partial_bytes), Z_OK);
+  EXPECT_GT(partial_bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  size_t sync_bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_SYNC_FLUSH, &sync_bytes), Z_OK);
+  EXPECT_GT(sync_bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The ranking is not the numeric order of the flush constants.  Z_BLOCK was
+// added after the others and its value, 5, is above Z_FINISH's 4, but it ranks
+// between Z_NO_FLUSH and Z_PARTIAL_FLUSH -- so an empty Z_BLOCK after a
+// Z_SYNC_FLUSH is redundant, while after a Z_NO_FLUSH it does work.  Comparing
+// the constants directly gets both of these backwards.
+TEST_F(IGZIPEmptyFlushRegressionTest, ZBlockRanksBelowSyncFlushNotAboveFinish) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_SYNC_FLUSH));
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_BLOCK, &bytes), Z_BUF_ERROR);
+  EXPECT_EQ(bytes, 0u);
+  ExpectPayloadRecoverable(-15);
+
+  ASSERT_EQ(deflateEnd(&stream_), Z_OK);
+  stream_open_ = false;
+  memset(&stream_, 0, sizeof(stream_));
+
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_NO_FLUSH));
+  EXPECT_EQ(EmptyFlush(Z_BLOCK, &bytes), Z_OK);
+  EXPECT_GT(bytes, 0u);
+  ExpectPayloadRecoverable(-15);
+}
+
+// The same rank term in the refusing direction, on the flush value the
+// alignment rule never tested: a repeated empty Z_FULL_FLUSH must be refused
+// with zero bytes, however many times it is asked for.  Unrefused, each call
+// appended another marker and the stream grew without bound.
+TEST_F(IGZIPEmptyFlushRegressionTest, RepeatedEmptyFullFlushProducesNoBytes) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_FULL_FLUSH));
+  const size_t after_first_flush = compressed_used_;
+
+  for (int iter = 0; iter < 8; ++iter) {
+    size_t bytes = 0;
+    EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_BUF_ERROR) << "iter=" << iter;
+    EXPECT_EQ(bytes, 0u) << "iter=" << iter;
+    EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP) << "iter=" << iter;
+  }
+  EXPECT_EQ(compressed_used_, after_first_flush);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The record-before-deciding term.  zlib stores the flush of every call in
+// last_flush, including one it goes on to refuse, so a refused low-rank flush
+// *lowers* last_flush and a higher-ranked flush after it does work.  Recording
+// only the calls that ran would leave last_flush at Z_FULL_FLUSH here and
+// refuse the Z_SYNC_FLUSH too.
+TEST_F(IGZIPEmptyFlushRegressionTest, RefusedFlushStillLowersTheBar) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_FULL_FLUSH));
+
+  size_t partial_bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_PARTIAL_FLUSH, &partial_bytes), Z_BUF_ERROR);
+  EXPECT_EQ(partial_bytes, 0u);
+
+  size_t sync_bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_SYNC_FLUSH, &sync_bytes), Z_OK);
+  EXPECT_GT(sync_bytes, 0u);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The Z_FINISH exemption: Z_FINISH is never refused as redundant, whatever the
+// previous flush was, because it is how a stream ends.
+TEST_F(IGZIPEmptyFlushRegressionTest, EmptyFinishAfterFullFlushStillEnds) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_FULL_FLUSH));
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_FINISH, &bytes), Z_STREAM_END);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The out-of-output-space term.  A caller draining one flush through a small
+// output buffer repeats the same flush value with no new input, which is
+// exactly the shape the rank rule refuses; zlib serves it anyway because a call
+// that ran out of room puts last_flush back below every flush value.  Refusing
+// it would strand the caller in a Z_BUF_ERROR loop with the flush half written.
+TEST_F(IGZIPEmptyFlushRegressionTest, FlushDrainsThroughASmallOutputBuffer) {
+  for (const unsigned int chunk : {7u, 8u, 16u, 64u}) {
+    z_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                           Z_DEFAULT_STRATEGY),
+              Z_OK)
+        << "chunk=" << chunk;
+
+    std::vector<char> compressed(kInputLength * 2 + 4096, 0);
+    size_t used = 0;
+    stream.next_in = reinterpret_cast<Bytef*>(input_);
+    stream.avail_in = static_cast<unsigned int>(kInputLength);
+
+    int ret = Z_OK;
+    int calls = 0;
+    for (; calls < 100000; ++calls) {
+      if (used + chunk > compressed.size()) {
+        break;
+      }
+      stream.next_out = reinterpret_cast<Bytef*>(compressed.data()) + used;
+      stream.avail_out = chunk;
+      ret = deflate(&stream, Z_SYNC_FLUSH);
+      used += chunk - stream.avail_out;
+      if (ret != Z_OK) {
+        break;
+      }
+      // The flush is drained once a call leaves room unused with no input
+      // left: nothing is pending on either side.
+      if (stream.avail_out != 0 && stream.avail_in == 0) {
+        ++calls;
+        break;
+      }
+      stream.next_in = nullptr;
+      stream.avail_in = 0;
+    }
+    EXPECT_EQ(ret, Z_OK) << "chunk=" << chunk;
+    EXPECT_LT(calls, 100000) << "chunk=" << chunk;
+
+    // Only now is the flush genuinely redundant, and only now may it be
+    // refused.
+    stream.next_in = nullptr;
+    stream.avail_in = 0;
+    stream.next_out = reinterpret_cast<Bytef*>(compressed.data()) + used;
+    stream.avail_out = 64;
+    EXPECT_EQ(deflate(&stream, Z_SYNC_FLUSH), Z_BUF_ERROR) << "chunk=" << chunk;
+    EXPECT_EQ(stream.avail_out, 64u) << "chunk=" << chunk;
+    deflateEnd(&stream);
+
+    z_stream inflate_stream;
+    memset(&inflate_stream, 0, sizeof(inflate_stream));
+    ASSERT_EQ(inflateInit2(&inflate_stream, -15), Z_OK) << "chunk=" << chunk;
+    std::vector<char> decompressed(kInputLength + 4096, 0);
+    inflate_stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+    inflate_stream.avail_in = static_cast<unsigned int>(used);
+    inflate_stream.next_out = reinterpret_cast<Bytef*>(decompressed.data());
+    inflate_stream.avail_out = static_cast<unsigned int>(decompressed.size());
+    inflate(&inflate_stream, Z_SYNC_FLUSH);
+    EXPECT_EQ(inflate_stream.total_out, kInputLength) << "chunk=" << chunk;
+    EXPECT_EQ(memcmp(decompressed.data(), input_, kInputLength), 0)
+        << "chunk=" << chunk;
+    inflateEnd(&inflate_stream);
+  }
+}
+
+// deflateReset must clear the recorded flush, since the restarted stream has
+// emitted nothing that a flush could repeat.  Leaving it set refuses the first
+// flush of every stream after the first.
+TEST_F(IGZIPEmptyFlushRegressionTest, ResetClearsTheRecordedFlush) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_FULL_FLUSH));
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_BUF_ERROR);
+  EXPECT_EQ(bytes, 0u);
+
+  ASSERT_EQ(deflateReset(&stream_), Z_OK);
+  compressed_used_ = 0;
+
+  // The restarted stream has emitted nothing, so this Z_FULL_FLUSH is not the
+  // one that was just refused: it must do work, exactly as it would on a stream
+  // that had only just been opened.  It has to be the *first* call after the
+  // reset -- any input-bearing call in between would record its own flush and
+  // hide a record the reset failed to clear.
+  EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_OK);
+  EXPECT_GT(bytes, 0u);
+
+  stream_.next_in = reinterpret_cast<Bytef*>(input_);
+  stream_.avail_in = static_cast<unsigned int>(kInputLength);
+  stream_.next_out =
+      reinterpret_cast<Bytef*>(compressed_.data()) + compressed_used_;
+  stream_.avail_out =
+      static_cast<unsigned int>(compressed_.size() - compressed_used_);
+  EXPECT_EQ(deflate(&stream_, Z_FINISH), Z_STREAM_END);
+  compressed_used_ = compressed_.size() - stream_.avail_out;
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The "no input" term.  A call that carries input is never refused, however
+// redundant its flush value looks -- it has something to compress.
+TEST_F(IGZIPEmptyFlushRegressionTest, InputBearingRepeatedFlushIsNeverRefused) {
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  std::vector<char> compressed(kInputLength * 2 + 4096, 0);
+  size_t used = 0;
+
+  for (int half = 0; half < 2; ++half) {
+    stream.next_in =
+        reinterpret_cast<Bytef*>(input_) + half * (kInputLength / 2);
+    stream.avail_in = static_cast<unsigned int>(kInputLength / 2);
+    stream.next_out = reinterpret_cast<Bytef*>(compressed.data()) + used;
+    stream.avail_out = static_cast<unsigned int>(compressed.size() - used);
+    const unsigned int before = stream.avail_out;
+    EXPECT_EQ(deflate(&stream, Z_FULL_FLUSH), Z_OK) << "half=" << half;
+    EXPECT_EQ(stream.avail_in, 0u) << "half=" << half;
+    EXPECT_GT(before - stream.avail_out, 0u) << "half=" << half;
+    EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP) << "half=" << half;
+    used += before - stream.avail_out;
+  }
+  deflateEnd(&stream);
+
+  z_stream inflate_stream;
+  memset(&inflate_stream, 0, sizeof(inflate_stream));
+  ASSERT_EQ(inflateInit2(&inflate_stream, -15), Z_OK);
+  std::vector<char> decompressed(kInputLength + 4096, 0);
+  inflate_stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  inflate_stream.avail_in = static_cast<unsigned int>(used);
+  inflate_stream.next_out = reinterpret_cast<Bytef*>(decompressed.data());
+  inflate_stream.avail_out = static_cast<unsigned int>(decompressed.size());
+  inflate(&inflate_stream, Z_SYNC_FLUSH);
+  EXPECT_EQ(inflate_stream.total_out, kInputLength);
+  EXPECT_EQ(memcmp(decompressed.data(), input_, kInputLength), 0);
+  inflateEnd(&inflate_stream);
+}
+
+// An empty flush that is *not* redundant reports Z_OK even when it finds
+// nothing to do.  zlib seeds its last_flush below every flush value, so the
+// opening call on a stream is never the refused one however empty it is; only
+// the call after it can be.
+TEST_F(IGZIPEmptyFlushRegressionTest, EmptyOpeningFlushIsServedNotRefused) {
+  ASSERT_EQ(deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  stream_open_ = true;
+  compressed_.assign(4096, 0);
+  compressed_used_ = 0;
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_NO_FLUSH, &bytes), Z_OK);
+  EXPECT_EQ(bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  EXPECT_EQ(EmptyFlush(Z_NO_FLUSH, &bytes), Z_BUF_ERROR);
+  EXPECT_EQ(bytes, 0u);
+}
+
+// A call with no output space is refused before the flush value is even looked
+// at, which is both what zlib returns and what keeps the flush unrecorded: the
+// caller was denied it, so a later call asking for the same flush still has
+// work to do.  Running ISA-L anyway also consumed input on a call zlib leaves
+// the caller holding.
+TEST_F(IGZIPEmptyFlushRegressionTest, NoOutputSpaceIsRefusedWithoutRecording) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_SYNC_FLUSH));
+  const size_t after_first_flush = compressed_used_;
+
+  // Denied, carrying input: the input must still be the caller's afterwards.
+  stream_.next_in = reinterpret_cast<Bytef*>(input_);
+  stream_.avail_in = static_cast<unsigned int>(kInputLength);
+  stream_.next_out =
+      reinterpret_cast<Bytef*>(compressed_.data()) + compressed_used_;
+  stream_.avail_out = 0;
+  EXPECT_EQ(deflate(&stream_, Z_FULL_FLUSH), Z_BUF_ERROR);
+  EXPECT_EQ(stream_.avail_in, kInputLength);
+  EXPECT_EQ(compressed_used_, after_first_flush);
+
+  // Denied, empty.
+  size_t bytes = 0;
+  stream_.avail_out = 0;
+  stream_.next_in = nullptr;
+  stream_.avail_in = 0;
+  EXPECT_EQ(deflate(&stream_, Z_FULL_FLUSH), Z_BUF_ERROR);
+
+  // The stream's recorded flush is still the Z_SYNC_FLUSH of the opening call,
+  // so an empty Z_PARTIAL_FLUSH is still redundant.  Treating "no room at all"
+  // as "ran out of room part-way" would put the record below every flush value
+  // and serve this.
+  EXPECT_EQ(EmptyFlush(Z_PARTIAL_FLUSH, &bytes), Z_BUF_ERROR);
+  EXPECT_EQ(bytes, 0u);
+
+  // The Z_FULL_FLUSH the two denied calls asked for has not been performed, so
+  // this one is not redundant and must do work.  Recording a denied call's
+  // flush would refuse it.
+  EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_OK);
+  EXPECT_GT(bytes, 0u);
+
+  // And now it is redundant.
+  EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_BUF_ERROR);
+  EXPECT_EQ(bytes, 0u);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The rule is zlib's, not a raw-deflate quirk: the wrapped formats answer the
+// same way.  A zlib or gzip header is emitted by the first call, so it cannot
+// be what makes the second one do work.
+TEST_F(IGZIPEmptyFlushRegressionTest, WrappedFormatsFollowTheSameRule) {
+  for (const int window_bits : {15, 31}) {
+    memset(&stream_, 0, sizeof(stream_));
+    ASSERT_NO_FATAL_FAILURE(StartStream(window_bits, Z_SYNC_FLUSH));
+
+    size_t bytes = 0;
+    EXPECT_EQ(EmptyFlush(Z_SYNC_FLUSH, &bytes), Z_BUF_ERROR)
+        << "window_bits=" << window_bits;
+    EXPECT_EQ(bytes, 0u) << "window_bits=" << window_bits;
+
+    EXPECT_EQ(EmptyFlush(Z_FULL_FLUSH, &bytes), Z_OK)
+        << "window_bits=" << window_bits;
+    EXPECT_GT(bytes, 0u) << "window_bits=" << window_bits;
+
+    ExpectPayloadRecoverable(window_bits);
+
+    ASSERT_EQ(deflateEnd(&stream_), Z_OK) << "window_bits=" << window_bits;
+    stream_open_ = false;
+  }
+}
+
+// zlib checks the flush range before it looks at anything else and rejects an
+// out-of-range value without touching the stream, so an accelerated stream has
+// to come out of such a call exactly as it went in.  Both halves of that were
+// wrong: the value was recorded as the stream's last flush, where it outranks
+// every legal one and refuses the caller's next empty flush, and since no
+// engine accepts it the call landed on the zlib fall-through, which pinned a
+// stream ISA-L was still holding to ZLIB -- so the buffered payload was never
+// emitted and the caller's own Z_FINISH produced a valid, empty stream.
+TEST_F(IGZIPEmptyFlushRegressionTest, InvalidFlushLeavesTheStreamUntouched) {
+  ASSERT_NO_FATAL_FAILURE(StartStream(-15, Z_NO_FLUSH));
+
+  // Z_TREES is one above deflate's Z_BLOCK and a legal flush for inflate, which
+  // makes it the out-of-range value a caller is likeliest to pass by mistake.
+  for (const int flush : {Z_TREES, 99, -1}) {
+    size_t bytes = 0;
+    EXPECT_EQ(EmptyFlush(flush, &bytes), Z_STREAM_ERROR) << "flush=" << flush;
+    EXPECT_EQ(bytes, 0u) << "flush=" << flush;
+    EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP) << "flush=" << flush;
+  }
+
+  // Having no output space does not change the answer, the way it does for a
+  // legal flush: zlib's range check comes first.
+  stream_.next_in = nullptr;
+  stream_.avail_in = 0;
+  stream_.next_out =
+      reinterpret_cast<Bytef*>(compressed_.data()) + compressed_used_;
+  stream_.avail_out = 0;
+  EXPECT_EQ(deflate(&stream_, 99), Z_STREAM_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  // The recorded flush is still the opening Z_NO_FLUSH, so an empty
+  // Z_PARTIAL_FLUSH outranks it and does work -- and that is also the call that
+  // proves the payload is still ISA-L's to emit.
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(Z_PARTIAL_FLUSH, &bytes), Z_OK);
+  EXPECT_GT(bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+
+  ExpectPayloadRecoverable(-15);
+}
+
+// The same value on the first call, where there is no engine holding anything
+// yet: the cost then is the pin itself, which takes the stream off the offload
+// for the rest of its life over a call zlib treats as a no-op.
+TEST_F(IGZIPEmptyFlushRegressionTest,
+       InvalidFlushOnAFreshStreamKeepsItOffloadable) {
+  ASSERT_EQ(deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+  stream_open_ = true;
+  compressed_.assign(kInputLength * 2 + 4096, 0);
+  compressed_used_ = 0;
+
+  size_t bytes = 0;
+  EXPECT_EQ(EmptyFlush(99, &bytes), Z_STREAM_ERROR);
+  EXPECT_EQ(bytes, 0u);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), UNDEFINED);
+
+  stream_.next_in = reinterpret_cast<Bytef*>(input_);
+  stream_.avail_in = static_cast<unsigned int>(kInputLength);
+  stream_.next_out = reinterpret_cast<Bytef*>(compressed_.data());
+  stream_.avail_out = static_cast<unsigned int>(compressed_.size());
+  EXPECT_EQ(deflate(&stream_, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream_), IGZIP);
+  compressed_used_ = compressed_.size() - stream_.avail_out;
+
+  ExpectPayloadRecoverable(-15);
 }
 
 // Regression test for: deflateReset on a reused IGZIP stream must restore the
@@ -3065,6 +3709,162 @@ TEST(IGZIPInflateRegressionTest, ActiveStreamHandlesNullNextInWithZeroAvailIn) {
   const int ret = inflate(&stream, Z_NO_FLUSH);
   EXPECT_TRUE(ret == Z_BUF_ERROR || ret == Z_OK)
       << "expected Z_BUF_ERROR or Z_OK, got " << ret;
+
+  inflateEnd(&stream);
+  DestroyBlock(input);
+}
+
+// zlib documents data_type as being written every time inflate() returns, under
+// every flush value.  An offloaded call cannot compute it -- ISA-L reaches its
+// block-header states inside a single isal_inflate() call and reports no bit
+// position -- so the field is deliberately left as the caller left it rather
+// than guessed at, which the README lists as a known divergence.  Left
+// unasserted, a later change could start writing a plausible-looking but wrong
+// value, which no caller could tell from a right one.  The sentinel is a value
+// zlib would never leave behind: bit 6 and above are the block-boundary flags,
+// and 63 is outside the 0-7 bit position zlib reports.
+TEST(IGZIPInflateRegressionTest, InflateLeavesDataTypeUntouched) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const int kSentinel = 0x5A5A;
+  const size_t input_length = 16 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, 0x1d7a);
+  ASSERT_NE(input, nullptr);
+
+  for (int window_bits : {-15, 15, 31}) {
+    std::string compressed;
+    size_t output_upper_bound;
+    ExecutionPath compress_path = UNDEFINED;
+    ASSERT_EQ(ZlibCompress(input, input_length, &compressed, window_bits,
+                           Z_FINISH, &output_upper_bound, &compress_path),
+              Z_STREAM_END)
+        << "window_bits=" << window_bits;
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(z_stream));
+    ASSERT_EQ(inflateInit2(&stream, window_bits), Z_OK);
+    stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+    stream.avail_in = static_cast<uInt>(compressed.size());
+
+    // Small chunks, so the payload takes several calls and the flush value
+    // varies across them.
+    std::vector<char> chunk(1024);
+    const int flushes[] = {Z_NO_FLUSH, Z_SYNC_FLUSH, Z_PARTIAL_FLUSH, Z_FINISH};
+    int ret = Z_OK;
+    size_t recovered = 0;
+    for (int call = 0; call < 4096 && ret != Z_STREAM_END; ++call) {
+      stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+      stream.avail_out = static_cast<uInt>(chunk.size());
+      stream.data_type = kSentinel;
+      ret = inflate(&stream, flushes[call % 4]);
+      ASSERT_TRUE(ret == Z_OK || ret == Z_STREAM_END || ret == Z_BUF_ERROR)
+          << "window_bits=" << window_bits << " call=" << call
+          << " ret=" << ret;
+      ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP)
+          << "window_bits=" << window_bits;
+      ASSERT_EQ(stream.data_type, kSentinel)
+          << "window_bits=" << window_bits << " call=" << call;
+      const size_t produced = chunk.size() - stream.avail_out;
+      ASSERT_LE(recovered + produced, input_length);
+      EXPECT_EQ(memcmp(chunk.data(), input + recovered, produced), 0)
+          << "window_bits=" << window_bits << " call=" << call;
+      recovered += produced;
+      if (ret == Z_BUF_ERROR) {
+        break;
+      }
+    }
+    EXPECT_EQ(ret, Z_STREAM_END) << "window_bits=" << window_bits;
+    EXPECT_EQ(recovered, input_length) << "window_bits=" << window_bits;
+
+    // The terminal-state gate answers the next call, and leaves the field alone
+    // for the same reason.
+    stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+    stream.avail_out = static_cast<uInt>(chunk.size());
+    stream.data_type = kSentinel;
+    EXPECT_EQ(inflate(&stream, Z_NO_FLUSH), Z_STREAM_END)
+        << "window_bits=" << window_bits;
+    EXPECT_EQ(stream.data_type, kSentinel) << "window_bits=" << window_bits;
+
+    inflateEnd(&stream);
+  }
+
+  DestroyBlock(input);
+}
+
+// A wrong wrapper checksum has to be reported as a data error, and it is the
+// no-input drain call that reports it.  ISA-L pulls bytes into its own state as
+// soon as it needs bits, so a decode that hands its output back in pieces has
+// consumed the whole compressed stream -- trailer included -- several calls
+// before it finishes producing.  The call that finally reaches the checksum
+// therefore arrives with avail_in == 0, and that path used to answer
+// Z_BUF_ERROR whatever went wrong: an invitation to enlarge the buffer and
+// retry a stream that is corrupt.  The zlib format is what reaches it, because
+// its 4-byte trailer fits inside what ISA-L has already read ahead; gzip's
+// 8-byte trailer does not, so that stream fails while input is still with the
+// caller and takes the ordinary dispatch path instead.  (ISA-L does not latch
+// the failure, so what a *repeat* call answers is a separate matter, decided
+// where the sticky error state lives.)
+TEST(IGZIPInflateRegressionTest, WrongChecksumIsADataErrorOnTheDrainCall) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 16 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, 0x3f04);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_GT(compressed.size(), 0u);
+
+  // Only the last trailer byte, so every deflate block stays valid and the
+  // decode runs to completion before anything is wrong.
+  compressed[compressed.size() - 1] =
+      static_cast<char>(compressed[compressed.size() - 1] ^ 0xff);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+  stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  stream.avail_in = static_cast<uInt>(compressed.size());
+
+  // Chunks small enough that the payload cannot be delivered in one call, which
+  // is what puts the checksum check on a call with no input left.
+  std::vector<char> chunk(1024);
+  std::string decompressed;
+  int ret = Z_OK;
+  uInt avail_in_on_failing_call = 1;
+  size_t produced_on_failing_call = 0;
+  for (int call = 0; call < 4096; ++call) {
+    stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+    stream.avail_out = static_cast<uInt>(chunk.size());
+    avail_in_on_failing_call = stream.avail_in;
+    ret = inflate(&stream, Z_SYNC_FLUSH);
+    ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP) << "call=" << call;
+    const size_t produced = chunk.size() - stream.avail_out;
+    decompressed.append(chunk.data(), produced);
+    if (ret != Z_OK) {
+      produced_on_failing_call = produced;
+      break;
+    }
+  }
+
+  EXPECT_EQ(ret, Z_DATA_ERROR);
+  EXPECT_EQ(avail_in_on_failing_call, 0u);
+
+  // The failing call is the one that delivers the tail of the payload -- the
+  // trailer is only checked once the last payload byte is out -- so it has to
+  // account for those bytes as zlib does, whatever it goes on to return.
+  // Reporting the error with next_out, avail_out and total_out untouched tells
+  // the caller the bytes in its buffer do not exist.
+  EXPECT_GT(produced_on_failing_call, 0u);
+  EXPECT_EQ(stream.total_out, input_length);
+  ASSERT_EQ(decompressed.size(), input_length);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_length), 0);
 
   inflateEnd(&stream);
   DestroyBlock(input);
@@ -4362,6 +5162,13 @@ TEST_F(DeflateParamsRegressionTest, MidstreamLevelZeroKeepsStreamIntact) {
   ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
   const size_t produced = output.size() - stream.avail_out;
   EXPECT_EQ(GetDeflateExecutionPath(&stream), IGZIP);
+  // The documented consequence of staying on IGZIP: the level the call asked
+  // for is not honored, so the half that was supposed to be stored is
+  // compressed like the first half.  Stored blocks cannot come out smaller than
+  // the data they store, so a total below the input length proves the request
+  // was not honored -- which is the residual the README describes, asserted
+  // here so a change in it cannot pass unnoticed.
+  EXPECT_LT(produced, input_length);
   deflateEnd(&stream);
 
   char* uncompressed = nullptr;

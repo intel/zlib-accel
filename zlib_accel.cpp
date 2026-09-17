@@ -395,6 +395,11 @@ struct DeflateSettings {
   // afterwards and every later call would be dispatched from scratch. A
   // ZLIB-path stream is left alone, since zlib tracks this itself.
   bool stream_end_reached = false;
+  // The flush value of the last offloaded deflate() call, for the empty-flush
+  // rule in IsRedundantEmptyFlush(). -2 is what zlib's deflateResetKeep() puts
+  // in its own last_flush, and it ranks below every real flush value so the
+  // first call on a stream is never refused.
+  int last_flush = -2;
 };
 
 struct InflateSettings {
@@ -470,6 +475,7 @@ class DeflateStreamSettings {
           source.strategy);
       settings->path = source.path;
       settings->stream_end_reached = source.stream_end_reached;
+      settings->last_flush = source.last_flush;
       map.Set(dest, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR,
@@ -570,6 +576,10 @@ static void ResetDeflateStreamState(
   }
   SetDeflatePath(settings, UNDEFINED);
   settings->stream_end_reached = false;
+  // Both of zlib's reset entry points put last_flush back to -2, so the first
+  // flush on the restarted stream does work whatever the previous one asked
+  // for.
+  settings->last_flush = -2;
 
 #ifdef USE_IGZIP
   if (settings->isal_strm != nullptr) {
@@ -629,6 +639,32 @@ static bool IgzipOwnsDeflateStream(
   return settings != nullptr && settings->path == IGZIP &&
          settings->isal_strm != nullptr;
 }
+
+#ifdef USE_IGZIP
+// zlib refuses a deflate() call that carries no input and asks for a flush no
+// stronger than the previous one: it has nothing to compress and the flush it
+// is being asked for has already been performed, so it reports Z_BUF_ERROR and
+// writes nothing. The ranking is zlib's own (the RANK macro in deflate.c), and
+// it is not the numeric order of the flush constants -- Z_BLOCK and Z_TREES
+// were added later and rank between Z_NO_FLUSH and Z_SYNC_FLUSH:
+//
+//   Z_NO_FLUSH 0, Z_BLOCK 1, Z_PARTIAL_FLUSH 2, Z_TREES 3, Z_SYNC_FLUSH 4,
+//   Z_FULL_FLUSH 6, Z_FINISH 8
+//
+// This is zlib policy rather than a property of any backend, so it lives here.
+// ISA-L has no such rule: it emits the empty stored block that byte-aligns the
+// output for every SYNC_FLUSH and FULL_FLUSH, whether or not one was just
+// emitted, so an application that flushes on a timer with no new data would
+// grow the stream by those marker bytes on every tick. The output stays valid
+// deflate, so nothing downstream reports it.
+//
+// Z_FINISH is exempt: it must always be able to close the stream, however many
+// times it is repeated.
+static bool IsRedundantEmptyFlush(uInt avail_in, int flush, int last_flush) {
+  const auto rank = [](int f) { return f * 2 - (f > 4 ? 9 : 0); };
+  return avail_in == 0 && flush != Z_FINISH && rank(flush) <= rank(last_flush);
+}
+#endif  // USE_IGZIP
 
 // Z_BLOCK and Z_TREES ask inflate() to stop early -- at the next deflate block
 // boundary, and additionally at the end of each block header -- and to report
@@ -829,8 +865,19 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
   // Counted like the fall-through below rather than like an early exit: the
   // call did reach zlib, and its rejection is an error the statistics should
   // show.
+  //
+  // A flush value outside zlib's range is delegated for the same reason, and it
+  // has to be delegated from here, above every path decision. No engine accepts
+  // such a value, so left to the code below it reaches the zlib fall-through --
+  // which pins the stream to ZLIB, abandoning whatever an active ISA-L stream
+  // still holds -- and on the way it is recorded as the stream's last flush,
+  // where it outranks every legal value and suppresses the caller's next empty
+  // flush. zlib rejects it before it touches any state, so the stream stays
+  // exactly as offloadable as it was. The terminal-state gate above tests the
+  // same range because a finished stream never reaches this point.
   if (strm->next_out == nullptr ||
-      (strm->avail_in != 0 && strm->next_in == nullptr)) {
+      (strm->avail_in != 0 && strm->next_in == nullptr) || flush > Z_BLOCK ||
+      flush < 0) {
     if (orig_deflate == nullptr) {
       return Z_VERSION_ERROR;
     }
@@ -870,6 +917,7 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
     uint32_t input_len = strm->avail_in;
     uint32_t output_len = strm->avail_out;
     bool igzip_stream_active = false;
+    bool call_refused = false;
 
 #ifdef USE_IAA
     iaa_available = (flush == Z_FINISH) && configs[USE_IAA_COMPRESS] &&
@@ -939,12 +987,44 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
             deflate_settings->level, deflate_settings->window_bits);
       }
       if (deflate_settings->isal_strm != nullptr) {
-        in_call = true;
-        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                            &input_len, strm->next_out, &output_len,
-                            &strm->total_in, &strm->total_out);
+        if (strm->avail_out == 0) {
+          // zlib refuses a call with nowhere to write before it looks at the
+          // flush value at all, so the flush is not recorded: the caller was
+          // denied it, and a later call asking for the same one still has work
+          // to do. Letting ISA-L run instead would consume input on a call zlib
+          // leaves the caller holding.
+          input_len = 0;
+          output_len = 0;
+          ret = 0;
+          call_refused = true;
+        } else {
+          // zlib records the flush of every call it does look at, including one
+          // it goes on to refuse -- a refused Z_PARTIAL_FLUSH lowers
+          // last_flush, so a following Z_SYNC_FLUSH outranks it and does work.
+          // Record it the same way, before the decision below reads the
+          // previous value.
+          const int previous_flush = deflate_settings->last_flush;
+          deflate_settings->last_flush = flush;
+
+          if (IsRedundantEmptyFlush(strm->avail_in, flush, previous_flush)) {
+            // Answer as zlib does, without letting ISA-L emit another marker. A
+            // flush ISA-L has not finished writing is not refused here: running
+            // out of output space is the only reason it stops mid-flush, and
+            // that already put last_flush at -1 below, which every flush
+            // outranks.
+            input_len = 0;
+            output_len = 0;
+            ret = 0;
+            call_refused = true;
+          } else {
+            in_call = true;
+            ret = CompressIGZIP(deflate_settings->isal_strm, flush,
+                                strm->next_in, &input_len, strm->next_out,
+                                &output_len, &strm->total_in, &strm->total_out);
+            in_call = false;
+          }
+        }
         SetDeflatePath(deflate_settings, IGZIP);
-        in_call = false;
 
         INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
         INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
@@ -987,6 +1067,16 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       strm->avail_out -= output_len;
       strm->total_out += output_len;
       if (path_selected == IGZIP) {
+        if (!call_refused && strm->avail_out == 0) {
+          // zlib's own rule for a call that ran out of output space part-way
+          // through: put last_flush back to -1, which every flush value
+          // outranks, so the caller's retry of the same flush is served instead
+          // of refused. That retry is how an application drains a flush through
+          // a small output buffer, and ISA-L likewise only stops mid-flush for
+          // want of room. A call that had no room to begin with was refused
+          // above and never got as far as recording its flush.
+          deflate_settings->last_flush = -1;
+        }
         const bool no_progress = (input_len == 0 && output_len == 0);
         bool finish_done = false;
 #ifdef USE_IGZIP
@@ -994,12 +1084,23 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
                       IsIGZIPDeflateFinished(deflate_settings->isal_strm);
 #endif
 
-        if (finish_done) {
-          ret = Z_STREAM_END;
-        } else if (!no_progress) {
-          ret = Z_OK;
-        } else {
+        if (call_refused) {
+          // Either there was nowhere to write, or the flush had already been
+          // performed. Those are the only two Z_BUF_ERRORs zlib's own deflate()
+          // reports besides "more input after Z_FINISH", and no-output-space
+          // outranks even a finished stream -- the same order the
+          // terminal-state gate above uses.
           ret = Z_BUF_ERROR;
+        } else if (finish_done) {
+          ret = Z_STREAM_END;
+        } else if (no_progress && strm->avail_in != 0) {
+          // Nothing moved with input still waiting: no room in the output
+          // buffer and none left in ISA-L's own. A call that had no input to
+          // begin with is not this case -- zlib reports Z_OK for one it has not
+          // refused, whether or not it found anything to do.
+          ret = Z_BUF_ERROR;
+        } else {
+          ret = Z_OK;
         }
       } else {
         if (strm->avail_in == 0) {

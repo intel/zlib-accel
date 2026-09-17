@@ -258,20 +258,11 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
       ", avail_out ", isal_strm->avail_out, ", total_out ",
       isal_strm->total_out, ", total_in ", isal_strm->total_in, "\n");
 
-  // ISA-L always emits sync bytes on SYNC_FLUSH regardless of pending data.
-  // When the stream is already byte-aligned (ZSTATE_NEW_HDR) and there is no
-  // new input, no real progress can be made — return 0 progress so the caller
-  // reports Z_BUF_ERROR, matching zlib's semantics for empty flush calls.
-  // ZSTATE_NEW_HDR is the idle/byte-aligned state in ISA-L's internal deflate
-  // state machine; validated against ISA-L v2.32.0 (commit c196241).
-  if (isal_strm->avail_in == 0 && isal_strm->flush == SYNC_FLUSH &&
-      isal_strm->end_of_stream == 0 &&
-      isal_strm->internal_state.state == ZSTATE_NEW_HDR) {
-    *output_length = 0;
-    *input_length = 0;
-    return 0;
-  }
-
+  // ISA-L emits the sync marker for every SYNC_FLUSH and FULL_FLUSH whether or
+  // not one has just been emitted, so a redundant empty flush would grow the
+  // stream. Refusing such a call is zlib policy and belongs with the rest of
+  // it: deflate() decides that through IsRedundantEmptyFlush() and never gets
+  // here.
   int comp = isal_deflate(isal_strm);
 
   *output_length = original_avail_out - isal_strm->avail_out;
@@ -415,13 +406,21 @@ void IGZIPHandleActiveStreamNoInput(z_streamp strm,
                          &output_len, &strm->total_in, &strm->total_out,
                          &end_of_stream);
 
+  // Account for what ISA-L produced before deciding what to report, the way
+  // zlib advances the stream at inf_leave whatever it goes on to return. The
+  // bytes are already in the caller's buffer, and a failure here is the very
+  // call likely to carry them: a wrapper checksum is only checked once the last
+  // payload byte has been handed over, so the call that delivers the tail is
+  // the call that reports the mismatch. Leaving next_out, avail_out and
+  // total_out where they were tells the caller those bytes do not exist.
+  strm->next_out += output_len;
+  strm->avail_out -= output_len;
+  // This is the only site that updates total_out for the avail_in==0 path.
+  // The caller returns immediately after this call, so the main
+  // inflate() update block is never reached — no double-counting.
+  strm->total_out += output_len;
+
   if (*ret == 0) {
-    strm->next_out += output_len;
-    strm->avail_out -= output_len;
-    // This is the only site that updates total_out for the avail_in==0 path.
-    // The caller returns immediately after this call, so the main
-    // inflate() update block is never reached — no double-counting.
-    strm->total_out += output_len;
     if (end_of_stream) {
       *ret = Z_STREAM_END;
     } else if (output_len > 0) {
@@ -432,7 +431,20 @@ void IGZIPHandleActiveStreamNoInput(z_streamp strm,
     return;
   }
 
-  *ret = Z_BUF_ERROR;
+  // UncompressIGZIP() already returns a zlib error code, so keep it: a failure
+  // here is reached with the caller's input buffer empty, but the data behind
+  // it is not.  ISA-L takes bytes into its own state as soon as it needs bits,
+  // so by the time it has decoded everything and turns to the wrapper checksum,
+  // the trailer it is checking has long since left the caller's buffer -- a
+  // zlib stream, whose trailer is 4 bytes, fails on exactly such a call
+  // whenever the output was handed back in pieces.  Reporting Z_BUF_ERROR for
+  // that invites the caller to enlarge its buffer and retry a stream that is
+  // corrupt, and ISA-L does not latch the failure, so the retry reports success
+  // on data it has already refused.
+  Log(LogLevel::LOG_ERROR,
+      "IGZIPHandleActiveStreamNoInput() igzip inflate failed with no input "
+      "available, ret ",
+      *ret, "\n");
 }
 
 IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
