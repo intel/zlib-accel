@@ -736,6 +736,37 @@ static bool IgzipOwnsDeflateStream(
          settings->isal_strm != nullptr;
 }
 
+#ifdef USE_IGZIP
+// Run ISA-L over one deflate call, creating its stream on first use. deflate()
+// reaches ISA-L two ways -- the IGZIP dispatch and the accelerator->IGZIP retry
+// -- and both do exactly this. Returns whether ISA-L ran: when it has no stream
+// there is nothing to report, so `ret` is left as the caller set it and the
+// stream falls through to zlib.
+static bool RunIGZIPDeflate(z_streamp strm,
+                            const std::shared_ptr<DeflateSettings>& settings,
+                            int flush, uint32_t* input_len,
+                            uint32_t* output_len, int* ret) {
+  if (settings->isal_strm == nullptr) {
+    settings->isal_strm =
+        InitCompressIGZIP(settings->level, settings->window_bits);
+  }
+  if (settings->isal_strm == nullptr) {
+    return false;
+  }
+
+  in_call = true;
+  *ret = CompressIGZIP(settings->isal_strm, flush, strm->next_in, input_len,
+                       strm->next_out, output_len, &strm->total_in,
+                       &strm->total_out);
+  SetDeflatePath(settings, IGZIP);
+  in_call = false;
+
+  INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+  INCREMENT_STAT_COND(*ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+  return true;
+}
+#endif  // USE_IGZIP
+
 // Z_BLOCK and Z_TREES ask inflate() to stop early -- at the next deflate block
 // boundary, and additionally at the end of each block header -- and to report
 // the bit position reached in z_stream.data_type. No backend can do either.
@@ -1040,21 +1071,10 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #endif  // USE_QAT
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
-      if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->isal_strm = InitCompressIGZIP(
-            deflate_settings->level, deflate_settings->window_bits);
-      }
-      if (deflate_settings->isal_strm != nullptr) {
-        in_call = true;
-        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                            &input_len, strm->next_out, &output_len,
-                            &strm->total_in, &strm->total_out);
-        SetDeflatePath(deflate_settings, IGZIP);
-        in_call = false;
-
-        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
-      }
+      // A stream ISA-L could not create leaves ret at 1, which is the zlib
+      // fall-through below.
+      RunIGZIPDeflate(strm, deflate_settings, flush, &input_len, &output_len,
+                      &ret);
 #endif
     }
 
@@ -1067,20 +1087,9 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       // Restore them before retrying with IGZIP.
       input_len = strm->avail_in;
       output_len = strm->avail_out;
-      if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->isal_strm = InitCompressIGZIP(
-            deflate_settings->level, deflate_settings->window_bits);
-      }
-      if (deflate_settings->isal_strm != nullptr) {
-        in_call = true;
-        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                            &input_len, strm->next_out, &output_len,
-                            &strm->total_in, &strm->total_out);
-        SetDeflatePath(deflate_settings, IGZIP);
-        in_call = false;
+      if (RunIGZIPDeflate(strm, deflate_settings, flush, &input_len,
+                          &output_len, &ret)) {
         path_selected = IGZIP;  // use IGZIP return-code semantics below
-        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
       }
     }
 #endif  // USE_IGZIP accelerator fallback
