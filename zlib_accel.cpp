@@ -666,6 +666,52 @@ static bool HandleMidStreamIGZIPInflateError(
   *ret = Z_DATA_ERROR;
   return true;
 }
+
+// Run ISA-L over one inflate call and apply the path decision it reports.
+// inflate() reaches ISA-L two ways -- the IGZIP dispatch and the
+// accelerator->IGZIP retry -- and both do exactly this; `source` only names the
+// engine in the log line. Returns false when ISA-L has no stream, which is the
+// caller's cue to answer Z_DATA_ERROR.
+static bool RunIGZIPInflateAndApplyPathAction(
+    z_streamp strm, const std::shared_ptr<InflateSettings>& settings,
+    const char* source, uint32_t* input_len, uint32_t* output_len, int* ret,
+    bool* end_of_stream, bool* midstream_error) {
+  // Log() compiles away without DEBUG_LOG, taking the only use of `source`.
+  (void)source;
+
+  in_call = true;
+  const IGZIPInflatePathAction path_action = IGZIPRunInflateAndSelectPathAction(
+      strm, &settings->isal_strm, settings->window_bits, input_len, output_len,
+      ret, end_of_stream);
+  in_call = false;
+
+  if (settings->isal_strm == nullptr) {
+    return false;
+  }
+
+  if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
+    Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
+        " source=", source, " total_in=", strm->total_in,
+        " total_out=", strm->total_out, " adler=", strm->adler, "\n");
+    *midstream_error = HandleMidStreamIGZIPInflateError(
+        strm, settings, *input_len, *output_len, ret);
+    if (!*midstream_error) {
+      SetInflatePath(settings, ZLIB);
+    }
+  } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
+    *midstream_error = HandleMidStreamIGZIPInflateError(
+        strm, settings, *input_len, *output_len, ret);
+    if (!*midstream_error) {
+      SetInflatePath(settings, ZLIB);
+    }
+  } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
+             settings->path != ZLIB) {
+    SetInflatePath(settings, IGZIP);
+  }
+  INCREMENT_STAT(INFLATE_IGZIP_COUNT);
+  INCREMENT_STAT_COND(*ret != 0, INFLATE_IGZIP_ERROR_COUNT);
+  return true;
+}
 #endif  // USE_IGZIP
 
 // zlib's Z_NO_COMPRESSION (0) asks for stored, uncompressed deflate blocks. No
@@ -1539,38 +1585,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
 #endif  // USE_QAT
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
-      in_call = true;
-      const IGZIPInflatePathAction path_action =
-          IGZIPRunInflateAndSelectPathAction(
-              strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &input_len, &output_len, &ret, &end_of_stream);
-      in_call = false;
-
-      if (inflate_settings->isal_strm == nullptr) {
+      if (!RunIGZIPInflateAndApplyPathAction(
+              strm, inflate_settings, "igzip", &input_len, &output_len, &ret,
+              &end_of_stream, &igzip_midstream_error)) {
         return Z_DATA_ERROR;
       }
-
-      if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
-        Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
-            " source=igzip", " total_in=", strm->total_in,
-            " total_out=", strm->total_out, " adler=", strm->adler, "\n");
-        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
-            strm, inflate_settings, input_len, output_len, &ret);
-        if (!igzip_midstream_error) {
-          SetInflatePath(inflate_settings, ZLIB);
-        }
-      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
-        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
-            strm, inflate_settings, input_len, output_len, &ret);
-        if (!igzip_midstream_error) {
-          SetInflatePath(inflate_settings, ZLIB);
-        }
-      } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
-                 inflate_settings->path != ZLIB) {
-        SetInflatePath(inflate_settings, IGZIP);
-      }
-      INCREMENT_STAT(INFLATE_IGZIP_COUNT);
-      INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
 #endif
     }
 
@@ -1584,39 +1603,14 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
       input_len = strm->avail_in;
       output_len = strm->avail_out;
       end_of_stream = true;
-      in_call = true;
-      const IGZIPInflatePathAction path_action =
-          IGZIPRunInflateAndSelectPathAction(
-              strm, &inflate_settings->isal_strm, inflate_settings->window_bits,
-              &input_len, &output_len, &ret, &end_of_stream);
-      in_call = false;
-
-      if (inflate_settings->isal_strm == nullptr) {
+      if (!RunIGZIPInflateAndApplyPathAction(
+              strm, inflate_settings,
+              (path_selected == QAT) ? "igzip (QAT fallback)"
+                                     : "igzip (IAA fallback)",
+              &input_len, &output_len, &ret, &end_of_stream,
+              &igzip_midstream_error)) {
         return Z_DATA_ERROR;
       }
-
-      if (path_action == IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT) {
-        Log(LogLevel::LOG_ERROR, " strm=", static_cast<void*>(strm),
-            " source=igzip (", (path_selected == QAT) ? "QAT" : "IAA",
-            " fallback)", " total_in=", strm->total_in,
-            " total_out=", strm->total_out, " adler=", strm->adler, "\n");
-        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
-            strm, inflate_settings, input_len, output_len, &ret);
-        if (!igzip_midstream_error) {
-          SetInflatePath(inflate_settings, ZLIB);
-        }
-      } else if (path_action == IGZIP_INFLATE_PATH_FALLBACK_DATA_ERROR) {
-        igzip_midstream_error = HandleMidStreamIGZIPInflateError(
-            strm, inflate_settings, input_len, output_len, &ret);
-        if (!igzip_midstream_error) {
-          SetInflatePath(inflate_settings, ZLIB);
-        }
-      } else if (path_action == IGZIP_INFLATE_PATH_SET_IGZIP &&
-                 inflate_settings->path != ZLIB) {
-        SetInflatePath(inflate_settings, IGZIP);
-      }
-      INCREMENT_STAT(INFLATE_IGZIP_COUNT);
-      INCREMENT_STAT_COND(ret != 0, INFLATE_IGZIP_ERROR_COUNT);
     }
 #endif  // USE_IGZIP accelerator fallback
 
