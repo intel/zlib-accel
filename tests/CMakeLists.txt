@@ -16,9 +16,18 @@ link_libraries(gtest pthread)
 # TODO Remove once crc16 references fixed in QPL
 add_link_options("-Wl,--unresolved-symbols=ignore-all")
 
+# This order is load-bearing. It fixes the order in which the suites register,
+# hence the order they run in, hence where each test sits in the std::rand()
+# sequence the whole binary shares -- and hence which payloads the parameterized
+# cases get and which of them QATzip refuses. Moving a source here can change
+# the refusal baseline without changing a line of test code.
 add_executable(zlib_accel_test
     zlib_accel_test.cpp
     logging_test.cpp
+    inflate_test.cpp
+    deflate_test.cpp
+    gz_test.cpp
+    midstream_test.cpp
     test_utils.cpp
     ../utils.cpp
 )
