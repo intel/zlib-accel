@@ -776,6 +776,68 @@ static bool IsRedundantEmptyFlush(uInt avail_in, int flush, int last_flush) {
   const auto rank = [](int f) { return f * 2 - (f > 4 ? 9 : 0); };
   return avail_in == 0 && flush != Z_FINISH && rank(flush) <= rank(last_flush);
 }
+
+// Run ISA-L over one deflate call, creating its stream on first use, after
+// applying the rules above for a call zlib would refuse outright. deflate()
+// reaches ISA-L two ways -- the IGZIP dispatch and the accelerator->IGZIP retry
+// -- and both need this same sequence. Returns whether ISA-L ran: when it has
+// no stream there is nothing to report, so `ret` is left as the caller set it
+// and the stream falls through to zlib. `call_refused` tells the return-code
+// translation that no engine ran, so the call is one of zlib's own
+// Z_BUF_ERRORs.
+static bool RunIGZIPDeflate(z_streamp strm,
+                            const std::shared_ptr<DeflateSettings>& settings,
+                            int flush, uint32_t* input_len,
+                            uint32_t* output_len, int* ret,
+                            bool* call_refused) {
+  if (settings->isal_strm == nullptr) {
+    settings->isal_strm =
+        InitCompressIGZIP(settings->level, settings->window_bits);
+  }
+  if (settings->isal_strm == nullptr) {
+    return false;
+  }
+
+  if (strm->avail_out == 0) {
+    // zlib refuses a call with nowhere to write before it looks at the flush
+    // value at all, so the flush is not recorded: the caller was denied it, and
+    // a later call asking for the same one still has work to do. Letting ISA-L
+    // run instead would consume input on a call zlib leaves the caller holding.
+    *input_len = 0;
+    *output_len = 0;
+    *ret = 0;
+    *call_refused = true;
+  } else {
+    // zlib records the flush of every call it does look at, including one it
+    // goes on to refuse -- a refused Z_PARTIAL_FLUSH lowers last_flush, so a
+    // following Z_SYNC_FLUSH outranks it and does work. Record it the same way,
+    // before the decision below reads the previous value.
+    const int previous_flush = settings->last_flush;
+    settings->last_flush = flush;
+
+    if (IsRedundantEmptyFlush(strm->avail_in, flush, previous_flush)) {
+      // Answer as zlib does, without letting ISA-L emit another marker. A flush
+      // ISA-L has not finished writing is not refused here: running out of
+      // output space is the only reason it stops mid-flush, and that already
+      // put last_flush at -1, which every flush outranks.
+      *input_len = 0;
+      *output_len = 0;
+      *ret = 0;
+      *call_refused = true;
+    } else {
+      in_call = true;
+      *ret = CompressIGZIP(settings->isal_strm, flush, strm->next_in, input_len,
+                           strm->next_out, output_len, &strm->total_in,
+                           &strm->total_out);
+      in_call = false;
+    }
+  }
+  SetDeflatePath(settings, IGZIP);
+
+  INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
+  INCREMENT_STAT_COND(*ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
+  return true;
+}
 #endif  // USE_IGZIP
 
 // Z_BLOCK and Z_TREES ask inflate() to stop early -- at the next deflate block
@@ -1152,53 +1214,10 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
 #endif  // USE_QAT
     } else if (path_selected == IGZIP) {
 #ifdef USE_IGZIP
-      if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->isal_strm = InitCompressIGZIP(
-            deflate_settings->level, deflate_settings->window_bits);
-      }
-      if (deflate_settings->isal_strm != nullptr) {
-        if (strm->avail_out == 0) {
-          // zlib refuses a call with nowhere to write before it looks at the
-          // flush value at all, so the flush is not recorded: the caller was
-          // denied it, and a later call asking for the same one still has work
-          // to do. Letting ISA-L run instead would consume input on a call zlib
-          // leaves the caller holding.
-          input_len = 0;
-          output_len = 0;
-          ret = 0;
-          call_refused = true;
-        } else {
-          // zlib records the flush of every call it does look at, including one
-          // it goes on to refuse -- a refused Z_PARTIAL_FLUSH lowers
-          // last_flush, so a following Z_SYNC_FLUSH outranks it and does work.
-          // Record it the same way, before the decision below reads the
-          // previous value.
-          const int previous_flush = deflate_settings->last_flush;
-          deflate_settings->last_flush = flush;
-
-          if (IsRedundantEmptyFlush(strm->avail_in, flush, previous_flush)) {
-            // Answer as zlib does, without letting ISA-L emit another marker. A
-            // flush ISA-L has not finished writing is not refused here: running
-            // out of output space is the only reason it stops mid-flush, and
-            // that already put last_flush at -1 below, which every flush
-            // outranks.
-            input_len = 0;
-            output_len = 0;
-            ret = 0;
-            call_refused = true;
-          } else {
-            in_call = true;
-            ret = CompressIGZIP(deflate_settings->isal_strm, flush,
-                                strm->next_in, &input_len, strm->next_out,
-                                &output_len, &strm->total_in, &strm->total_out);
-            in_call = false;
-          }
-        }
-        SetDeflatePath(deflate_settings, IGZIP);
-
-        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
-      }
+      // A stream ISA-L could not create leaves ret at 1, which is the zlib
+      // fall-through below.
+      RunIGZIPDeflate(strm, deflate_settings, flush, &input_len, &output_len,
+                      &ret, &call_refused);
 #endif
     }
 
@@ -1211,20 +1230,9 @@ int ZEXPORT deflate(z_streamp strm, int flush) {
       // Restore them before retrying with IGZIP.
       input_len = strm->avail_in;
       output_len = strm->avail_out;
-      if (deflate_settings->isal_strm == nullptr) {
-        deflate_settings->isal_strm = InitCompressIGZIP(
-            deflate_settings->level, deflate_settings->window_bits);
-      }
-      if (deflate_settings->isal_strm != nullptr) {
-        in_call = true;
-        ret = CompressIGZIP(deflate_settings->isal_strm, flush, strm->next_in,
-                            &input_len, strm->next_out, &output_len,
-                            &strm->total_in, &strm->total_out);
-        SetDeflatePath(deflate_settings, IGZIP);
-        in_call = false;
+      if (RunIGZIPDeflate(strm, deflate_settings, flush, &input_len,
+                          &output_len, &ret, &call_refused)) {
         path_selected = IGZIP;  // use IGZIP return-code semantics below
-        INCREMENT_STAT(DEFLATE_IGZIP_COUNT);
-        INCREMENT_STAT_COND(ret != 0, DEFLATE_IGZIP_ERROR_COUNT);
       }
     }
 #endif  // USE_IGZIP accelerator fallback
