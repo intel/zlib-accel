@@ -10464,6 +10464,562 @@ TEST_F(GzipFileTest, GzreadLatchesBufErrorOnATruncatedMember) {
   DestroyBlock(input);
 }
 
+// deflatePrime() and inflatePrime() write bits into zlib's own bit buffer. No
+// backend has one the shim can reach, so before these two were intercepted the
+// call went straight to zlib and the bits were then dropped by the engine that
+// actually ran the stream: a primed byte that never appeared in deflate output,
+// and a decoder that was asked to start off a byte boundary reporting a clean
+// Z_STREAM_END on bytes zlib refuses. The fix pins a primed stream to zlib and
+// refuses the call outright once an accelerator holds the stream.
+class PrimeRegressionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_use_zlib_uncompress_ = GetConfig(USE_ZLIB_UNCOMPRESS);
+    saved_use_iaa_uncompress_ = GetConfig(USE_IAA_UNCOMPRESS);
+    saved_use_qat_uncompress_ = GetConfig(USE_QAT_UNCOMPRESS);
+    saved_use_igzip_uncompress_ = GetConfig(USE_IGZIP_UNCOMPRESS);
+    saved_use_zlib_compress_ = GetConfig(USE_ZLIB_COMPRESS);
+    saved_use_iaa_compress_ = GetConfig(USE_IAA_COMPRESS);
+    saved_use_qat_compress_ = GetConfig(USE_QAT_COMPRESS);
+    saved_use_igzip_compress_ = GetConfig(USE_IGZIP_COMPRESS);
+    // Written unconditionally by SetCompressPath/SetUncompressPath as well.
+    saved_iaa_prepend_empty_block_ = GetConfig(IAA_PREPEND_EMPTY_BLOCK);
+    saved_qat_allow_chunking_ = GetConfig(QAT_COMPRESSION_ALLOW_CHUNKING);
+    saved_igzip_fallback_ = GetConfig(IGZIP_FALLBACK);
+  }
+
+  // Restored here rather than at the end of each helper: an ASSERT_* failure
+  // returns from the helper, which would skip an inline restore and leave the
+  // rest of the suite running on this test's configuration.
+  void TearDown() override {
+    SetConfig(USE_ZLIB_UNCOMPRESS, saved_use_zlib_uncompress_);
+    SetConfig(USE_IAA_UNCOMPRESS, saved_use_iaa_uncompress_);
+    SetConfig(USE_QAT_UNCOMPRESS, saved_use_qat_uncompress_);
+    SetConfig(USE_IGZIP_UNCOMPRESS, saved_use_igzip_uncompress_);
+    SetConfig(USE_ZLIB_COMPRESS, saved_use_zlib_compress_);
+    SetConfig(USE_IAA_COMPRESS, saved_use_iaa_compress_);
+    SetConfig(USE_QAT_COMPRESS, saved_use_qat_compress_);
+    SetConfig(USE_IGZIP_COMPRESS, saved_use_igzip_compress_);
+    SetConfig(IAA_PREPEND_EMPTY_BLOCK, saved_iaa_prepend_empty_block_);
+    SetConfig(QAT_COMPRESSION_ALLOW_CHUNKING, saved_qat_allow_chunking_);
+    SetConfig(IGZIP_FALLBACK, saved_igzip_fallback_);
+  }
+
+  uint32_t saved_use_zlib_uncompress_ = 0;
+  uint32_t saved_use_iaa_uncompress_ = 0;
+  uint32_t saved_use_qat_uncompress_ = 0;
+  uint32_t saved_use_igzip_uncompress_ = 0;
+  uint32_t saved_use_zlib_compress_ = 0;
+  uint32_t saved_use_iaa_compress_ = 0;
+  uint32_t saved_use_qat_compress_ = 0;
+  uint32_t saved_use_igzip_compress_ = 0;
+  uint32_t saved_iaa_prepend_empty_block_ = 0;
+  uint32_t saved_qat_allow_chunking_ = 0;
+  uint32_t saved_igzip_fallback_ = 0;
+};
+
+// Outside the accelerator guard below: a null stream reaches neither the
+// registry nor an engine, so this covers the wrappers' own ordering in the
+// build CI runs, which has every backend off.
+TEST_F(PrimeRegressionTest, PrimeRejectsANullStream) {
+  EXPECT_EQ(deflatePrime(nullptr, 8, 0xA5), Z_STREAM_ERROR);
+  EXPECT_EQ(inflatePrime(nullptr, 8, 0xA5), Z_STREAM_ERROR);
+}
+
+#if defined(USE_IGZIP) || defined(USE_QAT) || defined(USE_IAA)
+
+namespace {
+
+constexpr size_t kPrimeInputLength = 64 * 1024;
+// An arbitrary byte with bits in both nibbles, so a stream that dropped it
+// cannot coincide with one that kept it.
+constexpr int kPrimedByte = 0xA5;
+
+}  // namespace
+
+// A raw stream, because on the zlib format the two header bytes are written
+// straight to the pending buffer and the primed bits land behind them; with
+// windowBits negative the bit buffer is the first thing flushed, so the primed
+// byte is the stream's first byte and its survival is directly observable.
+static void RunDeflatePrimeKeepsPrimedBits(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c31);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  ASSERT_EQ(deflatePrime(&stream, 8, kPrimedByte), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB)
+      << "a primed stream must be pinned to the only engine whose bit buffer "
+         "the call reached";
+
+  std::vector<Bytef> output(deflateBound(&stream, kPrimeInputLength) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(kPrimeInputLength);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+  ASSERT_GT(stream.total_out, 1u);
+  output.resize(stream.total_out);
+  ASSERT_EQ(deflateEnd(&stream), Z_OK);
+
+  EXPECT_EQ(output[0], kPrimedByte)
+      << "the caller's bits must appear ahead of the deflate stream";
+
+  // What follows the primed byte has to be an intact raw deflate stream, or the
+  // bits were kept at the cost of the payload.
+  z_stream decode;
+  memset(&decode, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&decode, -15), Z_OK);
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  decode.next_in = output.data() + 1;
+  decode.avail_in = static_cast<uInt>(output.size() - 1);
+  decode.next_out = decoded.data();
+  decode.avail_out = static_cast<uInt>(decoded.size());
+  EXPECT_EQ(inflate(&decode, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(decode.total_out, kPrimeInputLength);
+  EXPECT_EQ(memcmp(decoded.data(), input, kPrimeInputLength), 0);
+  ASSERT_EQ(inflateEnd(&decode), Z_OK);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPDeflatePrimeKeepsPrimedBits) {
+  RunDeflatePrimeKeepsPrimedBits(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATDeflatePrimeKeepsPrimedBits) {
+  RunDeflatePrimeKeepsPrimedBits(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAADeflatePrimeKeepsPrimedBits) {
+  RunDeflatePrimeKeepsPrimedBits(IAA);
+}
+#endif
+
+// The pin costs the whole stream its offload, so it must be narrow: a call that
+// primes nothing, and a call zlib rejects without touching its bit buffer, both
+// leave the stream exactly as offloadable as they found it.
+static void RunDeflatePrimeWithoutBitsKeepsOffload(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c32);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  EXPECT_EQ(deflatePrime(&stream, 0, 0), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), UNDEFINED);
+  // zlib's own refusals for a bit count it cannot hold. Neither writes a bit,
+  // so neither is a reason to give up the accelerator.
+  EXPECT_EQ(deflatePrime(&stream, 17, 0), Z_BUF_ERROR);
+  EXPECT_EQ(deflatePrime(&stream, -1, 0), Z_BUF_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), UNDEFINED);
+
+  std::vector<Bytef> output(deflateBound(&stream, kPrimeInputLength) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(kPrimeInputLength);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), accel_path);
+  output.resize(stream.total_out);
+  ASSERT_EQ(deflateEnd(&stream), Z_OK);
+
+  z_stream decode;
+  memset(&decode, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&decode, 15), Z_OK);
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  decode.next_in = output.data();
+  decode.avail_in = static_cast<uInt>(output.size());
+  decode.next_out = decoded.data();
+  decode.avail_out = static_cast<uInt>(decoded.size());
+  EXPECT_EQ(inflate(&decode, Z_FINISH), Z_STREAM_END);
+  EXPECT_EQ(decode.total_out, kPrimeInputLength);
+  EXPECT_EQ(memcmp(decoded.data(), input, kPrimeInputLength), 0);
+  ASSERT_EQ(inflateEnd(&decode), Z_OK);
+
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPDeflatePrimeWithoutBitsKeepsOffload) {
+  RunDeflatePrimeWithoutBitsKeepsOffload(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATDeflatePrimeWithoutBitsKeepsOffload) {
+  RunDeflatePrimeWithoutBitsKeepsOffload(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAADeflatePrimeWithoutBitsKeepsOffload) {
+  RunDeflatePrimeWithoutBitsKeepsOffload(IAA);
+}
+#endif
+
+// Once the accelerator has produced output there is nowhere to put the bits:
+// zlib's deflate state never saw the stream, so it can neither emit them where
+// the caller asked nor continue from where the accelerator left off. zlib
+// itself accepts the call, so the refusal is a deliberate divergence -- a
+// return code the caller can act on, in place of bits that quietly disappear.
+static void RunDeflatePrimeRefusedOnAcceleratedStream(
+    ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/false, false, false);
+  SetUncompressPath(ZLIB, false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c33);
+  ASSERT_NE(input, nullptr);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
+                         Z_DEFAULT_STRATEGY),
+            Z_OK);
+
+  std::vector<Bytef> output(deflateBound(&stream, kPrimeInputLength) + 4096);
+  stream.next_in = reinterpret_cast<Bytef*>(input);
+  stream.avail_in = static_cast<uInt>(kPrimeInputLength);
+  stream.next_out = output.data();
+  stream.avail_out = static_cast<uInt>(output.size());
+  ASSERT_EQ(deflate(&stream, Z_FINISH), Z_STREAM_END);
+  ASSERT_EQ(GetDeflateExecutionPath(&stream), accel_path);
+
+  EXPECT_EQ(deflatePrime(&stream, 8, kPrimedByte), Z_STREAM_ERROR);
+  // The refusal is about bits, not about the call: priming nothing asks for
+  // nothing and is passed through.
+  EXPECT_EQ(deflatePrime(&stream, 0, 0), Z_OK);
+  // A count zlib refuses primes nothing either, so it keeps zlib's own answer
+  // here exactly as it does on a stream no engine has taken yet.
+  EXPECT_EQ(deflatePrime(&stream, 17, 0), Z_BUF_ERROR);
+  EXPECT_EQ(deflatePrime(&stream, -1, 0), Z_BUF_ERROR);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), accel_path)
+      << "a refused prime must not take the stream off its engine either";
+
+  // A reset discards zlib's bit buffer, so there is nothing primed left to
+  // honor and the next stream is offloadable again.
+  ASSERT_EQ(deflateReset(&stream), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), UNDEFINED);
+  EXPECT_EQ(deflatePrime(&stream, 8, kPrimedByte), Z_OK);
+  EXPECT_EQ(GetDeflateExecutionPath(&stream), ZLIB);
+
+  ASSERT_EQ(deflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPDeflatePrimeRefusedOnAcceleratedStream) {
+  RunDeflatePrimeRefusedOnAcceleratedStream(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATDeflatePrimeRefusedOnAcceleratedStream) {
+  RunDeflatePrimeRefusedOnAcceleratedStream(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAADeflatePrimeRefusedOnAcceleratedStream) {
+  RunDeflatePrimeRefusedOnAcceleratedStream(IAA);
+}
+#endif
+
+// The decode side is the one that can report success on data zlib refuses.
+// Priming the first byte and feeding the rest is the standard way to resume a
+// stream that does not start on a byte boundary; an engine that ignores the
+// primed bits sees a stream shifted by one byte, and on a raw stream it happily
+// decodes the shift into junk. Pinned to zlib, the shifted feed decodes to
+// exactly the original payload.
+static void RunInflatePrimeDecodesAShiftedStream(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/true, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c34);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, kPrimeInputLength, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_GT(compressed.size(), 1u);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  ASSERT_EQ(inflatePrime(&stream, 8, static_cast<unsigned char>(compressed[0])),
+            Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[1]);
+  stream.avail_in = static_cast<uInt>(compressed.size() - 1);
+  stream.next_out = decoded.data();
+  stream.avail_out = static_cast<uInt>(decoded.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+  EXPECT_EQ(stream.total_out, kPrimeInputLength);
+  EXPECT_EQ(memcmp(decoded.data(), input, kPrimeInputLength), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPInflatePrimeDecodesAShiftedStream) {
+  RunInflatePrimeDecodesAShiftedStream(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATInflatePrimeDecodesAShiftedStream) {
+  RunInflatePrimeDecodesAShiftedStream(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAAInflatePrimeDecodesAShiftedStream) {
+  RunInflatePrimeDecodesAShiftedStream(IAA);
+}
+#endif
+
+// The decode-side counterpart of RunDeflatePrimeWithoutBitsKeepsOffload. The
+// negative form is included here rather than among the refusals: before the
+// first inflate() call neither zlib nor an engine holds a bit, so discarding
+// what is held changes nothing and must not cost the offload.
+static void RunInflatePrimeWithoutBitsKeepsOffload(ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c35);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, kPrimeInputLength, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  EXPECT_EQ(inflatePrime(&stream, 0, 0), Z_OK);
+  EXPECT_EQ(inflatePrime(&stream, -1, 0), Z_OK);
+  // zlib's own refusal for a bit count it cannot hold.
+  EXPECT_EQ(inflatePrime(&stream, 17, 0), Z_STREAM_ERROR);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), UNDEFINED);
+
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = decoded.data();
+  stream.avail_out = static_cast<uInt>(decoded.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
+  EXPECT_EQ(stream.total_out, kPrimeInputLength);
+  EXPECT_EQ(memcmp(decoded.data(), input, kPrimeInputLength), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPInflatePrimeWithoutBitsKeepsOffload) {
+  RunInflatePrimeWithoutBitsKeepsOffload(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATInflatePrimeWithoutBitsKeepsOffload) {
+  RunInflatePrimeWithoutBitsKeepsOffload(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAAInflatePrimeWithoutBitsKeepsOffload) {
+  RunInflatePrimeWithoutBitsKeepsOffload(IAA);
+}
+#endif
+
+// Same refusal as the deflate side, for the same reason: the engine holds the
+// bits the call would have to modify, and zlib's inflate state never saw the
+// stream. Both the priming and the discarding form are refused; a reset returns
+// the stream to path selection with nothing primed on either side.
+static void RunInflatePrimeRefusedOnAcceleratedStream(
+    ExecutionPath accel_path) {
+  SetCompressPath(accel_path, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(accel_path, /*zlib_fallback=*/false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c36);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, kPrimeInputLength, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size());
+  stream.next_out = decoded.data();
+  stream.avail_out = static_cast<uInt>(decoded.size());
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_STREAM_END);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), accel_path);
+
+  EXPECT_EQ(inflatePrime(&stream, 8, kPrimedByte), Z_STREAM_ERROR);
+  EXPECT_EQ(inflatePrime(&stream, -1, 0), Z_STREAM_ERROR);
+  EXPECT_EQ(inflatePrime(&stream, 0, 0), Z_OK);
+  // zlib refuses an over-16 count with the same code, so this row is here to
+  // record that the answer does not depend on which side produced it.
+  EXPECT_EQ(inflatePrime(&stream, 17, 0), Z_STREAM_ERROR);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), accel_path);
+
+  ASSERT_EQ(inflateReset(&stream), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), UNDEFINED);
+  EXPECT_EQ(inflatePrime(&stream, 8, kPrimedByte), Z_OK);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), ZLIB);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+
+#ifdef USE_IGZIP
+TEST_F(PrimeRegressionTest, IGZIPInflatePrimeRefusedOnAcceleratedStream) {
+  RunInflatePrimeRefusedOnAcceleratedStream(IGZIP);
+}
+#endif
+
+#ifdef USE_QAT
+TEST_F(PrimeRegressionTest, QATInflatePrimeRefusedOnAcceleratedStream) {
+  RunInflatePrimeRefusedOnAcceleratedStream(QAT);
+}
+#endif
+
+#ifdef USE_IAA
+TEST_F(PrimeRegressionTest, IAAInflatePrimeRefusedOnAcceleratedStream) {
+  RunInflatePrimeRefusedOnAcceleratedStream(IAA);
+}
+#endif
+
+#ifdef USE_IGZIP
+// IGZIP is the only backend that holds a stream part-way through, so it is the
+// only one where the refusal covers a stream that is neither finished nor
+// restartable. QAT and IAA never reach this state: a decode that does not end
+// in one call falls back to zlib and the stream is on the zlib path from there.
+TEST_F(PrimeRegressionTest, IGZIPInflatePrimeRefusedMidStream) {
+  SetCompressPath(IGZIP, /*zlib_fallback=*/true, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  char* input = GenerateSeededCompressibleBlock(kPrimeInputLength,
+                                                /*seed=*/0x9c37);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, kPrimeInputLength, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+
+  // Half the input, so the stream is mid-block when the prime arrives.
+  std::vector<Bytef> decoded(kPrimeInputLength + 1024);
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]);
+  stream.avail_in = static_cast<uInt>(compressed.size() / 2);
+  stream.next_out = decoded.data();
+  stream.avail_out = static_cast<uInt>(decoded.size());
+  ASSERT_EQ(inflate(&stream, Z_NO_FLUSH), Z_OK);
+  ASSERT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  ASSERT_GT(stream.total_in, 0u);
+
+  EXPECT_EQ(inflatePrime(&stream, 8, kPrimedByte), Z_STREAM_ERROR);
+
+  // The refusal leaves the stream running: the rest of the input still decodes
+  // on IGZIP to the original payload.
+  stream.next_in = reinterpret_cast<Bytef*>(&compressed[0]) + stream.total_in;
+  stream.avail_in = static_cast<uInt>(compressed.size() - stream.total_in);
+  int ret = Z_OK;
+  for (int guard = 0; guard < 128; guard++) {
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT_NE(ret, Z_DATA_ERROR);
+    if (ret == Z_STREAM_END) {
+      break;
+    }
+  }
+  EXPECT_EQ(ret, Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&stream), IGZIP);
+  EXPECT_EQ(stream.total_out, kPrimeInputLength);
+  EXPECT_EQ(memcmp(decoded.data(), input, kPrimeInputLength), 0);
+
+  ASSERT_EQ(inflateEnd(&stream), Z_OK);
+  DestroyBlock(input);
+}
+#endif  // USE_IGZIP
+#endif  // USE_IGZIP || USE_QAT || USE_IAA
+
 class ShardedMapTest : public ::testing::Test {};
 
 TEST_F(ShardedMapTest, BasicSetAndGet) {
