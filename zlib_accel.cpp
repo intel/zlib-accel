@@ -1672,6 +1672,19 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     if (ret == Z_STREAM_END) {
       inflate_settings->stream_end_reached = true;
     }
+    // A decode error reported with no input left is latched like one reported
+    // on a call that carried input: ISA-L keeps no BAD state, so an unlatched
+    // failure lets the next call decode on from what it just refused. That
+    // matters more here than on the input-bearing path, because the next call
+    // reaches this same site and reports the completion the checksum denied,
+    // which records the terminal state above and leaves the stream answering
+    // Z_STREAM_END for the rest of its life. Reaching this site at all takes a
+    // previous call that consumed input, so the failure is mid-stream by
+    // construction and the stream can no longer be handed to zlib.
+    if (ret == Z_DATA_ERROR) {
+      inflate_settings->bytes_consumed = true;
+      inflate_settings->data_error = true;
+    }
     return ret;
   }
 #endif

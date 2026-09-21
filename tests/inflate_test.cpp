@@ -1080,6 +1080,60 @@ TEST(IGZIPInflateRegressionTest, WrongChecksumIsADataErrorOnTheDrainCall) {
   DestroyBlock(input);
 }
 
+// The same failure, called again. ISA-L holds no equivalent of zlib's BAD
+// state, and on this path the repeat call reaches the drain site and reports
+// the completion the checksum denied -- so without a latch the stream answers
+// Z_STREAM_END, records its terminal state and answers Z_STREAM_END forever.
+TEST(IGZIPInflateRegressionTest, DrainCallDataErrorStaysADataError) {
+  SetCompressPath(ZLIB, false, false, false);
+  SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
+
+  const size_t input_length = 16 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, 0x3f04);
+  ASSERT_NE(input, nullptr);
+
+  std::string compressed;
+  size_t output_upper_bound;
+  ExecutionPath compress_path = UNDEFINED;
+  ASSERT_EQ(ZlibCompress(input, input_length, &compressed, 15, Z_FINISH,
+                         &output_upper_bound, &compress_path),
+            Z_STREAM_END);
+  ASSERT_GT(compressed.size(), 0u);
+  compressed[compressed.size() - 1] =
+      static_cast<char>(compressed[compressed.size() - 1] ^ 0xff);
+
+  z_stream stream;
+  memset(&stream, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&stream, 15), Z_OK);
+  stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+  stream.avail_in = static_cast<uInt>(compressed.size());
+
+  std::vector<char> chunk(1024);
+  int ret = Z_OK;
+  for (int call = 0; call < 4096; ++call) {
+    stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+    stream.avail_out = static_cast<uInt>(chunk.size());
+    ret = inflate(&stream, Z_SYNC_FLUSH);
+    if (ret != Z_OK) {
+      break;
+    }
+  }
+  ASSERT_EQ(ret, Z_DATA_ERROR);
+  ASSERT_EQ(stream.avail_in, 0u);
+
+  const uLong total_out_at_failure = stream.total_out;
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+    stream.avail_out = static_cast<uInt>(chunk.size());
+    EXPECT_EQ(inflate(&stream, Z_SYNC_FLUSH), Z_DATA_ERROR)
+        << "repeat=" << repeat;
+    EXPECT_EQ(stream.total_out, total_out_at_failure) << "repeat=" << repeat;
+  }
+
+  inflateEnd(&stream);
+  DestroyBlock(input);
+}
+
 #ifdef USE_IAA
 // IAA->IGZIP fallback tests.
 // On machines without IAA hardware, CompressIAA/UncompressIAA return non-zero,
