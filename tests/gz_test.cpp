@@ -7,8 +7,10 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2718,4 +2720,109 @@ TEST_F(GzipFileTest, GzopenRejectsANullPath) {
   EXPECT_FALSE(std::cout.bad());
 
   SetConfig(LOG_LEVEL, saved_log_level);
+}
+
+// A write(2) the tests below control, for the two returns a real file will not
+// produce on demand: a short write and a write that accepts nothing. A pipe
+// cannot stand in for either -- a blocking one transfers the whole count
+// however small it is, and a non-blocking one answers EAGAIN instead of a
+// partial count -- so write itself is replaced. A definition here interposes
+// for libzlib-accel.so because the executable is searched ahead of the
+// libraries it loads, and it needs explicit default visibility to be exported
+// at all, since the whole build is compiled -fvisibility=hidden.
+//
+// This sees every write in the process, gtest's own output included, so
+// anything but a registered descriptor is passed straight through. The
+// pass-through is the raw syscall rather than a dlsym of the real write, to
+// keep it off the loader's path.
+namespace {
+std::atomic<int> g_write_limit_fd{-1};
+std::atomic<size_t> g_write_limit_chunk{0};
+std::atomic<bool> g_write_limit_once{false};
+std::atomic<int> g_write_limit_hits{0};
+}  // namespace
+
+#pragma GCC visibility push(default)
+extern "C" ssize_t write(int fd, const void* buf, size_t count) {
+  if (fd >= 0 && fd == g_write_limit_fd.load()) {
+    g_write_limit_hits.fetch_add(1);
+    if (g_write_limit_once.load()) {
+      g_write_limit_fd.store(-1);
+    }
+    const size_t chunk = g_write_limit_chunk.load();
+    if (chunk == 0) {
+      // Accepts nothing and sets no errno of its own, which is the case the
+      // caller has to fill in for itself.
+      return 0;
+    }
+    if (chunk < count) {
+      count = chunk;
+    }
+  }
+  return syscall(SYS_write, fd, buf, count);
+}
+#pragma GCC visibility pop
+
+// Registers a descriptor with the interposer above and unregisters it on the
+// way out, including on the early return an ASSERT_* performs: a registration
+// left behind would truncate every later write in the process.
+class ScopedWriteLimit {
+ public:
+  ScopedWriteLimit(int fd, size_t chunk, bool once) {
+    g_write_limit_chunk.store(chunk);
+    g_write_limit_once.store(once);
+    g_write_limit_hits.store(0);
+    g_write_limit_fd.store(fd);
+  }
+  ~ScopedWriteLimit() { g_write_limit_fd.store(-1); }
+  ScopedWriteLimit(const ScopedWriteLimit&) = delete;
+  ScopedWriteLimit& operator=(const ScopedWriteLimit&) = delete;
+
+  // How many writes the limit applied to, so a test can show it was not
+  // vacuous.
+  int hits() const { return g_write_limit_hits.load(); }
+};
+
+// CompressAndWrite has to send the rest of the buffer from where the last write
+// stopped. Rewriting from the start of io_buf would re-emit the bytes already
+// accepted and drop the tail, leaving a file that is still valid gzip and
+// decompresses to something else.
+TEST_F(GzipFileTest, ShortWritesStillProduceTheWholeFile) {
+  EnableShimOwnedGzWrites();
+  SetUncompressPath(ZLIB, false, false);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x5be1);
+  ASSERT_NE(input, nullptr);
+
+  int hits = 0;
+  {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    ASSERT_NE(fd, -1);
+    // Small enough that every flush takes many writes.
+    ScopedWriteLimit limit(fd, /*chunk=*/1024, /*once=*/false);
+    gzFile fp = gzdopen(fd, "wb");
+    ASSERT_NE(fp, nullptr);
+    EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+    EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+              static_cast<int>(input_length));
+    EXPECT_EQ(gzclose_w(fp), Z_OK);
+    hits = limit.hits();
+  }
+  // A full-sized write would have taken a handful; each of those became 1 KiB
+  // pieces.
+  EXPECT_GT(hits, 10);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+
+  DestroyBlock(uncompressed);
+  DestroyBlock(input);
 }
