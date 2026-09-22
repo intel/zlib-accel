@@ -1,18 +1,19 @@
 # zlib-accel: Transparent Compression/Decompression Acceleration for Zlib
 
-zlib-accel is a software shim that intercepts zlib calls and offloads compression/decompression jobs to hardware accelerators (where feasible and beneficial for performance).
-The shim allows applications to leverage hardware accelerators transparently without code changes. The only requirement is to preload the shim's shared library (e.g., using LD_PRELOAD).
+zlib-accel is a software shim that intercepts zlib calls and offloads compression/decompression jobs to a hardware accelerator or to a SIMD software encoder, where the request is one the backend can take.
+The shim allows applications to use those backends without code changes: preload the shim's shared library (e.g., using LD_PRELOAD), and enable a backend in the configuration file. Applications that depend on one of the zlib behaviors listed below may additionally need to disable offload for the streams concerned.
 
-Two accelerators are supported
-- Intel® QuickAssist Technology (QAT)
-- Intel® In-Memory Analytics Accelerator (IAA)
+Three backends are supported
+- Intel® QuickAssist Technology (QAT), a hardware accelerator
+- Intel® In-Memory Analytics Accelerator (IAA), a hardware accelerator
+- IGZIP, the SIMD deflate implementation in [Intel® ISA-L](https://github.com/intel/isa-l). Software only, so it requires no accelerator hardware.
 
 
 ## Scope/Constraints
 
 This shim is not a general-purpose replacement for zlib, and it is able to offload compression/decompression jobs in certain conditions. Therefore, not all applications can take advantage of the transparent offload, depending on how they use zlib. It is important to test thoroughly with your specific application and configuration. The use cases we have tested so far are listed in a section below.
 
-In general, the shim is able to offload zlib calls that complete compression/decompression of one deflate stream in one call. "Streaming" compression/decompression (where compression/decompression is done incrementally) are not currently supported. If the shim is not able to offload a job to an accelerator, it will fall back to zlib, ensuring the application still works correctly.
+In general, the shim is able to offload zlib calls that complete compression/decompression of one deflate stream in one call. "Streaming" compression/decompression (where compression/decompression is done incrementally) is offloadable to IGZIP only; the two hardware accelerators do not support it. A job the shim cannot offload is run by zlib instead, so for most applications the observable behavior is zlib's own. It is not a blanket guarantee: an offloaded stream diverges from zlib in the specific ways listed under Hardware Acceleration and Intercepted Zlib Functions below, and each of those says what an application that depends on the zlib behavior should do.
 
 The shim has only been tested on Linux. When building with hardware acceleration enabled (`USE_QAT`, `USE_IAA`, or `USE_IGZIP`), the [Intel® oneTBB](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onetbb.html) performance library is required and can be acquired by installing the [Intel® oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit-download.html).
 
@@ -39,18 +40,19 @@ IAA
 
 IGZIP
 - ISA-L software SIMD deflate; no hardware accelerator required. Unlike QAT and IAA, it supports genuine streaming (stateful) compression and decompression, so it is also usable as a fallback for the two hardware backends (see the igzip_fallback option).
+- One constraint shapes several of the divergences below, and is referred to as the mid-stream constraint: once ISA-L has started a stream it holds unflushed state for it, and that state can be neither handed to zlib nor duplicated without corrupting the output. A stream that has started on IGZIP therefore stays on IGZIP until it ends, whatever a later call asks for.
 - Compression:
-  - `Z_BLOCK` is not offloadable. It ends a deflate block without byte-aligning the output and without emitting the `00 00 FF FF` sync marker, which ISA-L cannot express — its only two flushing modes, `SYNC_FLUSH` and `FULL_FLUSH`, both always byte-align and always emit the marker. A stream that uses `Z_BLOCK` is therefore handled by zlib. The one exception is a stream that has already started on IGZIP under a different flush value and then switches to `Z_BLOCK` mid-stream: ISA-L holds unflushed stream state at that point and the stream cannot be moved to zlib without corrupting the output, so `Z_BLOCK` is treated as `Z_SYNC_FLUSH` (byte-aligned, with the extra sync marker). The result is still valid deflate that any decompressor accepts; only an application parsing block boundaries itself can observe the difference.
+  - `Z_BLOCK` is not offloadable. It ends a deflate block without byte-aligning the output and without emitting the `00 00 FF FF` sync marker, which ISA-L cannot express — its only two flushing modes, `SYNC_FLUSH` and `FULL_FLUSH`, byte-align and emit the marker. A stream that uses `Z_BLOCK` is therefore handled by zlib. The one exception is a stream already running on IGZIP under a different flush value that then switches to `Z_BLOCK` mid-stream: the mid-stream constraint applies, so `Z_BLOCK` is treated as `Z_SYNC_FLUSH` (byte-aligned, with the extra sync marker). The result is still valid deflate; only an application parsing block boundaries itself can observe the difference.
   - `Z_PARTIAL_FLUSH` is treated as `Z_SYNC_FLUSH`, which zlib permits.
-  - `deflateCopy` returns `Z_STREAM_ERROR` for a stream that is mid-stream on IGZIP — one that has called `deflate` but has not yet reached `Z_STREAM_END` — leaving both streams untouched. ISA-L has emitted a header and still holds unflushed stream state, and that state cannot be duplicated: its level buffer holds pointers into its own allocation, so a copy of it would share the source's pending output. Flushing that pending output first is not an alternative either, since those bytes belong to the prefix the two streams share and `deflateCopy` has no way to return bytes to the caller. A stream that has not yet called `deflate`, and a finished one (ISA-L has delivered all its output, so there is nothing left to duplicate and the copy inherits the terminal state), both copy normally — so copying to size the output, or to compress the same input under different settings, still works. Branching a common prefix into several alternative tails requires copying after the prefix has been fed, so it needs a source that is not on IGZIP: such a stream is handled by zlib or by QAT/IAA (which offload `Z_FINISH` only, so a mid-stream call has already pinned it to zlib) and copies without restriction. `inflateCopy` is unrestricted on every path, at any point in a stream.
+  - `deflateCopy` returns `Z_STREAM_ERROR` for a stream that is mid-stream on IGZIP — one that has called `deflate` but has not yet reached `Z_STREAM_END` — leaving both streams untouched. ISA-L's level buffer holds pointers into its own allocation, so a copy would share the source's pending output, and flushing that output first is not an alternative because those bytes belong to the prefix the two streams share. A stream that has not yet called `deflate`, and a finished one, both copy normally, so copying to size the output or to compress the same input under different settings still works. Branching a common prefix into several alternative tails needs a source that is not on IGZIP: such a stream is handled by zlib or by QAT/IAA and copies without restriction. `inflateCopy` is unrestricted on every path, at any point in a stream.
 
 All backends
 - The `strategy` argument of `deflateInit2`/`deflateParams` is not honored by any backend (QAT, IAA, or IGZIP). Compressed output remains valid and round-trips correctly — zlib defines strategy as affecting "the compression ratio but not the correctness of the compressed output" — but the ratio tuning requested by `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`, or `Z_FILTERED` is silently ignored. Applications that depend on a specific strategy for output size or entropy characteristics should disable offload for those streams.
-- `Z_NO_COMPRESSION` (level 0) streams are always handled by zlib. Level 0 requests stored, uncompressed deflate blocks, which none of the backends can produce — ISA-L's own level 0 is still LZ77+Huffman compression, and QAT and IAA take no compression level at all — so such streams are routed to zlib rather than being silently compressed. A level change made *after* initialization via `deflateParams` is observed as well, so a stream initialized at level 1-9 and later set to level 0 is routed to zlib from that point on. There are two exceptions:
-  - A stream that has already started on IGZIP stays on IGZIP for the rest of that stream, and a level change made while it is running — including a drop to level 0 — is not honored. ISA-L has already emitted a header and compressed data and still holds unflushed stream state at that point, so the stream cannot be moved to zlib without corrupting the output — the same constraint that makes `Z_BLOCK` alias to `Z_SYNC_FLUSH` mid-stream. The output remains valid deflate that round-trips correctly; where the application asked for stored blocks it is compressed instead. `deflateReset` ends the stream, and the next stream on the same `z_stream` does use the new level.
+- `Z_NO_COMPRESSION` (level 0) streams are handled by zlib, with the two exceptions below. Level 0 requests stored, uncompressed deflate blocks, which none of the backends can produce — ISA-L's own level 0 is still LZ77+Huffman compression, and QAT and IAA take no compression level at all — so such streams are routed to zlib rather than being silently compressed. A level change made *after* initialization via `deflateParams` is observed as well, so a stream initialized at level 1-9 and later set to level 0 is routed to zlib from that point on.
+  - A level change made while a stream is running on IGZIP — including a drop to level 0 — is not honored, by the mid-stream constraint. The output remains valid deflate that round-trips correctly; where the application asked for stored blocks it is compressed instead. `deflateReset` ends the stream, and the next stream on the same `z_stream` does use the new level.
   - `gzsetparams` is intercepted, and needs no such exception: the `gz*` write path compresses each buffered chunk as a complete gzip member, so the data buffered under the old level is written out as its own member before the new level is recorded, and a change to level 0 routes the rest of the file to zlib. The level given in the `gzopen`/`gzdopen` mode string is observed the same way, including `"wb0"`, which routes the whole file to zlib.
-- A compression level of 1-9 is a ratio hint, and only zlib and IGZIP act on it. QAT compresses at the level given by the `qat_compression_level` config option, whatever level the stream asked for, and IAA takes no compression level at all — so on those two paths every level in 1-9 produces the same output. IGZIP does act on it, but maps the range onto ISA-L's three levels (1-2, then 3-6 and `Z_DEFAULT_COMPRESSION`, then 7-9), so neighbouring zlib levels can coincide there as well. Compressed output remains valid and round-trips correctly; only the ratio differs from the one requested, as with `strategy` above. This holds wherever the level comes from — `deflateInit2`, `deflateParams`, the `gzopen`/`gzdopen` mode string, or `gzsetparams` — because it is the backend that has no level to set, not the entry point that failed to record one. Applications that depend on a specific level for output size should disable offload for those streams. Level 0 is a different case, since it changes the format rather than the ratio: it is routed to zlib and honored, as described in the bullet above.
-- `inflate()` with `flush` set to `Z_BLOCK` or `Z_TREES` is not offloadable, and such streams are handled by zlib. zlib defines both as requesting an early return at a deflate block (or, for `Z_TREES`, block-header) boundary, and documents `z_stream.data_type` as reporting the bit position reached. None of the three backends can do either — QAT and IAA decompress whole streams in one submission with no notion of a block boundary, and ISA-L transits its `ISAL_BLOCK_NEW_HDR`/`ISAL_BLOCK_HDR` states inside a single `isal_inflate` call with no way to stop there — so the stream is routed to zlib, which honors both the early return and `data_type`. The routing decision is per stream, not per call: once a stream uses either flush value it stays on zlib, because the bit accounting such a caller performs spans the whole stream. The one exception is a stream already being decompressed by IGZIP that switches to `Z_BLOCK`/`Z_TREES` mid-stream: ISA-L holds unflushed stream state at that point and the stream cannot be moved to zlib without corrupting the output, so those calls behave as `Z_NO_FLUSH` (decompression continues past the boundary). Output is byte-exact either way; only the return timing differs.
+- A compression level of 1-9 is a ratio hint, and only zlib and IGZIP act on it. QAT compresses at the level given by the `qat_compression_level` config option, whatever level the stream asked for, and IAA takes no compression level at all — so on those two paths every level in 1-9 produces the same output. IGZIP does act on it, but maps the range onto ISA-L's three levels (1-2, then 3-6 and `Z_DEFAULT_COMPRESSION`, then 7-9), so neighbouring zlib levels can coincide there as well. Only the ratio differs from the one requested; the output is valid and round-trips correctly, as with `strategy` above. This holds wherever the level comes from — `deflateInit2`, `deflateParams`, the `gzopen`/`gzdopen` mode string, or `gzsetparams` — because it is the backend that has no level to set, not the entry point that failed to record one. Applications that depend on a specific level for output size should disable offload for those streams. Level 0 is the different case covered by the bullet above, since it changes the format rather than the ratio.
+- `inflate()` with `flush` set to `Z_BLOCK` or `Z_TREES` is not offloadable, and such streams are handled by zlib. zlib defines both as requesting an early return at a deflate block (or, for `Z_TREES`, block-header) boundary, and documents `z_stream.data_type` as reporting the bit position reached. None of the three backends can do either — QAT and IAA decompress whole streams in one submission with no notion of a block boundary, and ISA-L transits its `ISAL_BLOCK_NEW_HDR`/`ISAL_BLOCK_HDR` states inside a single `isal_inflate` call with no way to stop there — so the stream is routed to zlib, which honors both the early return and `data_type`. The routing decision is per stream, not per call: once a stream uses either flush value it stays on zlib, because the bit accounting such a caller performs spans the whole stream. The one exception is a stream already being decompressed by IGZIP that switches to `Z_BLOCK`/`Z_TREES` mid-stream: by the mid-stream constraint those calls behave as `Z_NO_FLUSH` (decompression continues past the boundary). Output is byte-exact either way; only the return timing differs.
 - `z_stream.adler` is not updated on any offloaded call, on either side. zlib keeps the running checksum of the uncompressed data there — Adler-32 for the zlib format, CRC-32 for gzip — and an application may read it after a stream completes instead of computing its own. No backend reports a running checksum through this field, so it keeps whatever value zlib's own initialization left in it: 1 for a zlib-format stream and 0 for a gzip one, whatever the data was. The checksum in the stream itself is still written, and still verified on decompression — a wrong one is reported as a data error — so this affects only an application that reads the field. Such applications should compute the checksum themselves with `adler32`/`crc32`, or disable offload for those streams. Raw deflate streams are unaffected: they carry no checksum, and zlib does not maintain the field for them either.
 - `z_stream.data_type` is not updated on an offloaded `inflate()` call under any other flush value. zlib documents it as being set "every time inflate() returns for all flush options", so an application reading it after an offloaded call sees whatever value it already held. No backend exposes the bit-level accounting needed to compute the field faithfully — QAT and IAA expose no bit position at all — and a partially-correct `data_type` would be indistinguishable from a correct one to the caller, so the field is left unwritten rather than guessed. Decompressed output is unaffected. Applications that track bit positions themselves should either use `Z_BLOCK`/`Z_TREES`, which routes them to zlib as described above, or disable offload for those streams.
 
@@ -73,22 +75,22 @@ cmake <options> ..
 make
 ```
 
-CMake supports the following options:
-- USE_QAT (ON/OFF): include QAT acceleration
-- USE_IAA (ON/OFF): include IAA acceleration
-- USE_IGZIP (ON/OFF): include IGZIP acceleration (requires ISA-L v2.32.1 or above; the build fails at configure time on an older one)
+CMake supports the following options. A backend has to be enabled at build time *and* at run time, so building with `USE_IGZIP=ON` is not on its own enough to get IGZIP — see the configuration section.
+- USE_QAT (ON/OFF, default OFF): include QAT acceleration
+- USE_IAA (ON/OFF, default OFF): include IAA acceleration
+- USE_IGZIP (ON/OFF, default OFF): include IGZIP acceleration (requires ISA-L v2.32.1 or above; the build fails at configure time on an older one)
 - QPL_PATH: path to QPL for IAA acceleration (if not in a standard directory)
 - QATZIP_PATH: path to QATzip for QAT acceleration (if not in a standard directory)
 - ISAL_PATH: path to ISA-L for IGZIP acceleration (if not in a standard directory). May be either an ISA-L build tree or an install prefix.
-- DEBUG_LOG (ON/OFF): enable logging
-- ENABLE_STATISTICS (ON/OFF): enable statistics
-- COVERAGE (ON/OFF): enable test coverage (more details in a later section)
+- DEBUG_LOG (ON/OFF, default ON): enable logging
+- ENABLE_STATISTICS (ON/OFF, default OFF): enable statistics
+- COVERAGE (ON/OFF, default OFF): enable test coverage (more details in a later section)
 - CMAKE_BUILD_TYPE (Debug/Release...)
 
 For a release build, the following options are recommended: 
 
 ```
--DDEBUG_LOG=OFF -DCOVERAGE=OFF -CMAKE_BUILD_TYPE=Release
+-DDEBUG_LOG=OFF -DCOVERAGE=OFF -DCMAKE_BUILD_TYPE=Release
 ```
 
 Requirements for QAT
@@ -132,7 +134,7 @@ make
 make run
 ```
 
-The CMake options are the same as for the shared library build.
+The CMake options are the same as for the shared library build, except for ENABLE_STATISTICS, which is declared by the library build only. The tests must be configured with the same USE_QAT/USE_IAA/USE_IGZIP values as the library they link against.
 
 
 ### Collect Test Coverage
@@ -157,7 +159,7 @@ make
 make run
 ```
 
-The CMake options are the same as for the shared library build. Clang is required.
+The CMake options are the same as for the shared library build, except for ENABLE_STATISTICS, which is declared by the library build only. Clang is required.
 For libFuzzer command-line options, refer to the [documentation](https://llvm.org/docs/LibFuzzer.html).
 
 
@@ -183,11 +185,11 @@ use_qat_uncompress
 - Enable QAT for decompression
 
 use_iaa_compress
-- Values: 0,1. Default: 1
+- Values: 0,1. Default: 0
 - Enable IAA for compression
 
 use_iaa_uncompress
-- Values: 0,1.Default: 1
+- Values: 0,1. Default: 0
 - Enable IAA for decompression
 
 use_zlib_compress
@@ -200,9 +202,19 @@ use_zlib_uncompress
 - Enable zlib for decompression
 - Setting to 1 is recommended, to allow fall back to zlib in case accelerators cannot be used or experience an error.
 
+use_igzip_compress
+- Values: 0,1. Default: 0
+- Enable IGZIP for compression
+
+use_igzip_uncompress
+- Values: 0,1. Default: 0
+- Enable IGZIP for decompression
+- IGZIP requires no accelerator hardware, but it is not used unless one of these two options is set, even in a build configured with USE_IGZIP=ON.
+
 igzip_fallback
 - Values: 0,1. Default: 1
-- If 1, and an IAA or QAT compression/decompression operation fails, the request is retried using IGZIP (if enabled) before falling back to software zlib. Useful on machines where hardware accelerators are intermittently unavailable.
+- If 1, and an IAA or QAT operation fails inside deflate() or inflate(), the request is retried using IGZIP, if IGZIP is enabled for that direction, before falling back to software zlib. Useful on machines where hardware accelerators are intermittently unavailable.
+- This option does not apply to compress2()/uncompress2(), which fall back directly to zlib.
 
 iaa_compress_percentage
 - Values: 0-100. Default: 50
@@ -210,14 +222,13 @@ iaa_compress_percentage
 
 iaa_prepend_empty_block
 - Values: 0,1. Default: 0
-- **Deprecated.** This option is retained for backward compatibility and will be removed in a future release. Setting it to 1 has no effect on decompression.
-- Background: the original design prepended a 5-byte empty stored-block marker to IAA-compressed output so the decompressor could identify IAA-produced data (which uses a 4kB history window). This approach was abandoned because QPL hardware always consumes all `available_in` bytes regardless of where the stream boundary falls, making marker-based detection unreliable when the caller does not supply the exact compressed size. IAA decompression eligibility is now determined by a 512-byte minimum input length threshold: callers such as Java's `ZipInputStream` feed chunks of ≤512 bytes when the compressed size is unknown, while Lucene stored-field reads always supply the exact size (>512 bytes).
+- **Deprecated.** This option is retained for backward compatibility and will be removed in a future release. If 1, an empty stored block is prepended to IAA-compressed output; nothing reads it back, so it has no effect on decompression. IAA decompression eligibility is decided by a minimum input length instead — see the comment in `iaa.cpp` for why the marker scheme was replaced.
 
 iaa_uncompress_percentage
 - Values: 0-100. Default: 50
 - If both IAA and QAT are enabled, percentage of decompression calls to offload to IAA.
 
-qat_periodical_polling = 0
+qat_periodical_polling
 - Values: 0,1. Default: 0
 - If 1, use QAT periodical polling. If 0, use QAT busy polling.
 
@@ -239,10 +250,9 @@ log_level
 - Values: 0,1,2,3. Default: 1
 - This option applies only if the shim is built with DEBUG_LOG=ON.
 - Matches QATzip's verbosity convention: 0 = silent, 1 = errors only, 2 = info and errors, 3 = debug, info, and errors (most verbose).
-- Migration note: the numeric meanings changed from earlier versions. Older configurations that used `log_level=2` for error-only output must now use `log_level=1`. Review existing `log_level` settings when upgrading.
 
 log_stats_samples
-- Values: 0-INT_MAX. Default 1000
+- Values: 0-UINT32_MAX. Default 1000
 - This option applies only if the shim is built with ENABLE_STATISTICS=ON.
 - Append statistics to log every N samples (this option specifies N). A sample is one deflate() or inflate() call.
 - If set to 0, statistics are not appended to the log.
@@ -255,7 +265,7 @@ log_file
 map_shards
 - Values: 2-65536. Default 64
 - Sets the number of shards in the thread-safe concurrent hash map. Each shard holds an independent map instance.
-- It must be a power of two, so Fibonacci hashing can be used to calculate uniformly distributed shard indexes.
+- It must be a power of two.
 
 ## Tested Applications/Use Cases
 
@@ -299,7 +309,7 @@ deflatePrime/inflatePrime write bits into zlib's own bit buffer, which no backen
 Once an engine holds the stream — output already produced, or input already consumed — a call zlib would have accepted is refused with `Z_STREAM_ERROR`, the same decision `deflateSetDictionary` makes mid-stream. zlib's own deflate/inflate state never saw the stream, so the bits can be neither emitted where the caller asked for them nor recovered later, and moving the rest of the stream to zlib would restart it mid-output. On the decompression side `inflatePrime` with a negative bit count is refused for the same reason: it asks zlib to discard bits an engine is holding where zlib-accel cannot reach them, so honoring it would report success having done nothing. zlib itself accepts a prime at these points, so this is a deliberate divergence — a refusal the caller can act on, in place of bits that quietly disappear. `deflateReset`/`inflateReset` discard zlib's bit buffer and lift both the pin and the refusal, so the next stream on the same `z_stream` is offloaded again. Applications that resume a stream mid-byte this way, as `deflatePrime` after a reset is normally used to do, get zlib for that stream and full speed on the rest.   
 deflateCopy/inflateCopy are intercepted so that the copy gets its own per-stream state: zlib duplicates the stream it owns, but zlib-accel keys its own state on the `z_stream` pointer, so without this the copy would be unknown to the shim and silently run on zlib. The copy inherits the settings and execution path of the source, and for inflate it also gets an independent copy of the IGZIP decompression state, so either stream can be used, reset, or ended without affecting the other. `inflateCopy` is supported on every path; `deflateCopy` has one restriction, described under IGZIP above.
 
-A zlib entry point that does not appear in the lists in this section is **not** intercepted: it runs zlib's own code against zlib's own state for the stream. On an offloaded stream that state was initialized and then never advanced — no input was ever handed to it — so what such a call reports describes an empty stream rather than the one the application has been using. The calls do no harm; they answer from nothing. Nothing below affects compressed or decompressed output.
+The deflate/inflate entry points below are **not** intercepted: each runs zlib's own code against zlib's own state for the stream. On an offloaded stream that state was initialized and then never advanced — no input was ever handed to it — so what such a call reports describes an empty stream rather than the one the application has been using. The calls do no harm; they answer from nothing. None of them affects compressed or decompressed output.
 
 | Not intercepted | Consequence on an offloaded stream |
 |---|---|
@@ -309,34 +319,33 @@ A zlib entry point that does not appear in the lists in this section is **not** 
 | `inflateMark`, `inflateCodesUsed` | Report bit position and code count from zlib's inflate state. No backend exposes either — the same reason `data_type` is left alone — so the values describe nothing. |
 | `deflatePending` | Reports the bytes and bits zlib has generated but not yet handed back, which for an offloaded stream is 0 whatever the backend is holding. There is no faithful number to report instead: a backend delivers everything it produces straight into the caller's output buffer, and what it holds back is *input* it has not compressed yet, which is not what the count means. Deliberately left as is. |
 | `inflateValidate` | `inflateValidate(strm, 0)` asks zlib to stop verifying the wrapper checksum. No backend can be told to stop — ISA-L commits to checking when the stream is initialized — so a stream whose checksum is wrong is still reported as a data error, where zlib would have returned `Z_STREAM_END`, and the last of its output is not delivered. An application that decodes data with a knowingly wrong or absent checksum should disable offload for those streams. Deliberately deferred: matching zlib would mean recording the request and pinning the stream to zlib, the treatment `inflateSetDictionary` gets. |
-| `deflateBound`, `compressBound` | Answer from zlib's own formula for zlib's own settings. A backend's output for a single `Z_FINISH` call has been measured to fit within the bound, including on incompressible input, but neither ISA-L nor the hardware backends guarantee it, so an application should keep honoring `deflate`'s return code rather than assuming one bound-sized buffer must always be enough. |
+| `deflateBound`, `compressBound` | Answer from zlib's own formula for zlib's own settings. Neither ISA-L nor the hardware backends guarantee their output fits within it, so an application should keep honoring `deflate`'s return code rather than assuming one bound-sized buffer must always be enough. |
 
 utility functions
-- compress, uncompress
-- compress, uncompress2
+- compress, compress2, uncompress, uncompress2
 
 gzip file functions
-- gzopen, gzdopen, gzclose, gzclose_r, gzclose_w, gzeof
+- gzopen, gzopen64, gzdopen, gzclose, gzclose_r, gzclose_w, gzeof
 - gzwrite, gzputc, gzputs, gzfwrite, gzprintf, gzvprintf, gzflush, gzsetparams
 - gzread, gzgetc, gzgetc_, gzgets, gzfread, gzungetc
+- gztell, gztell64, gzoffset, gzoffset64, gzseek, gzseek64, gzrewind, gzerror, gzclearerr, gzbuffer, gzdirect
 
 zlib's `gz*` API is a streaming one: zlib keeps a single deflate or inflate stream per file, plus its own buffer, across every call the application makes. zlib-accel does not stream it. On the write side it buffers what the application writes and compresses each buffer into a *complete gzip member*, so a large file becomes a sequence of members where zlib produces one. That is valid gzip and decompresses normally with any tool; what it costs is compression ratio, since no match reaches across a member boundary. On the read side a member has to decompress within one internal buffer, or the rest of the file is decompressed by zlib.
 
-Every function that moves bytes is therefore intercepted and served from zlib-accel's own buffer. A call that reached zlib instead would act on zlib's stream for that file, which has never seen any of the file's data and whose position bears no relation to the file offset zlib-accel has reached — on the write side it would interleave a second member with the ones zlib-accel wrote, and on the read side it would return bytes decoded from the middle of a compressed member. `gzputc`, `gzputs`, `gzfwrite` and `gzprintf`/`gzvprintf` therefore write through the same path as `gzwrite`, and `gzgetc`, `gzgetc_`, `gzgets` and `gzfread` read through the same path as `gzread`. `gzprintf`/`gzvprintf` format the string themselves rather than handing the file to zlib to format it, which would leave the rest of the file unaccelerated. Formatting it here also removes zlib's length limit, which is a deliberate divergence: zlib formats into its own buffer, and a result that does not fit is not written at all — the call returns 0, having silently discarded the output. zlib-accel writes the whole string whatever its length. The bound is a property of zlib's buffer rather than of the format request, and it is adjustable through `gzbuffer`, which zlib-accel does not intercept, so an application that relies on the limit as a limit should not use gz offload.
+Every function that moves bytes is therefore intercepted and served from zlib-accel's own buffer. A call that reached zlib instead would act on zlib's stream for that file, which has never seen any of the file's data and whose position bears no relation to the file offset zlib-accel has reached — on the write side it would interleave a second member with the ones zlib-accel wrote, and on the read side it would return bytes decoded from the middle of a compressed member. `gzputc`, `gzputs`, `gzfwrite` and `gzprintf`/`gzvprintf` therefore write through the same path as `gzwrite`, and `gzgetc`, `gzgetc_`, `gzgets` and `gzfread` read through the same path as `gzread`. `gzprintf`/`gzvprintf` format the string themselves rather than handing the file to zlib to format it, which would leave the rest of the file unaccelerated. Formatting it here also removes zlib's length limit, which is a deliberate divergence: zlib formats into its own buffer, and a result that does not fit is not written at all — the call returns 0, having silently discarded the output. zlib-accel writes the whole string whatever its length. The bound is a property of zlib's buffer rather than of the format request, and it is adjustable through `gzbuffer`, whose size zlib-accel accepts without applying it (see below), so an application that relies on the limit as a limit should not use gz offload.
 
 `gzflush` writes the buffered data out as a complete member, which is what makes it visible to a reader, and satisfies every flush value zlib accepts; it is deliberately not forwarded to zlib, whose own flush would write a gzip header for a stream holding none of this file's data. `gzungetc` pushes bytes back onto the file without a limit, which `gzread` returns ahead of anything else — most recently pushed first — and it clears the end-of-file indicator, so `gzeof` reports false again until a later read comes up short, as it does with zlib. zlib bounds its push-back by the room in its own output buffer, and guarantees at least a full buffer's worth immediately after the file is opened; accepting every push satisfies that guarantee without depending on a buffer size zlib-accel does not share. `gzclose_r` and `gzclose_w` reach the same close path as `gzclose`, which writes out whatever is still buffered, and reject a file opened for the other direction exactly as zlib does; a close that reached zlib instead would report success while discarding the buffered tail of the file. The compression level in the `gzopen`/`gzdopen` mode string and in `gzsetparams` is recorded and reaches path selection and the compressor, which is as far as any level gets here: level 0 routes the file to zlib and is honored, and a level of 1-9 is acted on only where the backend has a level to set (see the level notes under All backends above).
 
 A `gzFile` zlib-accel has no entry for — one the application did not open through `gzopen`/`gzdopen`, including the `NULL` a failed open returns — is forwarded to zlib unchanged, as is a file already on the zlib path.
 
-The rest of zlib's `gz*` API is **not** intercepted. Those functions act on zlib's own state for the file, which does not reflect what zlib-accel has read or written:
+The position and error functions are intercepted for the same reason: they report on work zlib's state for the file never saw. `gztell` and `gzoffset` answer from the offsets zlib-accel has actually reached, `gzseek` and `gzrewind` act on the descriptor zlib-accel is using — a backward seek on a reader starts the file over and re-reads, as it does in zlib, since neither keeps an index of the compressed stream — and `gzerror`/`gzclearerr` report and clear zlib-accel's own error latch, which latches and refuses later calls the way zlib's does. `gzopen64` is `gzopen`, so an application built with `-D_FILE_OFFSET_BITS=64`, for which zlib.h renames `gzopen` to `gzopen64`, is accelerated like any other. `gzseek`, `gztell` and `gzoffset` are their `*64` counterparts with the result narrowed, and an offset that does not survive the narrowing is refused rather than truncated, exactly as zlib refuses it.
 
-| Not intercepted | Consequence on a file zlib-accel owns |
+Two of them answer differently from zlib's version:
+
+| Intercepted, with a difference | Behavior on a file zlib-accel owns |
 |---|---|
-| `gztell`, `gzoffset`, `gzseek`, `gzrewind` | The offsets reported come from zlib's own accounting, which has tracked none of the file's data, so they are wrong. `gzseek` and `gzrewind` additionally move the file descriptor zlib-accel is reading from or writing to, so the calls that follow act at the wrong offset. Reading or writing a file from start to finish is unaffected; an application that seeks within a `gzFile` should disable gz offload. |
-| `gzbuffer` | Sets the size of zlib's own buffers. zlib-accel uses its own, so the request has no effect while the file is accelerated. It is also what bounds zlib's `gzprintf` output and `gzungetc` push-back, neither of which is bounded here — see above. |
-| `gzerror`, `gzclearerr` | Report zlib's error state for the file, which stays clear even when an accelerated call has failed. The return values of the intercepted calls are the reliable signal. One consequence: zlib latches a failure and refuses every later call on the file, whereas an accelerated file has no such error state, so a call that follows a failed one is attempted. |
-| `gzdirect` | Answers from zlib's view of the file. On a read-mode file zlib inspects the header by reading the descriptor itself, and those bytes are then missing from what zlib-accel reads. |
-| `gzopen64`, `gzseek64`, `gztell64`, `gzoffset64` | Not exported, so they are handled by zlib alone. Note that zlib.h redirects `gzopen` to `gzopen64` for an application built with `-D_FILE_OFFSET_BITS=64`: such a file is handled by zlib end to end — correct, but not accelerated. |
+| `gzbuffer` | The requested size is validated as zlib validates it — refused after the first read or write, and for a size that cannot be doubled — and then not applied, since zlib-accel's buffers are a fixed size. This is a performance difference rather than a correctness one, and it is why the `gzprintf` length limit and the `gzungetc` push-back bound described above do not apply here. |
+| `gzdirect` | On a read-mode file the answer comes from zlib-accel's own look at the first bytes rather than zlib's, and the call performs that look if it was deferred to the first read, which is when zlib's `gzdirect` looks as well. A write-mode file is answered by zlib, which holds the only state the call reads. |
 
 
 ## Other Notes
