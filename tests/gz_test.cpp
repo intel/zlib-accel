@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -2689,4 +2690,32 @@ TEST_F(GzipFileTest, GzreadLatchesBufErrorOnATruncatedMember) {
   EXPECT_EQ(gzclose(fp), Z_OK);
   remove(filename);
   DestroyBlock(input);
+}
+
+// zlib's gz_open returns NULL for a null path before it looks at the mode
+// (gzlib.c), so the shim has to check it in the same place: it opens the file
+// itself, and the mode-rejection branch ahead of that open logs the path.
+// Streaming a null const char* into an ostream sets badbit rather than crashing
+// on this library, and the log stream is std::cout unless a log file is
+// configured, so one such call silences every later log in the process and
+// takes the application's own stdout with it. A null mode is deliberately not
+// checked, because zlib does not check it either.
+TEST_F(GzipFileTest, GzopenRejectsANullPath) {
+  // The log the bad mode reaches is LOG_INFO, so it has to be enabled for this
+  // to be more than an assertion about the return value.
+  const uint32_t saved_log_level = GetConfig(LOG_LEVEL);
+  SetConfig(LOG_LEVEL, 2);
+
+  EXPECT_EQ(gzopen(nullptr, "rb"), nullptr);
+  EXPECT_EQ(gzopen(nullptr, "wb"), nullptr);
+  // A mode naming no direction, which is the branch that logs the path.
+  EXPECT_EQ(gzopen(nullptr, "q"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "rb"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "wb"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "q"), nullptr);
+
+  // Nothing above wrote to the log stream, so it is still usable.
+  EXPECT_FALSE(std::cout.bad());
+
+  SetConfig(LOG_LEVEL, saved_log_level);
 }

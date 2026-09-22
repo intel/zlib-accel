@@ -3071,6 +3071,17 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   if (orig_gzdopen == nullptr) {
     return nullptr;
   }
+  // zlib's gz_open checks the path first and returns NULL for a null one
+  // (gzlib.c), ahead of interpreting the mode, so this has to as well. Reaching
+  // open(2) with a null path answers EFAULT, which arrives at the same return
+  // by accident, but the mode-rejection branch below streams the path into a
+  // log on the way -- setting badbit on the log stream, which silences every
+  // later log in the process. A null mode is deliberately not checked, because
+  // zlib does not check it either: its own walk over the mode string
+  // dereferences it.
+  if (path == nullptr) {
+    return nullptr;
+  }
   GzOpenParams params;
   int oflag = GetOpenFlags(mode, &params);
   // A mode string zlib rejects has to be rejected before open(2), not after:
@@ -3098,7 +3109,7 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   auto gz = gzip_files.Set(file, fd, params);
   if (gz != nullptr) {
     try {
-      gz->file_name = path != nullptr ? path : "";
+      gz->file_name = path;
     } catch (...) {
       // Only the text of a later gzerror message is lost.
     }
