@@ -50,6 +50,7 @@
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <climits>
 #include <cstdarg>
 #include <cstdint>
@@ -3423,6 +3424,14 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
     Log(LogLevel::LOG_INFO, "CompressAndWrite Line ", __LINE__, ", file ",
         static_cast<void*>(file), ", written to file ", write_ret, "\n");
     if (write_ret <= 0) {
+      // Every caller of this failure reports it as Z_ERRNO and latches
+      // strerror(errno), so there has to be an errno to read. A negative return
+      // has set one; a zero return has not, and would leave whatever the last
+      // unrelated syscall put there -- including success. EIO is the closest
+      // thing to what happened: the descriptor accepted none of the bytes.
+      if (write_ret == 0) {
+        errno = EIO;
+      }
       return 1;
     }
     written += static_cast<uint32_t>(write_ret);

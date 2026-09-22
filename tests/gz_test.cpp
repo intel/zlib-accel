@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2825,4 +2826,47 @@ TEST_F(GzipFileTest, ShortWritesStillProduceTheWholeFile) {
 
   DestroyBlock(uncompressed);
   DestroyBlock(input);
+}
+
+// A write that accepts nothing is not an error by itself, so it leaves errno
+// alone -- whatever an unrelated syscall put there last, including a success.
+// The failure is still reported as Z_ERRNO and latched with strerror(errno), so
+// the shim has to supply an errno of its own or the file ends up holding a
+// message that describes no failure.
+TEST_F(GzipFileTest, GzwriteReportsAWriteThatAcceptedNothing) {
+  EnableShimOwnedGzWrites();
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x2c73);
+  ASSERT_NE(input, nullptr);
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  int ret = 0;
+  {
+    // One shot only. zlib's own gz_comp treats a zero return as no progress and
+    // retries it forever, and the close below reaches that loop.
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    errno = 0;
+    ret = gzwrite(fp, input, static_cast<unsigned>(input_length));
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  // Nothing reached the file, and the reason is one an application can read.
+  EXPECT_EQ(ret, 0);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(EIO)), std::string::npos);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
 }
