@@ -22,6 +22,10 @@ using namespace config;
 #include "../igzip.h"
 #endif
 
+#ifdef USE_QAT
+#include "../qat.h"
+#endif
+
 #ifdef USE_IGZIP
 
 TEST(IGZIPInflateRegressionTest, EmptyInputContinuationKeepsIGZIPPath) {
@@ -2171,6 +2175,48 @@ static bool IAAHardwareDecompressWorks() {
   return ret == 0 && end_of_stream && output_len == input_length;
 }
 
+#ifdef USE_QAT
+// Same probe, for the USE_QAT block in RememberedRejectionWithNoFallbackDoes
+// NotRefuse below: SupportedOptionsQAT() is a software eligibility check with
+// no view of whether a device is present, so on a host where QAT is compiled
+// in but no accelerator works, that block would still select QAT and then
+// have no fallback to catch the failure.
+//
+// The payload has to be past the size where QATzip's decompressor refuses a
+// short zlib-produced stream on its own, independently of whether the device
+// works -- the same refusal the QAT refusal-set notes elsewhere in this repo
+// document -- or the probe reports "no device" on every host, including this
+// one. A short probe is what IAAHardwareDecompressWorks() above uses, but it
+// does not carry over: this is a different accelerator's decompressor with a
+// different floor, not a smaller version of the same check.
+static bool QATHardwareUncompressWorks() {
+  const size_t input_length = 64 * 1024;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x9a7);
+  if (input == nullptr) {
+    return false;
+  }
+  SetCompressPath(ZLIB, /*zlib_fallback=*/true, false, false);
+  std::string compressed;
+  size_t output_upper_bound = 0;
+  ExecutionPath compress_path = UNDEFINED;
+  int ret = ZlibCompress(input, input_length, &compressed, -15, Z_FINISH,
+                         &output_upper_bound, &compress_path);
+  DestroyBlock(input);
+  if (ret != Z_STREAM_END) {
+    return false;
+  }
+
+  std::vector<uint8_t> output(input_length + 1024);
+  uint32_t input_len = static_cast<uint32_t>(compressed.size());
+  uint32_t output_len = static_cast<uint32_t>(output.size());
+  bool end_of_stream = false;
+  ret = UncompressQAT(reinterpret_cast<uint8_t*>(&compressed[0]), &input_len,
+                      output.data(), &output_len, /*window_bits=*/-15,
+                      &end_of_stream);
+  return ret == 0 && end_of_stream && output_len == input_length;
+}
+#endif
+
 // The contract UncompressIAA() now offers its callers, checked on QPL's
 // software path so that it holds on a host with no device: the software path
 // rejects an oversized window for the same reason and with the same status.
@@ -2577,10 +2623,23 @@ TEST_F(IAAWindowRejectionTest, RememberedRejectionWithNoFallbackDoesNotRefuse) {
 #endif
 
 #ifdef USE_QAT
-  // Same with QAT as the only other engine. The traffic split is pinned at 100%
-  // IAA so the setup stream is the one that gets rejected rather than a coin
-  // toss; once the verdict stands the split no longer applies, because a
-  // suppressed IAA leaves QAT as the only candidate.
+  // Same with QAT as the only other engine, skipped on a host where QAT is
+  // compiled in but not usable: with no fallback configured, a failed
+  // UncompressQAT call here reaches Z_DATA_ERROR rather than the QAT this
+  // asserts, and that failure says nothing about the verdict under test.
+  if (!QATHardwareUncompressWorks()) {
+    // GTEST_SKIP() returns out of the test body, so the two blocks this
+    // function otherwise frees at the end have to be freed here instead.
+    DestroyBlock(tiny);
+    DestroyBlock(input);
+    GTEST_SKIP() << "no usable QAT device: nothing left to catch a failed "
+                    "UncompressQAT call in a no-fallback configuration";
+  }
+
+  // The traffic split is pinned at 100% IAA so the setup stream is the one
+  // that gets rejected rather than a coin toss; once the verdict stands the
+  // split no longer applies, because a suppressed IAA leaves QAT as the only
+  // candidate.
   SetConfig(USE_QAT_UNCOMPRESS, 1);
   SetConfig(IAA_UNCOMPRESS_PERCENTAGE, 100);
 
