@@ -1,6 +1,9 @@
 // Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+// The parameterized compress/decompress sweep over every compiled-in path, the
+// config-loader and ShardedMap tests, and the suite's main().
+
 #include "../zlib_accel.h"
 
 #include <gtest/gtest.h>
@@ -427,10 +430,10 @@ void RunDummyQATJob() {
 
 // A zero block that is not zeros still round-trips, so every case that takes
 // one would pass on uninitialized memory and the parameterized sweep would
-// quietly lose its most compressible payload.  Nothing else in the suite looks
-// at the contents of a generated block, so state the one generator whose
-// contents are part of its contract.  Draws no randomness, so it leaves the
-// payload sequence the parameterized cases share alone.
+// quietly lose its most compressible payload.  The generated blocks are
+// otherwise only round-tripped, never inspected, so state the contents of the
+// one generator whose contents are part of its contract.  Draws no randomness,
+// so it leaves the payload sequence the parameterized cases share alone.
 TEST(GeneratedBlockTest, ZeroBlockIsZeroed) {
   const size_t length = 4096;
   char* buf = GenerateBlock(length, zero_block);
@@ -656,8 +659,6 @@ INSTANTIATE_TEST_SUITE_P(
 #endif
                         ),
         testing::Values(false, true), testing::Values(-15, 15, 31),
-        // testing::Values(Z_NO_FLUSH, Z_PARTIAL_FLUSH,
-        // Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_FINISH, Z_BLOCK, Z_TREES),
         testing::Values(Z_FINISH), testing::Values(0),
         testing::Values(Z_PARTIAL_FLUSH, Z_SYNC_FLUSH), testing::Values(1, 2),
         testing::Values(1024, 4096, 16384, 262144, 2097152),

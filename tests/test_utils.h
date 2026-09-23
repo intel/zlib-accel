@@ -33,8 +33,9 @@ char* GenerateBlock(size_t length, BlockCompressibilityType block_type);
 char* GenerateSeededCompressibleBlock(size_t length, uint32_t seed,
                                       int ratio = 4);
 
-// Releases anything the suite hands out, so every producer here has to allocate
-// the way this releases. It used to free() while ZlibUncompress() returned
+// Releases a buffer any of the producers above hands out. Every one of them
+// allocates with new[], here and in the test files that declare their own, so
+// this has to stay delete[]: it used to free() while ZlibUncompress() returned
 // new[] memory, which ASAN halts on.
 void DestroyBlock(char* buf);
 

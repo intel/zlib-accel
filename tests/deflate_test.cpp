@@ -1165,9 +1165,8 @@ TEST(IGZIPDeflateRegressionTest,
 }
 
 TEST(IGZIPDeflateRegressionTest, SyncFlushWithInputMustStayOnIGZIPPath) {
-  // Originally this test asserted the path was ZLIB (IGZIPShouldFallbackDeflate
-  // redirected SYNC_FLUSH to zlib). That function is removed; IGZIP now handles
-  // SYNC_FLUSH natively and the stream must stay on IGZIP throughout.
+  // IGZIP handles SYNC_FLUSH natively, so a stream that uses it stays on IGZIP
+  // throughout rather than being redirected to zlib.
   SetCompressPath(IGZIP, false, false, false);
   SetUncompressPath(ZLIB, false, false);
 
@@ -1843,7 +1842,7 @@ static std::vector<Bytef> CompressWholeOnIgzipAtLevel(const char* input,
 // changed.  isal_deflate_reset() deliberately preserves level and level_buf,
 // and deflate() only builds a new ISA-L stream when isal_strm is null, so the
 // stream after the reset used to run at the level the FIRST stream was built
-// for -- measured 48335 bytes where a fresh level-1 stream produces 51021.
+// for.
 //
 // The oracle is byte equality against a fresh stream at the new level, with the
 // two controls asserted to differ so the comparison cannot pass vacuously on
@@ -1924,9 +1923,8 @@ TEST_F(DeflateParamsRegressionTest, ResetAfterLevelChangeRebuildsIgzipStream) {
 // still matches what the ISA-L stream was built for at that moment, so the
 // stream is legitimately kept.  deflateParams() then moves the level under a
 // stream deflate() reuses as-is, which used to leave the next stream running at
-// the old level -- measured 48335 bytes for a level-1 request where a fresh
-// level-1 stream produces 51021.  Same oracle as above; the two controls are
-// asserted to differ so it cannot pass vacuously.
+// the old level.  Same oracle as above; the two controls are asserted to differ
+// so it cannot pass vacuously.
 TEST_F(DeflateParamsRegressionTest, ParamsAfterResetRebuildsIgzipStream) {
   SetCompressPath(IGZIP, /*zlib_fallback=*/false, false, false);
   SetUncompressPath(ZLIB, false, false);
