@@ -428,6 +428,14 @@ struct InflateSettings {
   // clears the state; ISA-L does not, and keeps parsing whatever follows the
   // rejected bytes as a new block header, so the latch has to live here.
   bool data_error = false;
+  // Set once IAA has rejected a block of this stream for referencing a match
+  // beyond its 4 kB history buffer. Deliberately NOT cleared by inflateReset:
+  // the window is a property of the compressor that produced the bytes, and a
+  // reset starts a new stream from the same producer in every caller that
+  // matters here (Lucene resets its Inflater once per stored-field document).
+  // Clearing it would make the flag useless, since almost every rejection
+  // arrives on a stream that is about to be reset.
+  bool iaa_window_too_large = false;
 };
 
 // isal_strm is a raw pointer, so destroying a settings object does not free the
@@ -545,6 +553,12 @@ class InflateStreamSettings {
       settings->stream_end_reached = source.stream_end_reached;
       settings->bytes_consumed = source.bytes_consumed;
       settings->data_error = source.data_error;
+      // A copy decodes the rest of the same stream, so it inherits what IAA
+      // already said about that stream's history window. This has to be copied
+      // out by hand like every other field: the settings are rebuilt member by
+      // member here, not assigned, so a new member is silently dropped
+      // otherwise.
+      settings->iaa_window_too_large = source.iaa_window_too_large;
       map.Set(dest, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR,
@@ -625,6 +639,16 @@ static void ResetDeflateStreamState(
 
 // Same for the inflate side. A reset stream is ready to decode again; leaving
 // the terminal state set would wedge every later inflate() at Z_STREAM_END.
+//
+// iaa_window_too_large deliberately does NOT belong here. It records what IAA
+// said about the compressor that produced these bytes, and a reset stream is
+// almost always the same caller decoding more output from the same producer --
+// Lucene resets its Inflater once per stored-field document. Clearing it here
+// would make the flag useless: it would be forgotten before it was ever
+// consulted, and the shim would go back to submitting jobs it knows will be
+// rejected. inflateReset2() is the one exception, and clears the field itself:
+// a caller that declares an IAA-sized window has said what the next stream is,
+// which beats an inference drawn from the last one.
 static void ResetInflateStreamState(
     const std::shared_ptr<InflateSettings>& settings) {
   if (settings == nullptr) {
@@ -1756,6 +1780,35 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     igzip_available = igzip_supported_options;
 #endif
 
+#ifdef USE_IAA
+    // IsIAADecompressible cannot see match distances, so for raw deflate and
+    // gzip it has no header to read and is guessing. iaa_window_too_large is
+    // what a wrong guess, once made, costs being remembered: IAA has already
+    // told us this stream's producer used a window it cannot follow.
+    //
+    // That memory is an optimization, and an optimization must not change the
+    // answer, so it only suppresses IAA while some other engine can take the
+    // stream -- and "can take" has to mean will actually run it, not merely
+    // pass an eligibility check. zlib is always that safe: the fall-through
+    // below is software with no device to be missing. IGZIP is software too,
+    // but eligible is not enough on its own: the selection ladder below picks
+    // QAT ahead of IGZIP whenever qat_available is also true, and QAT's
+    // eligibility (qat_available) is a buffer/window check with no view of
+    // whether a device exists -- the reason it is left out of this condition
+    // entirely. So a stream this suppression hands to "IGZIP" can really be
+    // handed to a QAT that then fails, and the accelerator retry below only
+    // reaches IGZIP when IGZIP_FALLBACK is also set; igzip_available alone
+    // promises nothing about which engine the ladder actually picks. With no
+    // term true a suppressed stream would be refused outright, so submit it
+    // and let IAA decide: a job that probably fails beats refusing data that
+    // may decode.
+    if (iaa_available && inflate_settings->iaa_window_too_large &&
+        (configs[USE_ZLIB_UNCOMPRESS] ||
+         (igzip_available && (!qat_available || configs[IGZIP_FALLBACK])))) {
+      iaa_available = false;
+    }
+#endif
+
     // If both accelerators are enabled, send configured ratio of requests to
     // one or the other
     ExecutionPath path_selected = ZLIB;
@@ -1778,9 +1831,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     if (path_selected == IAA) {
 #ifdef USE_IAA
       in_call = true;
-      ret = UncompressIAA(strm->next_in, &input_len, strm->next_out,
-                          &output_len, qpl_path_hardware,
-                          inflate_settings->window_bits, &end_of_stream);
+      ret = UncompressIAA(
+          strm->next_in, &input_len, strm->next_out, &output_len,
+          qpl_path_hardware, inflate_settings->window_bits, &end_of_stream,
+          /*detect_gzip_ext=*/false, &inflate_settings->iaa_window_too_large);
       SetInflatePath(inflate_settings, IAA);
       // IAA inflate is stateless in this wrapper. If stream end was not
       // reached, use zlib for stateful continuation.
@@ -2087,6 +2141,19 @@ int ZEXPORT inflateReset2(z_streamp strm, int windowBits) {
   if (inflate_settings != nullptr) {
     ResetInflateStreamState(inflate_settings);
     inflate_settings->window_bits = windowBits;
+
+#ifdef USE_IAA
+    // The one thing that overrides a remembered rejection. That verdict is an
+    // inference about the compressor that produced the previous stream, and
+    // inflateReset2() is the caller stating outright what the next stream's
+    // window is; a declaration IAA can follow wins over the inference, since
+    // bytes that reached further back would be refused by zlib as well. An
+    // inflateReset() carries no such statement, which is why the verdict
+    // survives it.
+    if (DeclaresIAACompatibleWindow(windowBits)) {
+      inflate_settings->iaa_window_too_large = false;
+    }
+#endif
 
     if (inflate_settings->isal_strm != nullptr) {
 #ifdef USE_IGZIP
@@ -2427,6 +2494,11 @@ bool DeflateOwnsIgzipState(z_streamp strm) {
 bool InflateOwnsIgzipState(z_streamp strm) {
   auto inflate_settings = inflate_stream_settings.Get(strm);
   return inflate_settings != nullptr && inflate_settings->isal_strm != nullptr;
+}
+
+bool InflateIAAWindowRejected(z_streamp strm) {
+  auto inflate_settings = inflate_stream_settings.Get(strm);
+  return inflate_settings != nullptr && inflate_settings->iaa_window_too_large;
 }
 
 enum class FileMode { NONE, READ, WRITE, APPEND };
@@ -3197,6 +3269,13 @@ static int GzreadAcceleratorUncompress(GzipFile* gz, uint8_t* input,
   bool igzip_available = false;
 
 #ifdef USE_IAA
+  // No remembered window rejection here, unlike inflate(): gzread pins a file
+  // to zlib on its first accelerator failure of any kind (see
+  // use_zlib_for_decompression at the call site), so nothing more is submitted
+  // for the rest of that read pass. gzrewind clears the pin deliberately, to
+  // offer the accelerator another try at a file whose stream a mid-file
+  // fallback had taken away. One wasted submission per pass is all this path
+  // can spend, and within a pass there is no second one to suppress.
   iaa_available =
       configs[USE_IAA_UNCOMPRESS] &&
       SupportedOptionsIAA(kWindowBitsGzip, *input_length, *output_length) &&
