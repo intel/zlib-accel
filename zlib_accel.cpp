@@ -1789,18 +1789,22 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
     // That memory is an optimization, and an optimization must not change the
     // answer, so it only suppresses IAA while some other engine can take the
     // stream -- and "can take" has to mean will actually run it, not merely
-    // pass the software eligibility check the zlib fall-through below and the
-    // IGZIP retry both are: zlib and IGZIP are software, so eligible there
-    // means it works. QAT's eligibility (qat_available) is a buffer/window
-    // check with no view of whether a device exists, so it is deliberately
-    // left out of this condition; counting it would let a host with an
-    // eligible-but-nonfunctional QAT and no other fallback turn a stream IAA
-    // could have decoded into Z_DATA_ERROR, exactly what this optimization
-    // must not do. With neither term true a suppressed stream would be
-    // refused outright, so submit it and let IAA decide: a job that probably
-    // fails beats refusing data that may decode.
+    // pass an eligibility check. zlib is always that safe: the fall-through
+    // below is software with no device to be missing. IGZIP is software too,
+    // but eligible is not enough on its own: the selection ladder below picks
+    // QAT ahead of IGZIP whenever qat_available is also true, and QAT's
+    // eligibility (qat_available) is a buffer/window check with no view of
+    // whether a device exists -- the reason it is left out of this condition
+    // entirely. So a stream this suppression hands to "IGZIP" can really be
+    // handed to a QAT that then fails, and the accelerator retry below only
+    // reaches IGZIP when IGZIP_FALLBACK is also set; igzip_available alone
+    // promises nothing about which engine the ladder actually picks. With no
+    // term true a suppressed stream would be refused outright, so submit it
+    // and let IAA decide: a job that probably fails beats refusing data that
+    // may decode.
     if (iaa_available && inflate_settings->iaa_window_too_large &&
-        (configs[USE_ZLIB_UNCOMPRESS] || igzip_available)) {
+        (configs[USE_ZLIB_UNCOMPRESS] ||
+         (igzip_available && (!qat_available || configs[IGZIP_FALLBACK])))) {
       iaa_available = false;
     }
 #endif

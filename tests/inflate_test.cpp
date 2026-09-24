@@ -2629,6 +2629,33 @@ TEST_F(IAAWindowRejectionTest, RememberedRejectionWithNoFallbackDoesNotRefuse) {
   ASSERT_EQ(inflateEnd(&to_qat), Z_OK);
 #endif
 
+#if defined(USE_IGZIP) && defined(USE_QAT)
+  // The mixed configuration the suppression's igzip_available term still got
+  // wrong even after the qat_available fix above: with QAT also eligible,
+  // the selection ladder picks QAT ahead of IGZIP regardless of which one
+  // justified suppressing IAA, and the accelerator->IGZIP retry only covers
+  // that QAT choice when IGZIP_FALLBACK is set -- left off here, as in every
+  // other block in this test. So igzip_available alone must not stand the
+  // suppression down while qat_available is also true; the traffic split,
+  // still pinned at 100% IAA from the block above, is what actually serves
+  // the narrow stream.
+  SetConfig(USE_IGZIP_UNCOMPRESS, 1);
+
+  z_stream to_mixed;
+  memset(&to_mixed, 0, sizeof(z_stream));
+  ASSERT_EQ(inflateInit2(&to_mixed, -15), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_mixed, wide, input, input_length),
+            Z_DATA_ERROR);
+  ASSERT_TRUE(InflateIAAWindowRejected(&to_mixed));
+
+  ASSERT_EQ(inflateReset(&to_mixed), Z_OK);
+  EXPECT_EQ(InflateWholeStream(&to_mixed, narrow, input, input_length),
+            Z_STREAM_END);
+  EXPECT_EQ(GetInflateExecutionPath(&to_mixed), IAA);
+  ASSERT_EQ(inflateEnd(&to_mixed), Z_OK);
+  SetConfig(USE_IGZIP_UNCOMPRESS, 0);
+#endif
+
   DestroyBlock(tiny);
   DestroyBlock(input);
 }
