@@ -3694,12 +3694,19 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
   // zlib does not flush for a strategy it is not going to act on either.
   if (level != gz->level) {
     // Z_ERRNO is what zlib returns for an error writing the flushed data; a
-    // flush that could not run at all reports itself instead.
+    // flush that could not run at all reports itself instead. Both latch onto
+    // gz->err the same way gzwrite()/gzflush() do on the identical failure --
+    // without it, gzerror() on this file would still read Z_OK, and the
+    // sticky-error guard at the top of this function and of gzwrite()/
+    // gzflush() would not catch a later call on it either.
     const int flush_ret = FlushBufferedWrite(file, gz.get());
     if (flush_ret == Z_STREAM_ERROR) {
+      GzSetError(gz.get(), Z_STREAM_ERROR,
+                 "required zlib symbol is unresolved");
       return Z_STREAM_ERROR;
     }
     if (flush_ret != 0) {
+      GzSetError(gz.get(), Z_ERRNO, strerror(errno));
       return Z_ERRNO;
     }
   }

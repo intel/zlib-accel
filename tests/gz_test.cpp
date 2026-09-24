@@ -2935,3 +2935,52 @@ TEST_F(GzipFileTest, GzwriteReportsARealWriteFailure) {
   DestroyBlock(input);
   remove(filename);
 }
+
+// The third caller of FlushBufferedWrite(), and the one that did not latch a
+// failure the way GzwriteReportsARealWriteFailure above shows gzwrite() does:
+// a level change with data still buffered forces the same flush, and until
+// now nothing recorded its failure on the file.
+TEST_F(GzipFileTest, GzsetparamsLatchesAFailedFlush) {
+  EnableShimOwnedGzWrites();
+
+  const size_t half = 100 << 10;  // Under data_buf_size, so it stays buffered.
+  char* input = GenerateSeededCompressibleBlock(half, /*seed=*/0x5e77);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(half)),
+            static_cast<int>(half));
+
+  int ret = 0;
+  {
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    limit.FailWithErrno(ENOSPC);
+    errno = 0;
+    ret = gzsetparams(fp, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  EXPECT_EQ(ret, Z_ERRNO);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(ENOSPC)), std::string::npos);
+
+  // The latch has to reach the guard every write path shares: a caller that
+  // ignored gzsetparams()'s own return should still find the file refusing
+  // to write rather than silently accepting more into a file zlib considers
+  // failed.
+  EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(half)), 0);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
+}
