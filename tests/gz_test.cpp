@@ -2741,6 +2741,9 @@ std::atomic<int> g_write_limit_fd{-1};
 std::atomic<size_t> g_write_limit_chunk{0};
 std::atomic<bool> g_write_limit_once{false};
 std::atomic<int> g_write_limit_hits{0};
+// Forces the registered descriptor's write to fail outright with this errno
+// instead of the chunk/zero behavior above. 0 means unused.
+std::atomic<int> g_write_limit_fail_errno{0};
 }  // namespace
 
 #pragma GCC visibility push(default)
@@ -2749,6 +2752,11 @@ extern "C" ssize_t write(int fd, const void* buf, size_t count) {
     g_write_limit_hits.fetch_add(1);
     if (g_write_limit_once.load()) {
       g_write_limit_fd.store(-1);
+    }
+    const int fail_errno = g_write_limit_fail_errno.load();
+    if (fail_errno != 0) {
+      errno = fail_errno;
+      return -1;
     }
     const size_t chunk = g_write_limit_chunk.load();
     if (chunk == 0) {
@@ -2773,15 +2781,23 @@ class ScopedWriteLimit {
     g_write_limit_chunk.store(chunk);
     g_write_limit_once.store(once);
     g_write_limit_hits.store(0);
+    g_write_limit_fail_errno.store(0);
     g_write_limit_fd.store(fd);
   }
-  ~ScopedWriteLimit() { g_write_limit_fd.store(-1); }
+  ~ScopedWriteLimit() {
+    g_write_limit_fd.store(-1);
+    g_write_limit_fail_errno.store(0);
+  }
   ScopedWriteLimit(const ScopedWriteLimit&) = delete;
   ScopedWriteLimit& operator=(const ScopedWriteLimit&) = delete;
 
   // How many writes the limit applied to, so a test can show it was not
   // vacuous.
   int hits() const { return g_write_limit_hits.load(); }
+
+  // Makes the registered descriptor's write fail outright with e rather than
+  // the chunk/zero behavior above.
+  void FailWithErrno(int e) { g_write_limit_fail_errno.store(e); }
 };
 
 // CompressAndWrite has to send the rest of the buffer from where the last write
@@ -2865,6 +2881,55 @@ TEST_F(GzipFileTest, GzwriteReportsAWriteThatAcceptedNothing) {
   EXPECT_EQ(err, Z_ERRNO);
   ASSERT_NE(message, nullptr);
   EXPECT_NE(std::string(message).find(strerror(EIO)), std::string::npos);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
+}
+
+// The other outcome GzwriteReportsAWriteThatAcceptedNothing above does not
+// reach: a real write(2) failure, which already carries its own errno rather
+// than needing one supplied. Unlike the zero-return case, nothing between
+// write() and the check may touch errno first -- Log() runs there and is
+// itself a write(), a risk this forces a real errno (ENOSPC) through to make
+// concrete, though it does not exercise Log()'s own flush contending for
+// errno: forcing that deterministically would need a stdout write to fail on
+// cue after write(gz->fd, ...) already has, and every way tried to force it
+// either missed glibc's internal stdio path (a write() interposer, since
+// glibc's own flush does not go through the public symbol one replaces) or
+// landed on an earlier, unrelated flush instead of this one (a broken pipe on
+// stdout, since std::cout latches failure on the first write it loses and
+// answers every flush after that from the latch, not a new syscall).
+TEST_F(GzipFileTest, GzwriteReportsARealWriteFailure) {
+  EnableShimOwnedGzWrites();
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x9ee1);
+  ASSERT_NE(input, nullptr);
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  int ret = 0;
+  {
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    limit.FailWithErrno(ENOSPC);
+    errno = 0;
+    ret = gzwrite(fp, input, static_cast<unsigned>(input_length));
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  EXPECT_EQ(ret, 0);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(ENOSPC)), std::string::npos);
 
   gzclose_w(fp);
   DestroyBlock(input);

@@ -3421,17 +3421,21 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
   while (written < output_len) {
     const ssize_t write_ret =
         write(gz->fd, gz->io_buf + written, output_len - written);
+    // Captured before Log() rather than trusted after it: Log()'s own stream
+    // flush is a write() of its own, so a negative write_ret's errno would
+    // otherwise describe whatever that flush did, not the failure below.
+    const int write_errno = errno;
     Log(LogLevel::LOG_INFO, "CompressAndWrite Line ", __LINE__, ", file ",
         static_cast<void*>(file), ", written to file ", write_ret, "\n");
     if (write_ret <= 0) {
       // Every caller of this failure reports it as Z_ERRNO and latches
-      // strerror(errno), so there has to be an errno to read. A negative return
-      // has set one; a zero return has not, and would leave whatever the last
-      // unrelated syscall put there -- including success. EIO is the closest
-      // thing to what happened: the descriptor accepted none of the bytes.
-      if (write_ret == 0) {
-        errno = EIO;
-      }
+      // strerror(errno), so there has to be an errno to read. A negative
+      // return has the capture above; a zero return has no errno of its own
+      // to restore -- write(2) does not set one on that outcome -- and would
+      // otherwise read whatever the last unrelated syscall put there,
+      // including success. EIO is the closest thing to what happened: the
+      // descriptor accepted none of the bytes.
+      errno = (write_ret == 0) ? EIO : write_errno;
       return 1;
     }
     written += static_cast<uint32_t>(write_ret);
