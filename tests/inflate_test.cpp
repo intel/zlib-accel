@@ -2115,6 +2115,11 @@ class IAAWindowRejectionTest : public ::testing::Test {
 // came back wrong.
 static int InflateWholeStream(z_streamp strm, const std::string& compressed,
                               const char* expected, size_t expected_length) {
+  // A whole-stream decode finishes or errors out in one or two calls; this is
+  // headroom, not an expected count. Exhausting it below is reported rather
+  // than left to surface as a plain return-code mismatch, since "stuck" and
+  // "wrong answer" want different diagnostics.
+  constexpr int kMaxInflateCalls = 128;
   std::vector<Bytef> output(expected_length + 1024);
   strm->next_in =
       reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
@@ -2122,11 +2127,16 @@ static int InflateWholeStream(z_streamp strm, const std::string& compressed,
   strm->next_out = output.data();
   strm->avail_out = static_cast<uInt>(output.size());
   int ret = Z_OK;
-  for (int guard = 0; guard < 128; guard++) {
+  int guard = 0;
+  for (; guard < kMaxInflateCalls; guard++) {
     ret = inflate(strm, Z_NO_FLUSH);
     if (ret != Z_OK && ret != Z_BUF_ERROR) {
       break;
     }
+  }
+  if (guard == kMaxInflateCalls && (ret == Z_OK || ret == Z_BUF_ERROR)) {
+    ADD_FAILURE() << "inflate() neither finished nor errored after "
+                  << kMaxInflateCalls << " calls; decoder appears stuck";
   }
   if (ret != Z_STREAM_END) {
     return ret;
