@@ -34,7 +34,31 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential cmake zlib1g-dev
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake zlib1g-dev \
+          libqatzip-dev libtbb-dev nasm autoconf automake libtool pkg-config
+
+    # ISA-L and QPL have no apt package new enough (ISA-L) or at all (QPL);
+    # QAT and TBB are covered by the apt packages above -- both are just
+    # libraries to link against, no hardware or driver needed to compile.
+    - name: Build ISA-L
+      run: |
+        git clone --depth 1 https://github.com/intel/isa-l.git "${{ runner.temp }}/isa-l"
+        cd "${{ runner.temp }}/isa-l"
+        ./autogen.sh
+        ./configure --prefix="${{ runner.temp }}/deps"
+        make -j
+        make install
+
+    - name: Build QPL
+      run: |
+        git clone --depth 1 https://github.com/intel/qpl.git "${{ runner.temp }}/qpl"
+        cmake -S "${{ runner.temp }}/qpl" -B "${{ runner.temp }}/qpl/build" \
+          -DCMAKE_BUILD_TYPE=Release -DQPL_BUILD_EXAMPLES=OFF -DQPL_BUILD_TESTS=OFF \
+          -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/deps"
+        cmake --build "${{ runner.temp }}/qpl/build" -j
+        cmake --install "${{ runner.temp }}/qpl/build"
 
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
@@ -46,7 +70,11 @@ jobs:
       if: matrix.build-mode == 'manual'
       run: |
         mkdir build && cd build
-        cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
+        cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+          -DUSE_QAT=ON -DUSE_IAA=ON -DUSE_IGZIP=ON \
+          -DDEBUG_LOG=ON -DENABLE_STATISTICS=ON \
+          -DQPL_PATH="${{ runner.temp }}/deps" -DISAL_PATH="${{ runner.temp }}/deps" \
+          ..
         make
 
     - name: Perform CodeQL Analysis
