@@ -1,0 +1,71 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+  schedule:
+  - cron: '0 6 * * 1'  # weekly
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: c-cpp
+          build-mode: manual
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential cmake zlib1g-dev
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+
+    - name: Build zlib-accel
+      if: matrix.build-mode == 'manual'
+      run: |
+        mkdir build && cd build
+        cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
+        make
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{ matrix.language }}"
+
+    # Report only on a manual run, never on push/PR.
+    - name: Generate Security Report
+      if: github.event_name == 'workflow_dispatch'
+      uses: rsdmike/github-security-report-action@v3.0.4
+      with:
+        template: report
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: GitHub Upload Release Artifacts
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-artifact@v4
+      with:
+        name: report
+        path: |
+         ./report.pdf
