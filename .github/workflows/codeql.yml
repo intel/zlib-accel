@@ -38,7 +38,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y build-essential cmake zlib1g-dev \
           libqat-dev libtbb-dev nasm autoconf automake autoconf-archive \
-          libtool pkg-config
+          libtool pkg-config libnuma-dev liblz4-dev libzstd-dev
 
     # ISA-L and QPL have no apt package new enough (ISA-L) or at all (QPL).
     # QATzip's apt package is too old for this code (missing QzLogLevel_T),
