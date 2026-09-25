@@ -50,6 +50,7 @@
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <climits>
 #include <cstdarg>
 #include <cstdint>
@@ -3071,6 +3072,17 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   if (orig_gzdopen == nullptr) {
     return nullptr;
   }
+  // zlib's gz_open checks the path first and returns NULL for a null one
+  // (gzlib.c), ahead of interpreting the mode, so this has to as well. Reaching
+  // open(2) with a null path answers EFAULT, which arrives at the same return
+  // by accident, but the mode-rejection branch below streams the path into a
+  // log on the way -- setting badbit on the log stream, which silences every
+  // later log in the process. A null mode is deliberately not checked, because
+  // zlib does not check it either: its own walk over the mode string
+  // dereferences it.
+  if (path == nullptr) {
+    return nullptr;
+  }
   GzOpenParams params;
   int oflag = GetOpenFlags(mode, &params);
   // A mode string zlib rejects has to be rejected before open(2), not after:
@@ -3098,7 +3110,7 @@ gzFile ZEXPORT gzopen(const char* path, const char* mode) {
   auto gz = gzip_files.Set(file, fd, params);
   if (gz != nullptr) {
     try {
-      gz->file_name = path != nullptr ? path : "";
+      gz->file_name = path;
     } catch (...) {
       // Only the text of a later gzerror message is lost.
     }
@@ -3409,9 +3421,21 @@ static int CompressAndWrite(gzFile file, GzipFile* gz) {
   while (written < output_len) {
     const ssize_t write_ret =
         write(gz->fd, gz->io_buf + written, output_len - written);
+    // Captured before Log() rather than trusted after it: Log()'s own stream
+    // flush is a write() of its own, so a negative write_ret's errno would
+    // otherwise describe whatever that flush did, not the failure below.
+    const int write_errno = errno;
     Log(LogLevel::LOG_INFO, "CompressAndWrite Line ", __LINE__, ", file ",
         static_cast<void*>(file), ", written to file ", write_ret, "\n");
     if (write_ret <= 0) {
+      // Every caller of this failure reports it as Z_ERRNO and latches
+      // strerror(errno), so there has to be an errno to read. A negative
+      // return has the capture above; a zero return has no errno of its own
+      // to restore -- write(2) does not set one on that outcome -- and would
+      // otherwise read whatever the last unrelated syscall put there,
+      // including success. EIO is the closest thing to what happened: the
+      // descriptor accepted none of the bytes.
+      errno = (write_ret == 0) ? EIO : write_errno;
       return 1;
     }
     written += static_cast<uint32_t>(write_ret);
@@ -3670,12 +3694,19 @@ int ZEXPORT gzsetparams(gzFile file, int level, int strategy) {
   // zlib does not flush for a strategy it is not going to act on either.
   if (level != gz->level) {
     // Z_ERRNO is what zlib returns for an error writing the flushed data; a
-    // flush that could not run at all reports itself instead.
+    // flush that could not run at all reports itself instead. Both latch onto
+    // gz->err the same way gzwrite()/gzflush() do on the identical failure --
+    // without it, gzerror() on this file would still read Z_OK, and the
+    // sticky-error guard at the top of this function and of gzwrite()/
+    // gzflush() would not catch a later call on it either.
     const int flush_ret = FlushBufferedWrite(file, gz.get());
     if (flush_ret == Z_STREAM_ERROR) {
+      GzSetError(gz.get(), Z_STREAM_ERROR,
+                 "required zlib symbol is unresolved");
       return Z_STREAM_ERROR;
     }
     if (flush_ret != 0) {
+      GzSetError(gz.get(), Z_ERRNO, strerror(errno));
       return Z_ERRNO;
     }
   }
