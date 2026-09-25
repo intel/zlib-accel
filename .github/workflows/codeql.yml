@@ -37,11 +37,12 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake zlib1g-dev \
-          libqatzip-dev libtbb-dev nasm autoconf automake libtool pkg-config
+          libqat-dev libtbb-dev nasm autoconf automake libtool pkg-config
 
-    # ISA-L and QPL have no apt package new enough (ISA-L) or at all (QPL);
-    # QAT and TBB are covered by the apt packages above -- both are just
-    # libraries to link against, no hardware or driver needed to compile.
+    # ISA-L and QPL have no apt package new enough (ISA-L) or at all (QPL).
+    # QATzip's apt package is too old for this code (missing QzLogLevel_T),
+    # so it builds from source too, against libqat-dev above -- none of this
+    # needs hardware or a driver, just headers and a library to link against.
     - name: Build ISA-L
       run: |
         git clone --depth 1 https://github.com/intel/isa-l.git "${{ runner.temp }}/isa-l"
@@ -60,6 +61,14 @@ jobs:
         cmake --build "${{ runner.temp }}/qpl/build" -j
         cmake --install "${{ runner.temp }}/qpl/build"
 
+    - name: Build QATzip
+      run: |
+        git clone --depth 1 https://github.com/intel/QATzip.git "${{ runner.temp }}/QATzip"
+        cd "${{ runner.temp }}/QATzip"
+        ./autogen.sh
+        ./configure
+        make -j
+
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
       with:
@@ -74,6 +83,7 @@ jobs:
           -DUSE_QAT=ON -DUSE_IAA=ON -DUSE_IGZIP=ON \
           -DDEBUG_LOG=ON -DENABLE_STATISTICS=ON \
           -DQPL_PATH="${{ runner.temp }}/deps" -DISAL_PATH="${{ runner.temp }}/deps" \
+          -DQATZIP_PATH="${{ runner.temp }}/QATzip" \
           ..
         make
 
