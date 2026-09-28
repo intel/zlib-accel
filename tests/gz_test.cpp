@@ -7,14 +7,18 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -2689,4 +2693,294 @@ TEST_F(GzipFileTest, GzreadLatchesBufErrorOnATruncatedMember) {
   EXPECT_EQ(gzclose(fp), Z_OK);
   remove(filename);
   DestroyBlock(input);
+}
+
+// zlib's gz_open returns NULL for a null path before it looks at the mode
+// (gzlib.c), so the shim has to check it in the same place: it opens the file
+// itself, and the mode-rejection branch ahead of that open logs the path.
+// Streaming a null const char* into an ostream sets badbit rather than crashing
+// on this library, and the log stream is std::cout unless a log file is
+// configured, so one such call silences every later log in the process and
+// takes the application's own stdout with it. A null mode is deliberately not
+// checked, because zlib does not check it either.
+TEST_F(GzipFileTest, GzopenRejectsANullPath) {
+  // The log the bad mode reaches is LOG_INFO, so it has to be enabled for this
+  // to be more than an assertion about the return value.
+  const uint32_t saved_log_level = GetConfig(LOG_LEVEL);
+  SetConfig(LOG_LEVEL, 2);
+
+  EXPECT_EQ(gzopen(nullptr, "rb"), nullptr);
+  EXPECT_EQ(gzopen(nullptr, "wb"), nullptr);
+  // A mode naming no direction, which is the branch that logs the path.
+  EXPECT_EQ(gzopen(nullptr, "q"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "rb"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "wb"), nullptr);
+  EXPECT_EQ(gzopen64(nullptr, "q"), nullptr);
+
+  // Nothing above wrote to the log stream, so it is still usable.
+  EXPECT_FALSE(std::cout.bad());
+
+  SetConfig(LOG_LEVEL, saved_log_level);
+}
+
+// A write(2) the tests below control, for the two returns a real file will not
+// produce on demand: a short write and a write that accepts nothing. A pipe
+// cannot stand in for either -- a blocking one transfers the whole count
+// however small it is, and a non-blocking one answers EAGAIN instead of a
+// partial count -- so write itself is replaced. A definition here interposes
+// for libzlib-accel.so because the executable is searched ahead of the
+// libraries it loads, and it needs explicit default visibility to be exported
+// at all, since the whole build is compiled -fvisibility=hidden.
+//
+// This sees every write in the process, gtest's own output included, so
+// anything but a registered descriptor is passed straight through. The
+// pass-through is the raw syscall rather than a dlsym of the real write, to
+// keep it off the loader's path.
+namespace {
+std::atomic<int> g_write_limit_fd{-1};
+std::atomic<size_t> g_write_limit_chunk{0};
+std::atomic<bool> g_write_limit_once{false};
+std::atomic<int> g_write_limit_hits{0};
+// Forces the registered descriptor's write to fail outright with this errno
+// instead of the chunk/zero behavior above. 0 means unused.
+std::atomic<int> g_write_limit_fail_errno{0};
+}  // namespace
+
+#pragma GCC visibility push(default)
+extern "C" ssize_t write(int fd, const void* buf, size_t count) {
+  if (fd >= 0 && fd == g_write_limit_fd.load()) {
+    g_write_limit_hits.fetch_add(1);
+    if (g_write_limit_once.load()) {
+      g_write_limit_fd.store(-1);
+    }
+    const int fail_errno = g_write_limit_fail_errno.load();
+    if (fail_errno != 0) {
+      errno = fail_errno;
+      return -1;
+    }
+    const size_t chunk = g_write_limit_chunk.load();
+    if (chunk == 0) {
+      // Accepts nothing and sets no errno of its own, which is the case the
+      // caller has to fill in for itself.
+      return 0;
+    }
+    if (chunk < count) {
+      count = chunk;
+    }
+  }
+  return syscall(SYS_write, fd, buf, count);
+}
+#pragma GCC visibility pop
+
+// Registers a descriptor with the interposer above and unregisters it on the
+// way out, including on the early return an ASSERT_* performs: a registration
+// left behind would truncate every later write in the process.
+class ScopedWriteLimit {
+ public:
+  ScopedWriteLimit(int fd, size_t chunk, bool once) {
+    g_write_limit_chunk.store(chunk);
+    g_write_limit_once.store(once);
+    g_write_limit_hits.store(0);
+    g_write_limit_fail_errno.store(0);
+    g_write_limit_fd.store(fd);
+  }
+  ~ScopedWriteLimit() {
+    g_write_limit_fd.store(-1);
+    g_write_limit_fail_errno.store(0);
+  }
+  ScopedWriteLimit(const ScopedWriteLimit&) = delete;
+  ScopedWriteLimit& operator=(const ScopedWriteLimit&) = delete;
+
+  // How many writes the limit applied to, so a test can show it was not
+  // vacuous.
+  int hits() const { return g_write_limit_hits.load(); }
+
+  // Makes the registered descriptor's write fail outright with e rather than
+  // the chunk/zero behavior above.
+  void FailWithErrno(int e) { g_write_limit_fail_errno.store(e); }
+};
+
+// CompressAndWrite has to send the rest of the buffer from where the last write
+// stopped. Rewriting from the start of io_buf would re-emit the bytes already
+// accepted and drop the tail, leaving a file that is still valid gzip and
+// decompresses to something else.
+TEST_F(GzipFileTest, ShortWritesStillProduceTheWholeFile) {
+  EnableShimOwnedGzWrites();
+  SetUncompressPath(ZLIB, false, false);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x5be1);
+  ASSERT_NE(input, nullptr);
+
+  int hits = 0;
+  {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    ASSERT_NE(fd, -1);
+    // Small enough that every flush takes many writes.
+    ScopedWriteLimit limit(fd, /*chunk=*/1024, /*once=*/false);
+    gzFile fp = gzdopen(fd, "wb");
+    ASSERT_NE(fp, nullptr);
+    EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+    EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(input_length)),
+              static_cast<int>(input_length));
+    EXPECT_EQ(gzclose_w(fp), Z_OK);
+    hits = limit.hits();
+  }
+  // A full-sized write would have taken a handful; each of those became 1 KiB
+  // pieces.
+  EXPECT_GT(hits, 10);
+
+  char* uncompressed = nullptr;
+  size_t uncompressed_length = 0;
+  ASSERT_EQ(
+      ZlibUncompressGzipFile(input_length, &uncompressed, &uncompressed_length),
+      Z_OK);
+  EXPECT_EQ(uncompressed_length, input_length);
+  EXPECT_EQ(memcmp(uncompressed, input, input_length), 0);
+
+  DestroyBlock(uncompressed);
+  DestroyBlock(input);
+}
+
+// A write that accepts nothing is not an error by itself, so it leaves errno
+// alone -- whatever an unrelated syscall put there last, including a success.
+// The failure is still reported as Z_ERRNO and latched with strerror(errno), so
+// the shim has to supply an errno of its own or the file ends up holding a
+// message that describes no failure.
+TEST_F(GzipFileTest, GzwriteReportsAWriteThatAcceptedNothing) {
+  EnableShimOwnedGzWrites();
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x2c73);
+  ASSERT_NE(input, nullptr);
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  int ret = 0;
+  {
+    // One shot only. zlib's own gz_comp treats a zero return as no progress and
+    // retries it forever, and the close below reaches that loop.
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    errno = 0;
+    ret = gzwrite(fp, input, static_cast<unsigned>(input_length));
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  // Nothing reached the file, and the reason is one an application can read.
+  EXPECT_EQ(ret, 0);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(EIO)), std::string::npos);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
+}
+
+// The other outcome GzwriteReportsAWriteThatAcceptedNothing above does not
+// reach: a real write(2) failure, which already carries its own errno rather
+// than needing one supplied. Unlike the zero-return case, nothing between
+// write() and the check may touch errno first -- Log() runs there and is
+// itself a write(), a risk this forces a real errno (ENOSPC) through to make
+// concrete, though it does not exercise Log()'s own flush contending for
+// errno: forcing that deterministically would need a stdout write to fail on
+// cue after write(gz->fd, ...) already has, and every way tried to force it
+// either missed glibc's internal stdio path (a write() interposer, since
+// glibc's own flush does not go through the public symbol one replaces) or
+// landed on an earlier, unrelated flush instead of this one (a broken pipe on
+// stdout, since std::cout latches failure on the first write it loses and
+// answers every flush after that from the latch, not a new syscall).
+TEST_F(GzipFileTest, GzwriteReportsARealWriteFailure) {
+  EnableShimOwnedGzWrites();
+
+  const char* filename = "file.gz";
+  remove(filename);
+  const size_t input_length = 300 << 10;
+  char* input = GenerateSeededCompressibleBlock(input_length, /*seed=*/0x9ee1);
+  ASSERT_NE(input, nullptr);
+
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  int ret = 0;
+  {
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    limit.FailWithErrno(ENOSPC);
+    errno = 0;
+    ret = gzwrite(fp, input, static_cast<unsigned>(input_length));
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  EXPECT_EQ(ret, 0);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(ENOSPC)), std::string::npos);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
+}
+
+// The third caller of FlushBufferedWrite(), and the one that did not latch a
+// failure the way GzwriteReportsARealWriteFailure above shows gzwrite() does:
+// a level change with data still buffered forces the same flush, and until
+// now nothing recorded its failure on the file.
+TEST_F(GzipFileTest, GzsetparamsLatchesAFailedFlush) {
+  EnableShimOwnedGzWrites();
+
+  const size_t half = 100 << 10;  // Under data_buf_size, so it stays buffered.
+  char* input = GenerateSeededCompressibleBlock(half, /*seed=*/0x5e77);
+  ASSERT_NE(input, nullptr);
+
+  const char* filename = "file.gz";
+  remove(filename);
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  ASSERT_NE(fd, -1);
+  gzFile fp = gzdopen(fd, "wb");
+  ASSERT_NE(fp, nullptr);
+  EXPECT_NE(GetGzipFileExecutionPath(fp), ZLIB);
+
+  ASSERT_EQ(gzwrite(fp, input, static_cast<unsigned>(half)),
+            static_cast<int>(half));
+
+  int ret = 0;
+  {
+    ScopedWriteLimit limit(fd, /*chunk=*/0, /*once=*/true);
+    limit.FailWithErrno(ENOSPC);
+    errno = 0;
+    ret = gzsetparams(fp, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
+    EXPECT_EQ(limit.hits(), 1);
+  }
+
+  EXPECT_EQ(ret, Z_ERRNO);
+  int err = Z_OK;
+  const char* message = gzerror(fp, &err);
+  EXPECT_EQ(err, Z_ERRNO);
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(std::string(message).find(strerror(ENOSPC)), std::string::npos);
+
+  // The latch has to reach the guard every write path shares: a caller that
+  // ignored gzsetparams()'s own return should still find the file refusing
+  // to write rather than silently accepting more into a file zlib considers
+  // failed.
+  EXPECT_EQ(gzwrite(fp, input, static_cast<unsigned>(half)), 0);
+
+  gzclose_w(fp);
+  DestroyBlock(input);
+  remove(filename);
 }

@@ -17,7 +17,7 @@ constexpr int CUSTOM_PATH_MAX = 4096;
 
 bool ConfigReader::GetValue(const std::string& tag, uint32_t& value,
                             uint32_t max_value, uint32_t min_value,
-                            std::function<bool(uint32_t)> validator) {
+                            const std::function<bool(uint32_t)>& validator) {
   auto it = config_settings_map.find(tag);
   if (it == config_settings_map.end()) {
     return false;
