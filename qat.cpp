@@ -263,6 +263,11 @@ int UncompressQAT(uint8_t *input, uint32_t *input_length, uint8_t *output,
   // if (qzSessObj->end_of_last_block == 0) {
   unsigned char qat_end_of_stream = 0;
   rc = qzGetDeflateEndOfStream(qzSessObj, &qat_end_of_stream);
+  if (rc != QZ_OK) {
+    Log(LogLevel::LOG_ERROR, "UncompressQAT() Line ", __LINE__,
+        " qzGetDeflateEndOfStream status ", rc, " \n");
+    return 1;
+  }
   if (qat_end_of_stream == 0) {
     *end_of_stream = false;
     // Reset the QAT session
