@@ -20,6 +20,18 @@
 
 #include "config/config.h"
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ZLIB_ACCEL_HAS_ASAN 1
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define ZLIB_ACCEL_HAS_ASAN 1
+#endif
+
+#ifdef ZLIB_ACCEL_HAS_ASAN
+#include <sanitizer/lsan_interface.h>
+#endif
+
 template <typename Key, typename Value>
 class ShardedMap {
  public:
@@ -32,11 +44,17 @@ class ShardedMap {
   // afterwards to re-allocate with the configured shard count.
   ShardedMap() : num_shards_(config::GetConfig(config::MAP_SHARDS)) {
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
+#ifdef ZLIB_ACCEL_HAS_ASAN
+    __lsan_ignore_object(pd_map_arr_.get());
+#endif
   }
 
   void Init() {
     num_shards_ = config::GetConfig(config::MAP_SHARDS);
     pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
+#ifdef ZLIB_ACCEL_HAS_ASAN
+    __lsan_ignore_object(pd_map_arr_.get());
+#endif
   }
 
   auto Get(const Key& key) -> std::shared_ptr<typename Value::element_type> {
