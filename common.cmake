@@ -84,11 +84,20 @@ if(DEBUG_LOG)
   add_compile_definitions(DEBUG_LOG)
 endif()
 
+# _FORTIFY_SOURCE's runtime checks need -O1+ to activate (glibc substitutes the
+# checked _chk variants based on object-size information the compiler only
+# computes under optimization); an empty CMAKE_BUILD_TYPE gets no -O flag at
+# all otherwise, so the define alone did nothing. -O2 is appended first and
+# CMAKE_BUILD_TYPE's own -O flag (Debug's explicit -O0 below, or Release's
+# own -O3) lands after it in the compiler invocation and wins, so this only
+# changes the otherwise-unoptimized default build.
 set(COMPILER_FLAGS "-Wall -Wextra -Werror \
 -fvisibility=hidden \
 -Wformat -Wformat-security -Werror=format-security \
--D_FORTIFY_SOURCE=2 \
--fstack-protector-strong")
+-D_FORTIFY_SOURCE=2 -O2 \
+-fstack-protector-strong \
+-fstack-clash-protection \
+-fcf-protection")
 # UBSAN not compatible with -flto
 if(NOT UBSAN)
   set(COMPILER_FLAGS "${COMPILER_FLAGS} -flto")
