@@ -70,7 +70,9 @@ bool LoadConfigFile(std::string& file_content, const char* file_path,
     return false;
   }
   ConfigReader config_reader;
-  config_reader.ParseFile(file_path);
+  if (!config_reader.ParseFile(file_path)) {
+    return false;
+  }
 
   auto trySetConfig = [&](ConfigOption opt, uint32_t max, uint32_t min,
                           const std::function<bool(uint32_t)>& validator =

@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1258,6 +1259,22 @@ TEST_F(ConfigLoaderTest, SymbolicLinkTest) {
   EXPECT_FALSE(LoadConfigFile(file_content, symlink_path.c_str()));
   std::filesystem::remove(symlink_path);
   std::filesystem::remove(target_path);
+}
+
+// A file that exists and isn't a symlink can still fail to open (permission
+// race, or here, permissions denied outright) -- ParseFile()'s own false
+// return has to reach the caller rather than being discarded, or a file that
+// was never actually read is reported as a successful, empty parse.
+TEST_F(ConfigLoaderTest, UnopenableFileReportsFailure) {
+  std::string file_content;
+  const char* config_path = "/tmp/unopenable_config";
+  std::ofstream config_file(config_path);
+  config_file << "log_level=2\n";
+  config_file.close();
+  ASSERT_EQ(chmod(config_path, 0), 0);
+  EXPECT_FALSE(LoadConfigFile(file_content, config_path));
+  chmod(config_path, 0644);
+  std::remove(config_path);
 }
 
 TEST_F(ConfigLoaderTest, MapShardsValidPowerOfTwo) {
