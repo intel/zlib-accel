@@ -66,13 +66,23 @@ void CompressDecompress(const uint8_t* input_data, size_t input_data_length,
   // A Z_OK return owns the partial prefix it produced and an error owns
   // nothing, so release unconditionally here -- delete[] on the null an error
   // leaves is a no-op, and anything else is the buffer this call is abandoning.
-  if (ret != Z_STREAM_END) {
+  //
+  // ZlibUncompress's own contract (test_utils.cpp) treats Z_OK on the last
+  // chunk as a legitimate result, not a failure: zlib's inflate() returns
+  // Z_OK rather than Z_STREAM_END when avail_out reaches zero exactly at the
+  // stream's end, and a caller has to make a further call (with more output
+  // room) to observe Z_STREAM_END even though decompression is complete.
+  // Rejecting Z_OK here traps on that ordinary case; the length check below
+  // still catches a genuinely truncated result, which would leave
+  // uncompressed_length short of input_length.
+  if (ret != Z_STREAM_END && ret != Z_OK) {
     *fuzz_ret = 1;
     delete[] uncompressed;
     return;
   }
 
-  if (memcmp(uncompressed, input, uncompressed_length) != 0) {
+  if (uncompressed_length != input_length ||
+      memcmp(uncompressed, input, uncompressed_length) != 0) {
     *fuzz_ret = 1;
     delete[] uncompressed;
     return;
