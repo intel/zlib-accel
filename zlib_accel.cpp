@@ -481,20 +481,28 @@ class DeflateStreamSettings {
   // Reports failure by logging rather than throwing, for the same reason as
   // SetFromCopy() below: the caller is deflateInit_/deflateInit2_, an exported
   // zlib symbol, and an exception escaping here would cross into a C caller
-  // that cannot catch it. On failure the previous entry (if any) is left in
-  // place rather than released, since it was never actually replaced; a
-  // stream left with no entry at all is handled by deflate()'s own
-  // nullptr-settings check, which already forwards it to zlib.
+  // that cannot catch it. orig_deflateInit_/orig_deflateInit2_ has already
+  // succeeded by the time this runs, so a previous entry (if any) belongs to
+  // a lifecycle that is no longer live -- leaving it in place would hand the
+  // new zlib stream stale settings, and a stale isal_strm, from the old one.
+  // On failure the entry is therefore removed outright (Unset() is a no-op if
+  // there was none), same as a stream that never had an entry, which
+  // deflate()'s own nullptr-settings check already forwards to zlib. Get() is
+  // inside the try too: it takes a shared_lock on the non-TBB build and can
+  // throw std::system_error the same way Set() can.
   void Set(z_streamp strm, int level, int method, int window_bits,
            int mem_level, int strategy) {
-    auto previous = map.Get(strm);
+    std::shared_ptr<DeflateSettings> previous;
     try {
+      previous = map.Get(strm);
       auto settings = std::make_shared<DeflateSettings>(
           level, method, window_bits, mem_level, strategy);
       map.Set(strm, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR, "Set() failed to register deflate stream ",
           static_cast<void*>(strm), "\n");
+      map.Unset(strm);
+      ReleaseDeflateIgzipState(previous);
       return;
     }
     // A second deflateInit*() on a stream that was never ended replaces an
@@ -552,15 +560,20 @@ DeflateStreamSettings deflate_stream_settings;
 
 class InflateStreamSettings {
  public:
-  // See the deflate-side Set() for why failure is logged rather than thrown.
+  // See the deflate-side Set() for why failure is logged rather than thrown,
+  // why a failed Set() removes the entry outright rather than leaving a
+  // previous one in place, and why Get() is inside the try too.
   void Set(z_streamp strm, int window_bits) {
-    auto previous = map.Get(strm);
+    std::shared_ptr<InflateSettings> previous;
     try {
+      previous = map.Get(strm);
       auto settings = std::make_shared<InflateSettings>(window_bits);
       map.Set(strm, std::move(settings));
     } catch (...) {
       Log(LogLevel::LOG_ERROR, "Set() failed to register inflate stream ",
           static_cast<void*>(strm), "\n");
+      map.Unset(strm);
+      ReleaseInflateIgzipState(previous);
       return;
     }
     // See the deflate-side Set().

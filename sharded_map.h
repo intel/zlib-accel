@@ -49,12 +49,19 @@ class ShardedMap {
 #endif
   }
 
+  // Builds the new shard count and array in locals and commits both only once
+  // the allocation has actually succeeded. Assigning num_shards_ first would
+  // leave it paired with the old, differently-sized pd_map_arr_ if
+  // make_unique throws, and every later Get()/Set() shards by the new count
+  // against the old allocation.
   void Init() {
-    num_shards_ = config::GetConfig(config::MAP_SHARDS);
-    pd_map_arr_ = std::make_unique<PaddedMapType[]>(num_shards_);
+    uint32_t new_num_shards = config::GetConfig(config::MAP_SHARDS);
+    auto new_map_arr = std::make_unique<PaddedMapType[]>(new_num_shards);
 #ifdef ZLIB_ACCEL_HAS_ASAN
-    __lsan_ignore_object(pd_map_arr_.get());
+    __lsan_ignore_object(new_map_arr.get());
 #endif
+    num_shards_ = new_num_shards;
+    pd_map_arr_ = std::move(new_map_arr);
   }
 
   auto Get(const Key& key) -> std::shared_ptr<typename Value::element_type> {
