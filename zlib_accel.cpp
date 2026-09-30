@@ -329,23 +329,34 @@ static int init_zlib_accel(void) {
   }
 
   // Load configuration file; on failure (file absent or is a symlink) continue
-  // with compiled-in defaults — a missing config is not fatal.
-  std::string config_file_content;
-  std::string log_file;
-  const bool config_loaded = config::LoadConfigFile(
-      config_file_content, config::kDefaultConfigPath, &log_file);
-  if (!config_loaded) {
-    Log(LogLevel::LOG_ERROR,
-        "Failed to load configuration file, continuing with defaults\n");
-  }
+  // with compiled-in defaults — a missing config is not fatal. The whole block
+  // is wrapped: this runs from a constructor, called before the host's own
+  // main(), so an exception escaping it (std::bad_alloc, or std::system_error
+  // from a registry's mutex on the non-TBB build) has no handler above it and
+  // calls std::terminate, aborting the host process outright. Catching here
+  // keeps that the same non-fatal case as a missing config file.
+  try {
+    std::string config_file_content;
+    std::string log_file;
+    const bool config_loaded = config::LoadConfigFile(
+        config_file_content, config::kDefaultConfigPath, &log_file);
+    if (!config_loaded) {
+      Log(LogLevel::LOG_ERROR,
+          "Failed to load configuration file, continuing with defaults\n");
+    }
 
-  InitStreamRegistries();
+    InitStreamRegistries();
 
 #if defined(DEBUG_LOG) || defined(ENABLE_STATISTICS)
-  if (config_loaded && !log_file.empty()) {
-    CreateLogFile(log_file.c_str());
-  }
+    if (config_loaded && !log_file.empty()) {
+      CreateLogFile(log_file.c_str());
+    }
 #endif
+  } catch (...) {
+    Log(LogLevel::LOG_ERROR, "init_zlib_accel Line ", __LINE__,
+        " configuration/registry initialization threw; continuing with "
+        "compiled-in defaults\n");
+  }
 
   return 0;
 }
@@ -467,12 +478,33 @@ static void ReleaseInflateIgzipState(
 
 class DeflateStreamSettings {
  public:
+  // Reports failure by logging rather than throwing, for the same reason as
+  // SetFromCopy() below: the caller is deflateInit_/deflateInit2_, an exported
+  // zlib symbol, and an exception escaping here would cross into a C caller
+  // that cannot catch it. orig_deflateInit_/orig_deflateInit2_ has already
+  // succeeded by the time this runs, so a previous entry (if any) belongs to
+  // a lifecycle that is no longer live -- leaving it in place would hand the
+  // new zlib stream stale settings, and a stale isal_strm, from the old one.
+  // On failure the entry is therefore removed outright (Unset() is a no-op if
+  // there was none), same as a stream that never had an entry, which
+  // deflate()'s own nullptr-settings check already forwards to zlib. Get() is
+  // inside the try too: it takes a shared_lock on the non-TBB build and can
+  // throw std::system_error the same way Set() can.
   void Set(z_streamp strm, int level, int method, int window_bits,
            int mem_level, int strategy) {
-    auto previous = map.Get(strm);
-    auto settings = std::make_shared<DeflateSettings>(
-        level, method, window_bits, mem_level, strategy);
-    map.Set(strm, std::move(settings));
+    std::shared_ptr<DeflateSettings> previous;
+    try {
+      previous = map.Get(strm);
+      auto settings = std::make_shared<DeflateSettings>(
+          level, method, window_bits, mem_level, strategy);
+      map.Set(strm, std::move(settings));
+    } catch (...) {
+      Log(LogLevel::LOG_ERROR, "Set() failed to register deflate stream ",
+          static_cast<void*>(strm), "\n");
+      map.Unset(strm);
+      ReleaseDeflateIgzipState(previous);
+      return;
+    }
     // A second deflateInit*() on a stream that was never ended replaces an
     // entry that may still own an ISA-L stream, which nothing can reach once
     // the entry is gone. See SetFromCopy() for the ordering.
@@ -528,10 +560,22 @@ DeflateStreamSettings deflate_stream_settings;
 
 class InflateStreamSettings {
  public:
+  // See the deflate-side Set() for why failure is logged rather than thrown,
+  // why a failed Set() removes the entry outright rather than leaving a
+  // previous one in place, and why Get() is inside the try too.
   void Set(z_streamp strm, int window_bits) {
-    auto previous = map.Get(strm);
-    auto settings = std::make_shared<InflateSettings>(window_bits);
-    map.Set(strm, std::move(settings));
+    std::shared_ptr<InflateSettings> previous;
+    try {
+      previous = map.Get(strm);
+      auto settings = std::make_shared<InflateSettings>(window_bits);
+      map.Set(strm, std::move(settings));
+    } catch (...) {
+      Log(LogLevel::LOG_ERROR, "Set() failed to register inflate stream ",
+          static_cast<void*>(strm), "\n");
+      map.Unset(strm);
+      ReleaseInflateIgzipState(previous);
+      return;
+    }
     // See the deflate-side Set().
     ReleaseInflateIgzipState(previous);
   }
@@ -2791,12 +2835,22 @@ class GzipFiles {
  public:
   // Returns the entry it just created, so the caller can finish initializing it
   // (the file name, and the open-time header test) without a second lookup.
+  // Returns nullptr on failure rather than throwing, for the same reason as
+  // DeflateStreamSettings::Set(): the caller is gzopen/gzdopen, an exported
+  // zlib symbol. Both already treat a nullptr return as an unregistered file,
+  // which they forward to zlib unchanged.
   std::shared_ptr<GzipFile> Set(gzFile file, int fd,
                                 const GzOpenParams& params) {
-    auto f = std::make_shared<GzipFile>(fd, params);
-    auto created = f;
-    map.Set(file, std::move(f));
-    return created;
+    try {
+      auto f = std::make_shared<GzipFile>(fd, params);
+      auto created = f;
+      map.Set(file, std::move(f));
+      return created;
+    } catch (...) {
+      Log(LogLevel::LOG_ERROR, "Set() failed to register gz file ",
+          static_cast<void*>(file), "\n");
+      return nullptr;
+    }
   }
 
   void Unset(gzFile file) { map.Unset(file); }
