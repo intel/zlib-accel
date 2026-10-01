@@ -104,19 +104,14 @@ int CompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
     output_shift += GZIP_EXT_XHDR_SIZE;
   }
 
-  // DEPRECATED: iaa_prepend_empty_block is no longer used by the decompressor.
-  // The original design used a 5-byte empty stored-block marker written at the
-  // start of IAA-compressed output so that the decompressor could detect and
-  // trust IAA-compressed data (which uses a 4kB history window). This approach
-  // was abandoned because QPL hardware always consumes all available_in bytes
-  // regardless of where the BFINAL=1 token falls (overconsumption bug), so a
-  // caller-supplied exact boundary is required instead. IsIAADecompressible now
-  // uses a 512-byte minimum input length threshold to gate IAA decompression:
-  // Java ZipInputStream feeds <=512-byte chunks (csize unknown), triggering
-  // overconsumption; Lucene stored-field reads always provide the exact
-  // compressed size (>512 bytes), where consuming all input is correct.
-  // The config option is retained for backward compatibility and will be
-  // removed in a future release.
+  // DEPRECATED: iaa_prepend_empty_block still prepends the empty stored block
+  // below, but no decompressor reads it back. It was meant to mark output IAA
+  // produced, which uses a 4kB history window, so that a decompressor could
+  // recognize it. That failed because QPL consumes all of available_in wherever
+  // the BFINAL=1 token falls, leaving the marker unfindable unless the caller
+  // supplies the exact compressed size. IsIAADecompressible gates on a minimum
+  // input length instead -- see the comment there. The option is retained for
+  // backward compatibility and will be removed in a future release.
   bool prepend_empty_block = false;
   CompressedFormat format = GetCompressedFormat(window_bits);
   if (format != CompressedFormat::ZLIB &&
@@ -249,8 +244,9 @@ int UncompressIAA(uint8_t* input, uint32_t* input_length, uint8_t* output,
     return 1;
   }
 
-  // TODO If reached EOS, consumed bytes is wrong. Requires IAA fix.
-  //*input_length = job->total_in;
+  // TODO job->total_in is wrong once end of stream is reached, so the consumed
+  // count is left as the caller set it except on the gzip_ext path below.
+  // Requires an IAA fix.
   *output_length = job->total_out;
   if (gzip_ext) {
     *input_length = gzip_ext_dest_size + GZIP_EXT_HDRFTR_SIZE;

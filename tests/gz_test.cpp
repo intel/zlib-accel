@@ -1182,9 +1182,9 @@ TEST_F(GzipFileTest, GzwriteAndGzreadRejectALengthThatDoesNotFitInInt) {
 // A deployed host keeps the flag set for a backend it has, and the shim reads
 // the flag rather than the compile-time macro: the flag makes the shim own the
 // descriptor, and if the backend is not there its own inflate stream does the
-// decompressing. That combination is what the differential runs against plain
-// zlib were captured under, and it is reachable with nothing compiled in, so it
-// is what these tests ask for.
+// decompressing. That combination is the one the bookkeeping below is about,
+// and it is reachable with nothing compiled in, so it is what these tests ask
+// for.
 static void EnableShimOwnedGzReads() {
   SetConfig(USE_IAA_UNCOMPRESS, 0);
   SetConfig(USE_QAT_UNCOMPRESS, 1);
@@ -1611,8 +1611,7 @@ TEST_F(GzipFileTest, GzdirectOnSeekableFilesAnswersFromWhoeverOwnsThem) {
 // read zlib is still in LOOK, so the seek is lazy and succeeds, and the read
 // that follows pays for it by reading and discarding -- which a pipe permits.
 // After the first read zlib is in COPY, where gzseek64 lseeks the descriptor
-// directly, and a pipe refuses that. Both halves are measured against plain
-// zlib by the conformance suite's O12 check.
+// directly, and a pipe refuses that. Both halves are asserted below.
 TEST_F(GzipFileTest, ForwardSeekOnATransparentPipeFollowsZlib) {
   EnableSomeGzCompressPath();
   EnableShimOwnedGzReads();
@@ -1684,8 +1683,9 @@ TEST_F(GzipFileTest, GzseekReadsFromTheOffsetItReports) {
 
   char buf[17] = {0};
 
-  // Forward, absolute. This is the reported failure: without the fix gzseek
-  // returns 2560 and the read that follows comes back with byte 0 of the file.
+  // Forward, absolute. This is the reported failure: gzseek reported the offset
+  // it was asked for without the skip taking effect, so the read that followed
+  // came back with the start of the file.
   EXPECT_EQ(gzseek(fp, 2560, SEEK_SET), 2560);
   // gztell has to agree with what gzseek just promised, before any read has
   // made the skip real.
@@ -1785,10 +1785,8 @@ TEST_F(GzipFileTest, GzseekOnAWriteFileFillsTheGapWithZeros) {
   EXPECT_EQ(gztell(fp), 20);
 
   // Backwards is refused, there being nothing to go back to. Asserted after the
-  // gap has been filled, not before: measured in bare zlib, a refused seek
-  // abandons a skip that was still pending, so the sequence
-  // "seek +12, refused seek, write" produces an 8-byte file in zlib as well.
-  // Interesting, but it is zlib's behavior and not something to assert here.
+  // gap has been filled, not before: in zlib a refused seek also abandons a
+  // skip that was still pending, which would change the file this test writes.
   EXPECT_EQ(gzseek(fp, 0, SEEK_SET), -1);
   ASSERT_EQ(gzclose(fp), Z_OK);
 
@@ -2376,10 +2374,9 @@ TEST_F(GzipFileTest, GzreadIgnoresATrailerThatIsNotAMember) {
 //
 // Turning every uncompress flag off mid-read is the config change that used to
 // flip that branch. The file has to keep reading correctly through it: which
-// engine decompresses may change, but not who reads the descriptor. Measured
-// against the version of this that borrowed zlib's header look, where zlib was
-// left holding up to 8 KB of stale input as well: reading such a file through
-// zlib returned 51,456 bytes of duplicates and then Z_DATA_ERROR.
+// engine decompresses may change, but not who reads the descriptor. Handing it
+// to zlib instead returns duplicated bytes and then Z_DATA_ERROR, since zlib
+// resumes from an offset the shim has already read past.
 TEST_F(GzipFileTest, ConfigChangeMidReadDoesNotHandARewoundFileToZlib) {
   EnableSomeGzCompressPath();
   EnableShimOwnedGzReads();
@@ -2523,10 +2520,10 @@ TEST_F(GzipFileTest, GzdirectOnAShimOwnedGzipFileMovesNothing) {
 // allocated, nothing read -- so gzbuffer is not just accepted but applied, and
 // the size the caller asked for is the size zlib reads with.
 //
-// Measured through the offset because that is the only visible difference. The
-// version of this that borrowed zlib's header look had already made zlib
-// allocate at 512 bytes by the time the application could speak, so a gzbuffer
-// of any size changed nothing and the file was read 512 bytes at a time.
+// Measured through the offset because that is the only visible difference: a
+// gzbuffer zlib has already allocated past is accepted and then changes
+// nothing, so the size the caller asked for is only observable in how much zlib
+// reads.
 TEST_F(GzipFileTest, GzbufferOnAPlainFileIsHonouredByZlib) {
   EnableSomeGzCompressPath();
   EnableShimOwnedGzReads();
@@ -2554,7 +2551,7 @@ TEST_F(GzipFileTest, GzbufferOnAPlainFileIsHonouredByZlib) {
   ASSERT_EQ(gzread(fp, &first, 1), 1);
   EXPECT_EQ(first, plain[0]);
   // One byte asked for, the whole file read: zlib filled the buffer it was told
-  // to use. At the old 512 this offset was 1,024.
+  // to use, rather than one it had already allocated.
   EXPECT_EQ(lseek(fd, 0, SEEK_CUR), static_cast<off_t>(plain.size()));
   // And zlib's own refusal after allocating, which is the half of the fidelity
   // the shim used to have to imitate.

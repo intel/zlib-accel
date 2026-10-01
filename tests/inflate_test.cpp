@@ -526,11 +526,12 @@ TEST(IGZIPInflateRegressionTest, RawSplitInputDefersCorrectionUntilStreamEnd) {
 }
 
 // Regression: after inflate() returns Z_STREAM_END and avail_in is left
-// pointing at trailing bytes (Bug 1 fix), a subsequent inflate() call with
-// those trailing bytes must return Z_STREAM_END, not Z_BUF_ERROR. The IGZIP
-// stream is still active (not freed), and isal_inflate on a finished stream
-// returns ISAL_END_INPUT with 0 consumed — the avail_in>0 path in inflate()
-// previously fell through to Z_BUF_ERROR when input_len==output_len==0.
+// pointing at the bytes past the end of the stream, a subsequent inflate() call
+// with those trailing bytes must return Z_STREAM_END, not Z_BUF_ERROR. The
+// IGZIP stream is still active (not freed), and isal_inflate on a finished
+// stream returns ISAL_END_INPUT with 0 consumed — the avail_in>0 path in
+// inflate() previously fell through to Z_BUF_ERROR when
+// input_len==output_len==0.
 TEST(IGZIPInflateRegressionTest,
      InflateAfterStreamEndWithTrailingBytesReturnsStreamEnd) {
   SetCompressPath(IGZIP, false, false, false);
@@ -572,7 +573,8 @@ TEST(IGZIPInflateRegressionTest,
   // First call: IGZIP decompresses the stream and leaves 8 trailing bytes.
   ASSERT_EQ(inflate(&dstream, Z_SYNC_FLUSH), Z_STREAM_END);
   ASSERT_EQ(GetInflateExecutionPath(&dstream), IGZIP);
-  ASSERT_EQ(dstream.avail_in, 8u) << "Bug 1 fix should rewind trailing bytes";
+  ASSERT_EQ(dstream.avail_in, 8u)
+      << "the bytes past the end of the stream must be left unconsumed";
 
   // Second call: avail_in==8 > 0, IGZIP stream still active. isal_inflate on
   // a finished stream produces no I/O — must return Z_STREAM_END, not
@@ -933,8 +935,9 @@ TEST(IGZIPInflateRegressionTest, ActiveStreamHandlesNullNextInWithZeroAvailIn) {
 // than guessed at, which the README lists as a known divergence.  Left
 // unasserted, a later change could start writing a plausible-looking but wrong
 // value, which no caller could tell from a right one.  The sentinel is a value
-// zlib would never leave behind: bit 6 and above are the block-boundary flags,
-// and 63 is outside the 0-7 bit position zlib reports.
+// zlib would never leave behind: everything zlib writes there fits in the low
+// byte -- the bit position plus the block-boundary and last-block flags -- and
+// the sentinel has bits set above it.
 TEST(IGZIPInflateRegressionTest, InflateLeavesDataTypeUntouched) {
   SetCompressPath(ZLIB, false, false, false);
   SetUncompressPath(IGZIP, /*zlib_fallback=*/false, false);
@@ -1137,11 +1140,14 @@ TEST(IGZIPInflateRegressionTest, DrainCallDataErrorStaysADataError) {
 }
 
 #ifdef USE_IAA
-// IAA->IGZIP fallback tests.
-// On machines without IAA hardware, CompressIAA/UncompressIAA return non-zero,
-// which naturally triggers the fallback path. These tests verify:
-//   - When igzip_fallback=1: the stream lands on IGZIP after IAA fails.
-//   - When igzip_fallback=0: the stream falls through to zlib, not IGZIP.
+// Accelerator->IGZIP fallback tests: IAA here, QAT in the matching block below.
+// On a machine without the hardware the accelerator call returns non-zero,
+// which is what reaches the fallback path; on a machine with it the call can
+// succeed instead.  Each test therefore asserts what holds either way:
+//   - igzip_fallback=1: the stream lands on IGZIP or on the accelerator itself,
+//     never on zlib.
+//   - igzip_fallback=0: a failed accelerator call falls through to zlib rather
+//     than to IGZIP.
 
 TEST(IAAFallbackIGZIPTest, DeflateUsesIGZIPWhenIAAFailsAndFallbackEnabled) {
   SetCompressPath(IAA, /*zlib_fallback=*/true,
@@ -1169,8 +1175,6 @@ TEST(IAAFallbackIGZIPTest, DeflateUsesIGZIPWhenIAAFailsAndFallbackEnabled) {
   int ret = deflate(&stream, Z_FINISH);
   ASSERT_EQ(ret, Z_STREAM_END);
 
-  // If IAA hardware is absent, the fallback must have routed to IGZIP.
-  // If IAA hardware is present and succeeds, IAA path is also acceptable.
   const ExecutionPath path = GetDeflateExecutionPath(&stream);
   EXPECT_TRUE(path == IGZIP || path == IAA)
       << "Expected IGZIP (fallback) or IAA (hardware success), got "
@@ -1286,8 +1290,6 @@ TEST(IAAFallbackIGZIPTest, InflateUsesIGZIPWhenIAAFailsAndFallbackEnabled) {
   ret = inflate(&dstream, Z_FINISH);
   ASSERT_EQ(ret, Z_STREAM_END);
 
-  // If IAA hardware is absent, fallback must route to IGZIP.
-  // If IAA hardware is present and succeeds, IAA is also acceptable.
   const ExecutionPath path = GetInflateExecutionPath(&dstream);
   EXPECT_TRUE(path == IGZIP || path == IAA)
       << "Expected IGZIP (fallback) or IAA (hardware success), got "
@@ -1342,11 +1344,7 @@ TEST(IAAFallbackIGZIPTest, InflateDoesNotUseIGZIPWhenFallbackDisabled) {
 #endif  // USE_IAA
 
 #if defined(USE_QAT) && defined(USE_IGZIP)
-// QAT->IGZIP fallback tests.
-// On machines without QAT hardware, CompressQAT/UncompressQAT return non-zero,
-// which naturally triggers the fallback path. These tests verify:
-//   - When igzip_fallback=1: the stream lands on IGZIP after QAT fails.
-//   - When igzip_fallback=0: the stream falls through to zlib, not IGZIP.
+// QAT->IGZIP fallback tests, the same shape as the IAA block above.
 
 TEST(QATFallbackIGZIPTest, DeflateUsesIGZIPWhenQATFailsAndFallbackEnabled) {
   SetCompressPath(QAT, /*zlib_fallback=*/true,
@@ -1374,8 +1372,6 @@ TEST(QATFallbackIGZIPTest, DeflateUsesIGZIPWhenQATFailsAndFallbackEnabled) {
   int ret = deflate(&stream, Z_FINISH);
   ASSERT_EQ(ret, Z_STREAM_END);
 
-  // If QAT hardware is absent, fallback must route to IGZIP.
-  // If QAT hardware is present and succeeds, QAT path is also acceptable.
   const ExecutionPath path = GetDeflateExecutionPath(&stream);
   EXPECT_TRUE(path == IGZIP || path == QAT)
       << "Expected IGZIP (fallback) or QAT (hardware success), got "
@@ -1454,8 +1450,6 @@ TEST(QATFallbackIGZIPTest, InflateUsesIGZIPWhenQATFailsAndFallbackEnabled) {
   ret = inflate(&dstream, Z_FINISH);
   ASSERT_EQ(ret, Z_STREAM_END);
 
-  // If QAT hardware is absent, fallback must route to IGZIP.
-  // If QAT hardware is present and succeeds, QAT is also acceptable.
   const ExecutionPath path = GetInflateExecutionPath(&dstream);
   EXPECT_TRUE(path == IGZIP || path == QAT)
       << "Expected IGZIP (fallback) or QAT (hardware success), got "
@@ -1893,8 +1887,10 @@ TEST_F(InflateFlushGateTest, ZBlockSucceedsWithZlibUncompressDisabled) {
 // An IGZIP stream already in flight is exempt from the gate: ISA-L holds
 // unflushed inflate state that cannot be handed to zlib without corrupting the
 // output, so the stream stays on IGZIP and Z_BLOCK behaves as Z_NO_FLUSH. The
-// accepted residual is over-delivery plus an unwritten data_type -- never wrong
-// bytes. Mirrors ZBlockMidStreamStaysOnIGZIPAndRoundTrips on the deflate side.
+// residual this test accepts is over-delivery -- never wrong bytes. The other
+// half of the residual, that data_type is left as the caller set it, is
+// asserted by InflateLeavesDataTypeUntouched rather than here. Mirrors
+// ZBlockMidStreamStaysOnIGZIPAndRoundTrips on the deflate side.
 TEST_F(InflateFlushGateTest, ZBlockMidStreamStaysOnIGZIPAndRoundTrips) {
   SetUncompressPath(IGZIP, /*zlib_fallback=*/true, false);
 

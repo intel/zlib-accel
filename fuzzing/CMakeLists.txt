@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 
-project(zlib-accel-test VERSION 1.0.0)
+project(zlib-accel-test VERSION 1.1.0)
 
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   message(FATAL_ERROR "Fuzz testing requires the Clang compiler.")

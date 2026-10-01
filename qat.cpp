@@ -122,7 +122,7 @@ void QATJob::Init(QzSessionPtr &qzSession, CompressedFormat format,
         qzLogLevel = LOG_DEBUG3;
         break;
       default:
-        // Unreachable: all LogLevel values are handled above.
+        // Only reached if a LogLevel is added without a case above.
         qzLogLevel = LOG_NONE;
         break;
     }
@@ -260,7 +260,6 @@ int UncompressQAT(uint8_t *input, uint32_t *input_length, uint8_t *output,
   *input_length = src_buf_size;
   *output_length = dst_buf_size;
 
-  // if (qzSessObj->end_of_last_block == 0) {
   unsigned char qat_end_of_stream = 0;
   rc = qzGetDeflateEndOfStream(qzSessObj, &qat_end_of_stream);
   if (rc != QZ_OK) {

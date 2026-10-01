@@ -211,7 +211,7 @@ int CompressIGZIP(struct isal_zstream *isal_strm, int flush,
     return -1;
   }
 
-  // set stream->avail_in, next_in, avail_out, next_out (from zstream)​
+  // set stream->avail_in, next_in, avail_out, next_out (from zstream)
   isal_strm->next_out = output;
   const uint32_t original_avail_out = *output_length;
   isal_strm->avail_out = original_avail_out;
@@ -475,10 +475,6 @@ IGZIPInflatePathAction IGZIPRunInflateAndSelectPathAction(
                          strm->next_out, output_length, &strm->total_in,
                          &strm->total_out, end_of_stream);
 
-  // Raw boundary guard removed: ISA-L PR#215 (cd72fd7) fixes avail_in
-  // over-consumption at BLOCK_FINISH in isal_inflate; the guard is no
-  // longer needed for that case.
-
   if (*ret == Z_NEED_DICT) {
     return IGZIP_INFLATE_PATH_FALLBACK_NEED_DICT;
   }
@@ -507,7 +503,7 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
     Log(LogLevel::LOG_ERROR, "UncompressIGZIP() isal_strm_inflate is NULL\n");
     return Z_STREAM_ERROR;
   }
-  // set stream->avail_in, next_in, avail_out, next_out (from zstream)​
+  // set stream->avail_in, next_in, avail_out, next_out (from zstream)
   isal_strm_inflate->next_out = output;
   const uint32_t original_avail_out = *output_length;
   isal_strm_inflate->avail_out = original_avail_out;
@@ -528,11 +524,10 @@ int UncompressIGZIP(struct inflate_state *isal_strm_inflate,
     consumed_before_adjust = 0;
   }
 
-  // Bug 2 guard removed: ISA-L PR#215 (cd72fd7) makes BLOCK_FINISH correctly
-  // restore avail_in after over-consumption into read_in. Continuing past
-  // BLOCK_INPUT_DONE (even with avail_in 1-7) reaches BLOCK_FINISH with the
-  // correct stream boundary. No fallback needed.
-  // (ISA-L >= 2.32.1 enforced at configure time via common.cmake.)
+  // ISA-L restores avail_in at BLOCK_FINISH after over-consuming into read_in,
+  // so continuing past BLOCK_INPUT_DONE with 1-7 bytes still in hand reaches
+  // the correct stream boundary and needs no fallback. (ISA-L >= 2.32.1 is
+  // enforced at configure time via common.cmake.)
 
   *output_length = original_avail_out - isal_strm_inflate->avail_out;
   *input_length = consumed_before_adjust;
@@ -630,9 +625,8 @@ bool UncompressWindowChangedIGZIP(const struct inflate_state *isal_strm_inflate,
 }
 
 void ResetCompressIGZIP(struct isal_zstream *isal_strm) {
-  // ISA-L PR#215 (30e90b4) stops gzip_flag from being mutated during
-  // compression, so isal_deflate_reset preserves it correctly.  No manual
-  // ConfigureDeflateWindow call is needed here.
+  // ISA-L does not mutate gzip_flag during compression, so isal_deflate_reset
+  // preserves it and no ConfigureDeflateWindow call is needed here.
   isal_deflate_reset(isal_strm);
   isal_strm->end_of_stream = 0;
   isal_strm->flush = NO_FLUSH;
