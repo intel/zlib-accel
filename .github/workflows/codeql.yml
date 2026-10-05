@@ -98,7 +98,7 @@ jobs:
     # Report only on a manual run, never on push/PR.
     - name: Generate Security Report
       if: github.event_name == 'workflow_dispatch'
-      uses: rsdmike/github-security-report-action@v3.0.4
+      uses: rsdmike/github-security-report-action@v4.1.0
       with:
         template: report
         token: ${{ secrets.GITHUB_TOKEN }}
