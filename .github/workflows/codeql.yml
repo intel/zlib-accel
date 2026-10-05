@@ -105,7 +105,7 @@ jobs:
 
     - name: GitHub Upload Release Artifacts
       if: github.event_name == 'workflow_dispatch'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: report
         path: |
